@@ -11,6 +11,11 @@ repos:
     hooks:
       - id: gitleaks
 
+  # These hooks cover Python only. Ruff's own file discovery also formats Python
+  # code blocks inside markdown, but the pre-commit hook hands it .md paths as if
+  # they were Python source and it fails to parse them. CI runs `ruff format
+  # --check .`, which does discovery properly, so README snippets are still
+  # checked -- just by CI rather than here.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.6
     hooks:
@@ -18,13 +23,19 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.19.0
+  # mypy runs in the project environment rather than an isolated pre-commit venv:
+  # strict checking needs the real dependencies (promptolution, networkx, numpy),
+  # and mirroring them into additional_dependencies would be a second, drifting
+  # copy of the dependency list. This is also exactly what CI runs.
+  - repo: local
     hooks:
       - id: mypy
-        args: [--config-file=pyproject.toml]
+        name: mypy (strict, project env)
+        entry: uv run mypy
+        language: system
+        types: [python]
         pass_filenames: false
-        additional_dependencies: [pytest>=8.3]
+        require_serial: true
 
   - repo: https://github.com/astral-sh/uv-pre-commit
     rev: 0.9.15
