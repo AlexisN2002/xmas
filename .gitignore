@@ -1,0 +1,93 @@
+# ---------------------------------------------------------------------------
+# Secrets. Nothing that could hold a credential is ever tracked.
+# Lesson from the seed repos: per-file entries (openaitoken.txt,
+# deepinfratoken.txt, ...) get out of date and a new name slips through. Match
+# credential-shaped *files* by pattern, and let gitleaks catch content that
+# patterns miss. Patterns are deliberately extension-anchored so that ordinary
+# source files (tokenizer.py, secrets_manager.py) are never silently untracked.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*token*.txt
+*token*.json
+*token*.yaml
+*secret*.txt
+*secret*.json
+*secret*.yaml
+*credential*.json
+*_key.txt
+api_key.txt
+*.key
+*.pem
+*.pfx
+*.p12
+.netrc
+
+# ---------------------------------------------------------------------------
+# Run artifacts. Experiment output belongs in an experiments repo or object
+# storage, never in the framework. (cantante tracks 36 MB of results/.)
+# ---------------------------------------------------------------------------
+results/
+runs/
+outputs/
+logs/
+artifacts/
+checkpoints/
+wandb/
+mlruns/
+data/
+data_cache/
+*.log
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments. uv.lock is deliberately NOT ignored: it is committed so CI and
+# contributors resolve identical dependencies.
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Tooling caches and reports
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Docs build
+# ---------------------------------------------------------------------------
+site/
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Local agent scratch
+# ---------------------------------------------------------------------------
+CLAUDE.local.md
+**/CLAUDE.local.md
+.claude/settings.local.json

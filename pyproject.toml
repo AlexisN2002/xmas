@@ -1,0 +1,129 @@
+[project]
+name = "xmas"
+description = "A lightweight framework for building and optimizing multi-agent systems."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Tom Zehle" }]
+requires-python = ">=3.12,<3.13"
+dynamic = ["version"]
+keywords = ["multi-agent-systems", "llm", "agents", "prompt-optimization"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+# promptolution is a hard dependency, not a family resemblance: xmas subclasses its
+# base classes, so single-agent xmas *is* promptolution and its optimizers plug in
+# without ports. Compatible range: track 2.x, refuse the next major.
+dependencies = ["promptolution>=2.2.3,<3.0.0"]
+
+[project.urls]
+Repository = "https://github.com/gepromptet/xmas"
+Documentation = "https://github.com/gepromptet/xmas/tree/main/docs"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The version is single-sourced from the package. Keep the `__version__` line in
+# src/xmas/__init__.py; the build reads it from there.
+[tool.hatch.version]
+path = "src/xmas/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xmas"]
+
+# ---------------------------------------------------------------------------
+# Optional extras, mirroring promptolution's [api]/[vllm]/[transformers] pattern:
+# a minimal core, heavy backends opted into explicitly. More will follow as the
+# core package lands.
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+vllm = ["promptolution[vllm]>=2.2.3,<3.0.0"]
+dev = [
+  "pre-commit>=4.0",
+  "ruff>=0.14",
+  "mypy>=1.14",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
+  "mkdocstrings[python]>=0.27",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff: linter + formatter. Replaces black, flake8, isort and pydocstyle.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "F",   # pyflakes
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "I",   # isort
+  "N",   # pep8-naming
+  "D",   # pydocstyle
+  "UP",  # pyupgrade
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "SIM", # flake8-simplify
+  "ARG", # flake8-unused-arguments
+  "PTH", # flake8-use-pathlib
+  "TID", # flake8-tidy-imports
+  "RUF", # ruff-specific
+]
+ignore = [
+  "D203", # incompatible with D211 (blank line before class docstring)
+  "D213", # incompatible with D212 (multi-line summary position)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["xmas"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests document themselves through their names; docstrings are optional there.
+"tests/**/*.py" = ["D100", "D103", "D104"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# mypy: strict. New code starts clean, so it stays clean.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+pretty = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+xfail_strict = true
+
+[tool.coverage.run]
+source = ["src/xmas"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
