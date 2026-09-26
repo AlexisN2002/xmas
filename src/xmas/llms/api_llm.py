@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ from promptolution.llms import api_llm as _promptolution
 
 from xmas.llms.scoring import ScoredSequence
 from xmas.llms.telemetry import GENERATE, SCORE, CallLog, CallRecord, approximate_tokens
+from xmas.tools import Tool, ToolCallRequest, complete_with_tools
 
 ENV_BASE_URL = "XMAS_BASE_URL"
 """Environment variable holding the endpoint base URL."""
@@ -167,6 +169,27 @@ class APILLM(_promptolution.APILLM):
             )
         )
         return responses
+
+    def get_tool_response(
+        self, messages: list[dict[str, Any]], tools: Sequence[Tool]
+    ) -> tuple[str, list[ToolCallRequest]]:
+        """Run one chat turn that may request tools.
+
+        Scheduled on promptolution's background loop and semaphore, with its
+        timeout and backoff, and recorded like :meth:`get_response`. Token counts
+        are the provider's when it reports usage.
+
+        Args:
+            messages: OpenAI-shaped history (system, user, assistant with
+                ``tool_calls``, tool).
+            tools: Tools on offer. Empty omits the ``tools`` key, which forces a
+                text answer.
+
+        Returns:
+            The message text (``""`` when the model only called tools) and the
+            requested calls, in order.
+        """
+        return complete_with_tools(self, messages, tools)
 
     @property
     def model(self) -> str:
