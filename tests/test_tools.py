@@ -5,10 +5,13 @@ No network: the model is a scripted double and the tool source a recording one.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Sequence
 from typing import Annotated, Any
 
+import httpx2
+import openai
 import pytest
 from openai.types.chat import ChatCompletion
 from pydantic import Field
@@ -582,3 +585,92 @@ def test_api_llm_drives_a_whole_tool_agent(monkeypatch: pytest.MonkeyPatch) -> N
     assert trace.output == "42"
     assert trace["coder"][0].tool_calls == (ToolCall("add", {"a": 40}, "42"),)
     assert sent[1]["messages"][-1] == {"role": "tool", "tool_call_id": "c1", "content": "42"}
+
+
+URL = "https://gateway.example/v1/chat/completions"
+
+
+def status_error(cls: type[openai.APIStatusError], status: int, message: str = "") -> openai.APIStatusError:
+    response = httpx2.Response(status, request=httpx2.Request("POST", URL))
+    return cls(message or f"Error code: {status}", response=response, body=None)
+
+
+@pytest.fixture
+def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the backoff delays instead of waiting them out."""
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    return delays
+
+
+@pytest.mark.parametrize(
+    ("cls", "status"),
+    [
+        (openai.BadRequestError, 400),
+        (openai.AuthenticationError, 401),
+        (openai.PermissionDeniedError, 403),
+        (openai.NotFoundError, 404),
+        (openai.UnprocessableEntityError, 422),
+    ],
+)
+def test_api_llm_does_not_retry_a_permanent_client_error(
+    monkeypatch: pytest.MonkeyPatch, slept: list[float], cls: type[openai.APIStatusError], status: int
+) -> None:
+    llm, sent, log = api_llm(monkeypatch, [status_error(cls, status), completion("unreachable")])
+    llm.retry_base_delay_s = 1.0
+    with pytest.raises(cls):
+        llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
+    assert len(sent) == 1
+    assert slept == []
+    assert log.records[-1].ok is False
+
+
+def test_a_tool_less_route_fails_the_run_after_one_call(monkeypatch: pytest.MonkeyPatch, slept: list[float]) -> None:
+    refused = status_error(openai.NotFoundError, 404, "No endpoints found that support tool use (Tool Compatibility)")
+    llm, sent, _ = api_llm(monkeypatch, [refused, completion("unreachable")])
+    llm.retry_base_delay_s = 1.0
+    trace = MAS(agents=[coder(["add"])], llm=llm, tools=[add]).run("q")
+    assert trace.error is not None
+    assert trace.error.startswith("NotFoundError: No endpoints found")
+    assert len(sent) == 1
+    assert slept == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        status_error(openai.RateLimitError, 429),
+        status_error(openai.InternalServerError, 500),
+        status_error(openai.InternalServerError, 503),
+        status_error(openai.APIStatusError, 408),
+        status_error(openai.ConflictError, 409),
+        openai.APIConnectionError(request=httpx2.Request("POST", URL)),
+        openai.APITimeoutError(request=httpx2.Request("POST", URL)),
+    ],
+    ids=["429", "500", "503", "408", "409", "connection", "timeout"],
+)
+def test_api_llm_retries_transient_errors_up_to_the_limit(
+    monkeypatch: pytest.MonkeyPatch, slept: list[float], error: Exception
+) -> None:
+    llm, sent, log = api_llm(monkeypatch, [error] * 6)
+    llm.retry_base_delay_s = 1.0
+    assert llm.max_retries == 5
+    with pytest.raises(type(error)):
+        llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
+    assert len(sent) == 6
+    assert slept == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert log.records[-1].ok is False
+
+
+def test_api_llm_recovers_after_a_connection_error(monkeypatch: pytest.MonkeyPatch, slept: list[float]) -> None:
+    dropped = openai.APIConnectionError(request=httpx2.Request("POST", URL))
+    llm, sent, _ = api_llm(monkeypatch, [dropped, completion("42")])
+    assert llm.get_tool_response([{"role": "user", "content": "hi"}], []) == ("42", [])
+    assert len(sent) == 2
+    assert len(slept) == 1

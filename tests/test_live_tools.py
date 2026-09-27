@@ -115,7 +115,8 @@ def serving_xmas(tmp_path_factory: pytest.TempPathFactory) -> Iterator[DevServer
 
     root = tmp_path_factory.mktemp("serving-xmas")
     port = _free_port()
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    # serving-xmas needs none of xmas's own settings (gateway URL and key included).
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV" and not k.startswith("XMAS_")}
     env.update(
         {
             "SX_BIND_HOST": "127.0.0.1",

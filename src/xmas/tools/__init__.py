@@ -28,6 +28,7 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, overload, runtime_checkable
 
+import openai
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
@@ -496,8 +497,29 @@ class SupportsToolCalls(Protocol):
         ...
 
 
+_RETRYABLE_4XX = frozenset({408, 409, 429})
+"""Client-error statuses a retry can fix: request timeout, conflict, rate limit."""
+
+
+def _is_permanent(exc: Exception) -> bool:
+    """Whether retrying cannot help: a 4xx answer other than 408, 409 and 429.
+
+    The status rule the openai client applies to its own retries. Connection
+    errors, timeouts and 5xx stay retryable.
+    """
+    return (
+        isinstance(exc, openai.APIStatusError)
+        and 400 <= exc.status_code < 500
+        and exc.status_code not in _RETRYABLE_4XX
+    )
+
+
 async def _create_with_retries(llm: APILLM, kwargs: dict[str, Any]) -> ChatCompletion:
-    """One chat-completions call with promptolution's timeout and backoff."""
+    """One chat-completions call with promptolution's timeout and backoff.
+
+    A permanent client error (400, 401, 403, 404, 422, ...) is raised at once
+    instead of being sent ``max_retries`` more times.
+    """
     last: Exception | None = None
     for attempt in range(llm.max_retries + 1):
         try:
@@ -507,6 +529,8 @@ async def _create_with_retries(llm: APILLM, kwargs: dict[str, Any]) -> ChatCompl
                 )
             return completion
         except Exception as exc:
+            if _is_permanent(exc):
+                raise
             last = exc
             if attempt < llm.max_retries:
                 await asyncio.sleep(llm.retry_base_delay_s * (2**attempt))
