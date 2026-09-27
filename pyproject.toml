@@ -57,9 +57,9 @@ packages = ["src/xmas"]
 [project.optional-dependencies]
 vllm = ["promptolution[vllm]>=2.2.3,<3.0.0"]
 # xmas.tools.mcp.MCPTools: tools served over MCP (streamable HTTP).
-mcp = ["mcp>=1.30,<2"]
+mcp = ["mcp>=2.2,<3"]
 dev = [
-  "mcp>=1.30,<2",
+  "mcp>=2.2,<3",
   "pre-commit>=4.0",
   "ruff>=0.14",
   "mypy>=1.14",

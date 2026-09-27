@@ -1,4 +1,4 @@
-"""MCPTools against an in-process FastMCP server over streamable HTTP (127.0.0.1, ephemeral port).
+"""MCPTools against an in-process MCPServer over streamable HTTP (127.0.0.1, ephemeral port).
 
 The fake server speaks serving-xmas's result shapes (Envelope JSON, error bodies)
 and sits behind a tiny bearer-auth middleware, so HTTP-level refusals are real.
@@ -19,7 +19,7 @@ import pytest
 pytest.importorskip("mcp")
 
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -41,7 +41,7 @@ def envelope(exit_code: int = 0, stdout: str = "", stderr: str = "", **extra: An
 
 
 def as_result(body: dict[str, Any], is_error: bool) -> CallToolResult:
-    return CallToolResult(content=[TextContent(type="text", text=json.dumps(body))], isError=is_error)
+    return CallToolResult(content=[TextContent(type="text", text=json.dumps(body))], is_error=is_error)
 
 
 def error_body(code: str, status: int, message: str = "no", **extra: Any) -> CallToolResult:
@@ -52,7 +52,7 @@ def error_body(code: str, status: int, message: str = "no", **extra: Any) -> Cal
 
 
 class Server:
-    """FastMCP app, auth middleware and bookkeeping for one test module."""
+    """MCPServer app, auth middleware and bookkeeping for one test module."""
 
     def __init__(self) -> None:
         """Build the app; the fixture serves it."""
@@ -60,7 +60,7 @@ class Server:
         self.peak = 0
         self.sessions: set[str] = set()
         self.initializes = 0
-        mcp = FastMCP("fake-serving-xmas")
+        mcp = MCPServer("fake-serving-xmas")
         self.mcp = mcp
 
         @mcp.tool()
@@ -276,12 +276,12 @@ def test_repr_never_shows_the_key() -> None:
 def test_result_mapping_for_foreign_servers() -> None:
     plain = CallToolResult(content=[TextContent(type="text", text="a"), TextContent(type="text", text="b")])
     assert result_text(plain) == "a\nb"
-    image = CallToolResult(content=[ImageContent(type="image", data="AA==", mimeType="image/png")])
+    image = CallToolResult(content=[ImageContent(type="image", data="AA==", mime_type="image/png")])
     assert result_text(image) == "[image content omitted]"
     with pytest.raises(ToolError, match="went wrong"):
-        result_text(CallToolResult(content=[TextContent(type="text", text="went wrong")], isError=True))
+        result_text(CallToolResult(content=[TextContent(type="text", text="went wrong")], is_error=True))
     with pytest.raises(ToolError, match="tool failed"):
-        result_text(CallToolResult(content=[], isError=True))
+        result_text(CallToolResult(content=[], is_error=True))
     assert result_text(as_result({"other": 1}, is_error=False)) == '{"other": 1}'
 
 

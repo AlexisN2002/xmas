@@ -16,14 +16,19 @@ import os
 import threading
 from collections.abc import Coroutine
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any, TypeVar
 
-import httpx
-from mcp import ClientSession
+import httpx2
+from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.exceptions import McpError
-from mcp.types import CONNECTION_CLOSED, CallToolResult, TextContent
+from mcp.types import (
+    CONNECTION_CLOSED,
+    INVALID_REQUEST,
+    REQUEST_TIMEOUT,
+    CallToolResult,
+    PaginatedRequestParams,
+    TextContent,
+)
 
 from xmas.llms.api_llm import RateLimitedError
 from xmas.tools import TOOL_NAME, Tool, ToolAccessError, ToolError
@@ -33,8 +38,10 @@ __all__ = ["ENV_TOOLS_KEY", "MCPTools"]
 ENV_TOOLS_KEY = "XMAS_TOOLS_KEY"
 """Environment variable holding the tool server key."""
 
-SESSION_TERMINATED = 32600
-"""Error code the MCP client reports when the server no longer knows the session (HTTP 404)."""
+SESSION_LOST = frozenset({"Session terminated", "Session not found"})
+"""Messages of the ``INVALID_REQUEST`` error a call fails with when the server no longer knows
+the session (HTTP 404 on an established session): the SDK server's own JSON-RPC error body,
+which the client passes on verbatim, or the client's stand-in when the 404 carries none."""
 
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
@@ -50,9 +57,9 @@ class _Refused:
 
 def _refusal_error(refused: _Refused) -> Exception:
     """Map an HTTP refusal to the error a run ends with."""
-    if refused.status == httpx.codes.TOO_MANY_REQUESTS:
+    if refused.status == httpx2.codes.TOO_MANY_REQUESTS:
         return RateLimitedError("rate limited (HTTP 429)", retry_after=refused.retry_after)
-    if refused.status == httpx.codes.UNAUTHORIZED:
+    if refused.status == httpx2.codes.UNAUTHORIZED:
         return ToolAccessError("unauthorized (HTTP 401): check XMAS_TOOLS_KEY")
     return ToolAccessError(f"forbidden (HTTP {refused.status})")
 
@@ -99,7 +106,7 @@ def result_text(result: CallToolResult) -> str:
     if isinstance(body, dict) and "exit_code" in body:
         exit_code, killed = body.get("exit_code"), body.get("killed", "none")
         stdout, stderr = str(body.get("stdout") or ""), str(body.get("stderr") or "")
-        if result.isError or exit_code != 0 or killed != "none":
+        if result.is_error or exit_code != 0 or killed != "none":
             raise ToolError(f"exit_code={exit_code} killed={killed}\n{stderr or stdout}".rstrip("\n"))
         out = stdout
         if body.get("truncated"):
@@ -110,14 +117,14 @@ def result_text(result: CallToolResult) -> str:
         return out
     if isinstance(body, dict) and "error" in body and "status" in body:
         code, status, message = str(body["error"]), body["status"], str(body.get("message") or body["error"])
-        if status in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN) or code == "insufficient_budget":
+        if status in (httpx2.codes.UNAUTHORIZED, httpx2.codes.FORBIDDEN) or code == "insufficient_budget":
             raise ToolAccessError(f"{code}: {message}")
-        if status == httpx.codes.TOO_MANY_REQUESTS:
+        if status == httpx2.codes.TOO_MANY_REQUESTS:
             raw = body.get("retry_after_s")
             retry_after = float(raw) if isinstance(raw, int | float) and not isinstance(raw, bool) else None
             raise RateLimitedError(f"{code}: {message}", retry_after=retry_after)
         raise ToolError(f"{code}: {message}")
-    if result.isError:
+    if result.is_error:
         raise ToolError(text or "tool failed")
     return text
 
@@ -249,21 +256,21 @@ class MCPTools:
 
     # ------------------------------------------------------------ loop side
 
-    async def _on_response(self, response: httpx.Response) -> None:
+    async def _on_response(self, response: httpx2.Response) -> None:
         """Record an HTTP refusal, which the SDK would otherwise surface inconsistently."""
-        if response.status_code in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN, httpx.codes.TOO_MANY_REQUESTS):
+        if response.status_code in (httpx2.codes.UNAUTHORIZED, httpx2.codes.FORBIDDEN, httpx2.codes.TOO_MANY_REQUESTS):
             self._refused = _Refused(response.status_code, _header_seconds(response.headers.get("Retry-After")))
 
     async def _own(self, ready: asyncio.Future[ClientSession], stop: asyncio.Event) -> None:
         """Own one session: enter and leave the SDK's contexts in this one task, as it requires."""
         try:
             async with (
-                httpx.AsyncClient(
+                httpx2.AsyncClient(
                     headers={"Authorization": f"Bearer {self._key}"},
-                    timeout=httpx.Timeout(30.0, read=self.timeout_s),
+                    timeout=httpx2.Timeout(30.0, read=self.timeout_s),
                     event_hooks={"response": [self._on_response]},
                 ) as client,
-                streamable_http_client(self.url, http_client=client) as (read, write, _),
+                streamable_http_client(self.url, http_client=client) as (read, write),
                 ClientSession(read, write) as session,
             ):
                 await session.initialize()
@@ -314,14 +321,14 @@ class MCPTools:
         found: list[Tool] = []
         cursor: str | None = None
         while True:
-            page = await session.list_tools(cursor)
+            page = await session.list_tools(params=PaginatedRequestParams(cursor=cursor) if cursor else None)
             for item in page.tools:
                 if not TOOL_NAME.match(item.name):
                     logger.warning("MCPTools: skipping tool %r, whose name OpenAI would refuse", item.name)
                     continue
-                schema = dict(item.inputSchema or {"type": "object", "properties": {}})
+                schema = dict(item.input_schema or {"type": "object", "properties": {}})
                 found.append(Tool(item.name, item.description or "", schema))
-            cursor = page.nextCursor
+            cursor = page.next_cursor
             if not cursor:
                 return found
 
@@ -332,24 +339,23 @@ class MCPTools:
             for attempt in range(2):
                 session = await self._connect()
                 try:
-                    result = await session.call_tool(
-                        name, arguments, read_timeout_seconds=timedelta(seconds=self.timeout_s)
-                    )
-                except McpError as exc:
+                    result = await session.call_tool(name, arguments, read_timeout_seconds=self.timeout_s)
+                except MCPError as exc:
                     if self._refused is not None:
                         refused = _refusal_error(self._refused)
                         await self._adisconnect()
                         raise refused from exc
-                    code = exc.error.code
-                    if code == SESSION_TERMINATED and attempt == 0:  # the server forgot the session; nothing ran
+                    code = exc.code
+                    terminated = code == INVALID_REQUEST and exc.message in SESSION_LOST
+                    if terminated and attempt == 0:  # the server forgot the session; nothing ran
                         await self._adisconnect()
                         continue
-                    if code in (CONNECTION_CLOSED, SESSION_TERMINATED):
+                    if terminated or code == CONNECTION_CLOSED:
                         await self._adisconnect()
                         raise ConnectionError(f"MCP connection lost during {name}: {exc}") from exc
-                    if code == httpx.codes.REQUEST_TIMEOUT:
+                    if code == REQUEST_TIMEOUT:
                         raise TimeoutError(f"MCP call {name} timed out after {self.timeout_s}s") from exc
-                    raise ToolError(f"mcp error {code}: {exc.error.message}") from exc
+                    raise ToolError(f"mcp error {code}: {exc.message}") from exc
                 return result_text(result)
         raise AssertionError("unreachable")  # pragma: no cover
 
