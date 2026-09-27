@@ -10,6 +10,11 @@ the fixture, never from ``XMAS_TOOLS_KEY``, so they need no tool credential.
 Both tests need a reachable docker daemon (the server runs each tool in a
 container) and skip without one. The fake-model test then runs in the default
 suite; the live one additionally needs Tom's gateway (``requires_gateway``).
+
+The live test's model is ``XMAS_LIVE_TOOLS_MODEL``, defaulting to the pinned
+``MODEL`` of ``test_live_gateway``. Not every gateway route serves tools: when the
+gateway has no tool-capable endpoint for the chosen model, the test fails with a
+message naming the model and the variable, so pick one whose route does.
 """
 
 from __future__ import annotations
@@ -30,11 +35,11 @@ import pytest
 
 pytest.importorskip("mcp")
 
-from xmas import MAS, Agent
+from xmas import APILLM, MAS, Agent
 from xmas.tools.mcp import MCPTools
 
 from .conftest import requires_gateway
-from .test_live_gateway import throttled
+from .test_live_gateway import GATEWAY_CONCURRENCY, MODEL
 from .test_tools import ToolMockLLM, req
 
 SERVING_XMAS_DIR = Path(os.environ.get("XMAS_SERVING_XMAS_DIR", Path.home() / "serving-xmas"))
@@ -48,6 +53,9 @@ JOB_LABEL = "serving-xmas.job"
 
 QUESTION = "what is 2**20?"
 ANSWER = "1048576"
+
+LIVE_TOOLS_MODEL_ENV = "XMAS_LIVE_TOOLS_MODEL"
+"""Overrides the live test's model; unset, it is ``test_live_gateway.MODEL``."""
 
 
 def _docker_reachable() -> bool:
@@ -205,11 +213,20 @@ def test_a_gateway_model_runs_python_on_the_dev_server(serving_xmas: DevServer) 
 
     Needs ``XMAS_BASE_URL`` and ``XMAS_API_KEY`` for the gateway and a reachable
     docker. The tool key comes from the ``serving_xmas`` fixture, not from
-    ``XMAS_TOOLS_KEY``, so nothing else has to be set.
+    ``XMAS_TOOLS_KEY``, so nothing else has to be set. The model is
+    ``XMAS_LIVE_TOOLS_MODEL`` (default ``test_live_gateway.MODEL``).
     """
+    model = os.environ.get(LIVE_TOOLS_MODEL_ENV) or MODEL
+    llm = APILLM(model=model, max_tokens=256, max_concurrent_calls=GATEWAY_CONCURRENCY)
     with MCPTools(serving_xmas.url, serving_xmas.key, timeout_s=120) as remote:
-        trace = MAS(agents=[coder()], llm=throttled(max_tokens=256), tools=[remote]).run(QUESTION)
+        trace = MAS(agents=[coder()], llm=llm, tools=[remote]).run(QUESTION)
 
+    if trace.error is not None and "No endpoints found" in trace.error and "Tool Compatibility" in trace.error:
+        pytest.fail(
+            f"the gateway has no tool-capable route for {model!r}; "
+            f"set {LIVE_TOOLS_MODEL_ENV} to a model that serves tools",
+            pytrace=False,
+        )
     assert trace.error is None, trace.error
     calls = trace["coder"][0].tool_calls
     assert calls, "the model answered without calling run_python"
