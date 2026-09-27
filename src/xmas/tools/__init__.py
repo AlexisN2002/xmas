@@ -12,7 +12,9 @@ calls, each result goes back as a ``role=tool`` message, and after
 ``max_tool_rounds`` such turns one last turn with the tools withheld forces a
 text answer. Every call is kept as a :class:`~xmas.trace.ToolCall` on the
 agent's record. A tool that fails is data (the model sees the error and may try
-again); a source that refuses the caller ends the run.
+again); a source that refuses the caller ends the run. A call identical to one
+that already succeeded in the same loop is not run again: the model gets the
+earlier result back under a short note (see ``DEDUPE_TOOL_CALLS``).
 """
 
 from __future__ import annotations
@@ -59,6 +61,19 @@ __all__ = [
 
 TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 """Names the OpenAI ``tools`` payload accepts; checked when a Tool is built."""
+
+DEDUPE_TOOL_CALLS = True
+"""Whether the tool loop answers a repeated successful call from its earlier result.
+
+Two calls are the same when they name the same tool and their arguments are
+equal as sorted-key JSON: after the tool's own validation for a tool built by
+:func:`tool`, and after reading numeric strings as numbers for ``integer`` and
+``number`` parameters of a remote tool. Failed calls always run again. Set to
+``False`` to run every call.
+"""
+
+REPEATED_CALL_NOTE = "[same call as before; result repeated]"
+"""Prefixed to the earlier result when a repeated call is answered without running it."""
 
 
 class ToolError(RuntimeError):
@@ -545,6 +560,10 @@ def complete_with_tools(
 
     Runs on the model's own background loop and semaphore, and records one
     ``GENERATE`` call with the provider's exact token counts when it reports them.
+    The request carries ``model``, ``messages``, ``max_tokens`` and the tools;
+    sampling parameters (``temperature``, ``top_p``, ``stop``, ...) are sent only
+    when set in the model's ``call_kwargs``, never as defaults, so a route that
+    refuses them still serves the call.
 
     Args:
         llm: The model.
@@ -636,6 +655,69 @@ def _execute(tools: ToolIndex, request: ToolCallRequest) -> ToolCall:
     return ToolCall(request.name, arguments, result)
 
 
+_INTEGER = re.compile(r"-?[0-9]+")
+_NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")
+
+
+def _numeric_type(schema: Any) -> str | None:
+    """Return ``"integer"`` or ``"number"`` when a property schema is plainly numeric (``null`` allowed)."""
+    if not isinstance(schema, dict):
+        return None
+    declared = schema.get("type")
+    listed = [declared] if isinstance(declared, str) else declared if isinstance(declared, list) else []
+    types = {item for item in listed if isinstance(item, str)} - {"null"}
+    return types.pop() if len(types) == 1 and types <= {"integer", "number"} else None
+
+
+def _numbers_from_strings(arguments: dict[str, Any], parameters: dict[str, Any]) -> dict[str, Any]:
+    """Read top-level numeric strings as numbers where the schema says integer or number.
+
+    Conservative: only plain ASCII decimal literals without surrounding space
+    are converted (``"20"``, ``"-1.5"``, the latter for ``number`` only), and a
+    number-typed ``"20"`` becomes ``20``, not ``20.0``.
+    """
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return arguments
+    out = dict(arguments)
+    for key, value in arguments.items():
+        kind = _numeric_type(properties.get(key))
+        if kind is None or not isinstance(value, str):
+            continue
+        if _INTEGER.fullmatch(value):
+            out[key] = int(value)
+        elif kind == "number" and _NUMBER.fullmatch(value):
+            out[key] = float(value)
+    return out
+
+
+def _call_key(tools: ToolIndex, request: ToolCallRequest) -> tuple[str, str] | None:
+    """Return what makes a request the same call as another, or ``None`` if it cannot be matched.
+
+    Local tools built by :func:`tool` compare after their own validation;
+    remote tools after :func:`_numbers_from_strings`; other local tools as sent.
+    Requests that would fail (bad JSON, unknown tool, invalid arguments) get no key.
+    """
+    try:
+        arguments = json.loads(request.arguments or "{}")
+    except json.JSONDecodeError:
+        return None
+    entry = tools.get(request.name)
+    if not isinstance(arguments, dict) or entry is None:
+        return None
+    spec, _ = entry
+    try:
+        if spec._model is not None:
+            canonical = spec.validate(arguments)
+        elif spec.fn is None:
+            canonical = _numbers_from_strings(arguments, spec.parameters)
+        else:
+            canonical = arguments
+        return spec.name, json.dumps(canonical, sort_keys=True, default=repr)
+    except (ToolError, TypeError, ValueError):
+        return None
+
+
 def run_tool_loop(
     llm: SupportsToolCalls,
     rendered: str,
@@ -648,7 +730,9 @@ def run_tool_loop(
 
     At most ``max_rounds`` turns may request tools. Calls within a turn run in
     order. If the model is still asking after that, one more turn with the tools
-    withheld forces a text answer.
+    withheld forces a text answer. With ``DEDUPE_TOOL_CALLS``, a call equal to one
+    that already succeeded in this loop is not run again; it is answered, and
+    recorded, with the earlier result under ``REPEATED_CALL_NOTE``.
 
     Args:
         llm: The agent's model.
@@ -667,6 +751,7 @@ def run_tool_loop(
     ]
     specs = [spec for spec, _ in tools.values()]
     calls: list[ToolCall] = []
+    succeeded: dict[tuple[str, str], str] = {}
     usage = TokenUsage()
 
     def turn(offered: list[Tool]) -> tuple[str, list[ToolCallRequest]]:
@@ -683,7 +768,14 @@ def run_tool_loop(
             return text, tuple(calls), usage
         messages.append({"role": "assistant", "content": text or None, "tool_calls": [_wire(r) for r in requests]})
         for request in requests:
-            call = _execute(tools, request)
+            key = _call_key(tools, request) if DEDUPE_TOOL_CALLS else None
+            if key is not None and key in succeeded:
+                repeated = f"{REPEATED_CALL_NOTE}\n{succeeded[key]}"
+                call = ToolCall(request.name, json.loads(request.arguments or "{}"), repeated)
+            else:
+                call = _execute(tools, request)
+                if key is not None and not call.failed:
+                    succeeded[key] = call.result
             calls.append(call)
             messages.append({"role": "tool", "tool_call_id": request.id, "content": call.result})
     text, _ = turn([])

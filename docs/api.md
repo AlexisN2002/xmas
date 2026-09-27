@@ -62,7 +62,9 @@ teacher-forced sibling of generation.
 
 Functions an agent may call while it answers: `Agent.tools` names resolve
 against `MAS(..., tools=[...])` when the system is built. `MCPTools` needs the
-`mcp` extra.
+`mcp` extra. A tool turn sends sampling parameters (`temperature`, `top_p`,
+`stop`, ...) only when they are set in the model's `call_kwargs`, never as
+defaults.
 
 ::: xmas.tools
     options:

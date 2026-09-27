@@ -26,7 +26,7 @@ import signal
 import socket
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -92,6 +92,34 @@ def _job_containers() -> set[str]:
     return set(listed.stdout.split())
 
 
+def _server_env(base: Mapping[str, str], settings: Mapping[str, str]) -> dict[str, str]:
+    """Return the dev server's environment: ``base`` minus inherited settings, plus ``settings``.
+
+    ``VIRTUAL_ENV`` and every ``XMAS_*`` (gateway URL and key included) are dropped
+    because serving-xmas needs none of them; every inherited ``SX_*`` (say a
+    caller's ``SX_STATE_DIR`` or ``SX_TEST_KEY``) is dropped so that only
+    ``settings`` configures the server.
+    """
+    env = {k: v for k, v in base.items() if k != "VIRTUAL_ENV" and not k.startswith(("XMAS_", "SX_"))}
+    env.update(settings)
+    return env
+
+
+def test_server_env_drops_inherited_settings() -> None:
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/x",
+        "VIRTUAL_ENV": "/venv",
+        "XMAS_API_KEY": "gateway-key",
+        "SX_TEST_KEY": "sk-sx-caller",
+        "SX_STATE_DIR": "/caller/state",
+        "SX_PORT": "8000",
+    }
+    env = _server_env(base, {"SX_PORT": "4242", "SX_LOG_LEVEL": "warning"})
+    assert env == {"PATH": "/usr/bin", "HOME": "/home/x", "SX_PORT": "4242", "SX_LOG_LEVEL": "warning"}
+    assert base["SX_STATE_DIR"] == "/caller/state"  # the caller's mapping is left alone
+
+
 @dataclass(frozen=True)
 class DevServer:
     """A running serving-xmas dev server and a key it accepts."""
@@ -115,9 +143,8 @@ def serving_xmas(tmp_path_factory: pytest.TempPathFactory) -> Iterator[DevServer
 
     root = tmp_path_factory.mktemp("serving-xmas")
     port = _free_port()
-    # serving-xmas needs none of xmas's own settings (gateway URL and key included).
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV" and not k.startswith("XMAS_")}
-    env.update(
+    env = _server_env(
+        os.environ,
         {
             "SX_BIND_HOST": "127.0.0.1",
             "SX_PORT": str(port),
@@ -128,7 +155,7 @@ def serving_xmas(tmp_path_factory: pytest.TempPathFactory) -> Iterator[DevServer
             "SX_POLICY_PATH": str(root / "policy.json"),
             "SX_MAX_CONTAINERS": "2",
             "SX_LOG_LEVEL": "warning",
-        }
+        },
     )
     (root / "workspace").mkdir()
     serving = [uv, "run", "--frozen", "--project", str(SERVING_XMAS_DIR), "serving"]

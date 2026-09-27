@@ -16,6 +16,7 @@ import pytest
 from openai.types.chat import ChatCompletion
 from pydantic import Field
 
+import xmas.tools
 from xmas import END, MAS, START, Agent, ToolCall
 from xmas.llms.api_llm import APILLM, RateLimitedError
 from xmas.llms.telemetry import CallLog
@@ -23,6 +24,7 @@ from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
 from xmas.optimization.topology import TopologyBudget
 from xmas.tools import (
+    REPEATED_CALL_NOTE,
     LocalTools,
     SupportsToolCalls,
     Tool,
@@ -59,9 +61,18 @@ class ToolMockLLM(MockLLM):
 class FakeToolSource:
     """A ToolSource with scripted answers; records every call."""
 
-    def __init__(self, names: Sequence[str] = ("run_python",), answers: dict[str, Any] | None = None) -> None:
-        """Offer ``names``; ``answers`` maps a name to its result, or to an exception to raise."""
-        self.specs = [Tool(name, f"{name} tool", {"type": "object", "properties": {}}) for name in names]
+    def __init__(
+        self,
+        names: Sequence[str] = ("run_python",),
+        answers: dict[str, Any] | None = None,
+        properties: dict[str, Any] | None = None,
+    ) -> None:
+        """Offer ``names``; ``answers`` maps a name to its result, or to an exception to raise.
+
+        ``properties`` is the JSON Schema ``properties`` every tool declares.
+        """
+        schema = {"type": "object", "properties": dict(properties or {})}
+        self.specs = [Tool(name, f"{name} tool", schema) for name in names]
         self.answers = answers or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.listed = 0
@@ -411,7 +422,7 @@ def test_endless_requests_stop_after_max_rounds_plus_a_final_turn_without_tools(
     assert trace.output == "again"
     assert [tools for _, tools in llm.seen] == [["run_python"]] * rounds + [[]]
     assert len(trace["coder"][0].tool_calls) == rounds
-    assert len(source.calls) == rounds
+    assert len(source.calls) == min(rounds, 1)  # the same call again is answered from the first result
 
 
 def test_default_is_five_rounds() -> None:
@@ -501,6 +512,111 @@ def test_a_plain_agent_in_a_mixed_mas_sends_exactly_what_it_did_before() -> None
     assert mixed.seen[0][0][1]["content"] == f"Do {plain_trace['planner'][0].raw_response}"
 
 
+RUN_PYTHON_SCHEMA = {"code": {"type": "string"}, "timeout_s": {"type": "integer"}}
+
+
+def test_an_identical_repeat_is_answered_from_the_earlier_result() -> None:
+    source = FakeToolSource(answers={"run_python": "1048576"}, properties=RUN_PYTHON_SCHEMA)
+    first = '{"code": "print(2**20)", "timeout_s": 20}'
+    again = '{"timeout_s": 20, "code": "print(2**20)"}'  # key order does not matter
+    llm = ToolMockLLM([("", [req("run_python", first, "1")]), ("", [req("run_python", again, "2")]), ("done", [])])
+    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
+
+    assert trace.error is None
+    assert len(source.calls) == 1
+    earlier, repeated = trace["coder"][0].tool_calls
+    assert earlier == ToolCall("run_python", {"code": "print(2**20)", "timeout_s": 20}, "1048576")
+    assert repeated.result == f"{REPEATED_CALL_NOTE}\n1048576"
+    assert not repeated.failed
+    assert repeated.arguments == {"timeout_s": 20, "code": "print(2**20)"}
+    assert llm.seen[2][0][-1] == {"role": "tool", "tool_call_id": "2", "content": repeated.result}
+
+
+def test_a_numeric_string_for_an_integer_parameter_is_the_same_call() -> None:
+    source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
+    llm = ToolMockLLM(
+        [
+            ("", [req("run_python", '{"code": "x", "timeout_s": 20}', "1")]),
+            ("", [req("run_python", '{"code": "x", "timeout_s": "20"}', "2")]),
+            ("done", []),
+        ]
+    )
+    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
+    assert len(source.calls) == 1
+    repeated = trace["coder"][0].tool_calls[1]
+    assert repeated.arguments == {"code": "x", "timeout_s": "20"}  # recorded as the model sent it
+    assert repeated.result.startswith(REPEATED_CALL_NOTE)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ('{"code": "x"}', '{"code": "y"}'),
+        ('{"code": "x", "timeout_s": 20}', '{"code": "x", "timeout_s": 21}'),
+        ('{"code": "20"}', '{"code": 20}'),  # a string parameter: no numeric reading
+        ('{"code": "x", "timeout_s": 20}', '{"code": "x", "timeout_s": "20.0"}'),  # not an integer literal
+    ],
+)
+def test_different_arguments_run_again(first: str, second: str) -> None:
+    source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
+    llm = ToolMockLLM([("", [req("run_python", first, "1"), req("run_python", second, "2")]), ("done", [])])
+    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
+    assert len(source.calls) == 2
+    assert not any(call.result.startswith(REPEATED_CALL_NOTE) for call in trace["coder"][0].tool_calls)
+
+
+def test_a_failed_call_is_run_again() -> None:
+    class FlakySource(FakeToolSource):
+        def call(self, name: str, arguments: dict[str, Any]) -> str:
+            self.calls.append((name, arguments))
+            if len(self.calls) == 1:
+                raise ToolError("exit_code=1")
+            return "ok"
+
+    source = FlakySource()
+    llm = ToolMockLLM(
+        [("", [req("run_python", '{"code": "x"}', "1")]), ("", [req("run_python", '{"code": "x"}', "2")])]
+    )
+    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
+    assert len(source.calls) == 2
+    assert trace["coder"][0].tool_calls == (
+        ToolCall("run_python", {"code": "x"}, "exit_code=1", failed=True),
+        ToolCall("run_python", {"code": "x"}, "ok"),
+    )
+
+
+def test_a_local_tool_repeat_compares_after_validation() -> None:
+    seen: list[tuple[int, int]] = []
+
+    @tool
+    def power(base: int, exp: int = 2) -> int:
+        """Raise base to exp."""
+        seen.append((base, exp))
+        return int(base**exp)
+
+    llm = ToolMockLLM(
+        [
+            ("", [req("power", '{"base": 2, "exp": 20}', "1")]),
+            ("", [req("power", '{"base": "2", "exp": "20"}', "2"), req("power", '{"base": 2}', "3")]),
+            ("done", []),
+        ]
+    )
+    trace = MAS(agents=[coder(["power"])], llm=llm, tools=[power]).run("q")
+    assert seen == [(2, 20), (2, 2)]  # "2"/"20" coerce to the first call; exp=2 is new
+    results = [call.result for call in trace["coder"][0].tool_calls]
+    assert results == ["1048576", f"{REPEATED_CALL_NOTE}\n1048576", "4"]
+
+
+def test_dedupe_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(xmas.tools, "DEDUPE_TOOL_CALLS", False)
+    source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
+    call = '{"code": "x", "timeout_s": 20}'
+    llm = ToolMockLLM([("", [req("run_python", call, "1")]), ("", [req("run_python", call, "2")]), ("done", [])])
+    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
+    assert len(source.calls) == 2
+    assert [c.result for c in trace["coder"][0].tool_calls] == ["run_python ok"] * 2
+
+
 def test_run_batch_with_tools() -> None:
     source = FakeToolSource()
     llm = ToolMockLLM(default=("done", []))
@@ -528,9 +644,13 @@ def completion(content: str | None, calls: list[dict[str, Any]] | None = None, u
     return ChatCompletion.model_validate(body)
 
 
-def api_llm(monkeypatch: pytest.MonkeyPatch, answers: list[Any]) -> tuple[APILLM, list[dict[str, Any]], CallLog]:
+def api_llm(
+    monkeypatch: pytest.MonkeyPatch, answers: list[Any], **kwargs: Any
+) -> tuple[APILLM, list[dict[str, Any]], CallLog]:
     log = CallLog()
-    llm = APILLM(model="m", base_url="https://gateway.example/v1", api_key="k", telemetry=log, retry_base_delay_s=0)
+    llm = APILLM(
+        model="m", base_url="https://gateway.example/v1", api_key="k", telemetry=log, retry_base_delay_s=0, **kwargs
+    )
     sent: list[dict[str, Any]] = []
 
     async def create(**kwargs: Any) -> ChatCompletion:
@@ -560,6 +680,21 @@ def test_api_llm_offers_tools_and_parses_calls(monkeypatch: pytest.MonkeyPatch) 
     assert "tool_choice" not in sent[0]
     record = log.records[0]
     assert (record.ok, record.input_tokens, record.output_tokens) == (True, 11, 7)
+
+
+SAMPLING = ("temperature", "top_p", "stop")
+
+
+def test_api_llm_sends_no_sampling_parameters_unless_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Routes that refuse temperature or stop (require_parameters) must still serve a default model."""
+    llm, sent, _ = api_llm(monkeypatch, [completion("a")])
+    llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
+    assert set(sent[0]) == {"model", "messages", "max_tokens", "tools"}
+
+    chosen = {"temperature": 0.2, "top_p": 0.9, "stop": ["\n\n"]}
+    llm, sent, _ = api_llm(monkeypatch, [completion("a")], call_kwargs=chosen)
+    llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
+    assert {key: sent[0][key] for key in SAMPLING} == chosen
 
 
 def test_api_llm_omits_tools_on_the_final_turn_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
