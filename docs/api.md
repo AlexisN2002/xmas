@@ -52,11 +52,32 @@ teacher-forced sibling of generation.
 
 ::: xmas.llms.api_llm.APILLM
 
-::: xmas.llms.api_llm.ScoringUnsupportedError
+Per-call records: pass `call_log=CallLog()` and every call leaves a `CallRecord` with a
+`call_id` (UUID4), a `ts` (start time, ISO 8601 with offset), the `params` it was sent
+(`max_tokens` plus `call_kwargs`, minus `extra_headers`) and the provider's `response_id` (`response_ids` for a batch).
+`CallLog(capture_text=True)` also records `prompt`, `system_prompt` and `response`; a batch
+stays one record and fills `prompts`, `system_prompts`, `responses` instead .
+
+::: xmas.errors.XmasError
 
 ::: xmas.llms.scoring.ScoredSequence
 
-::: xmas.llms.scoring.SupportsScore
+## Tools
+
+Functions an agent may call while it answers: `Agent.tools` names resolve
+against `MAS(..., tools=[...])` when the system is built. `MCPTools` needs the
+`mcp` extra.
+
+::: xmas.tools
+    options:
+      members:
+        - Tool
+        - tool
+        - ToolSource
+        - ToolCallRequest
+        - LocalTools
+
+::: xmas.tools.mcp.MCPTools
 
 ::: xmas.llms.masking
     options:
@@ -70,7 +91,6 @@ teacher-forced sibling of generation.
     options:
       members:
         - safe_format
-        - extract_placeholders
         - encode_prompts
         - decode_prompts
 
@@ -82,42 +102,9 @@ teacher-forced sibling of generation.
 
 ::: xmas.tasks.gsm8k.extract_number
 
-## Probing
-
-Generation-free evaluation. A probing task wraps any other task and scores candidates
-by teacher-forcing a shared pool of references whose reward is already known, instead
-of decoding a fresh answer per candidate. Every optimizer runs against it unchanged,
-which is design principle P2.
-
-The estimator is CALINKA's importance-sampling form: a candidate is credited for the
-share of the *population's* probability mass it puts on references that scored well.
-
-::: xmas.tasks.probing.ProbingTask
-
-::: xmas.tasks.probing.Reference
-
-::: xmas.tasks.probing.ReferencePool
-
-::: xmas.tasks.probing.ProbeTensor
-
-::: xmas.tasks.probing.Estimator
-
-::: xmas.tasks.probing.ImportanceSampling
-
-::: xmas.tasks.probing.AgreementReadout
-
-::: xmas.tasks.probing
-    options:
-      members:
-        - measure_agreement
-        - negative_control
-        - materialize
-        - importance_weights
-        - rank_agreement
-
 ## Optimization
 
-::: xmas.optimization.base.MASOptimizer
+::: xmas.optimization.optimizer.MASOptimizer
 
 ::: xmas.optimization.attribution.Attributor
 
@@ -125,17 +112,11 @@ share of the *population's* probability mass it puts on references that scored w
 
 ::: xmas.optimization.attribution.ContrastiveAttributor
 
-::: xmas.optimization.attribution.UNKNOWN
-
-::: xmas.optimization.updaters.Updater
-
-::: xmas.optimization.updaters.TopologyUpdater
-
 ::: xmas.optimization.updaters.PromptUpdater
 
 ::: xmas.optimization.updaters.AgentPromptView
 
-::: xmas.optimization.reference.PrefixSearchOptimizer
+::: xmas.optimization.prefix_search.PrefixSearchOptimizer
 
 ### CANTANTE
 
@@ -184,8 +165,6 @@ built from it.
 Topology search moves information around; something has to write the sentence
 that uses it.
 
-::: xmas.optimization.synthesis.PromptSynthesizer
-
 ::: xmas.optimization.synthesis.LLMPromptSynthesizer
 
 ::: xmas.optimization.synthesis.MechanicalSynthesizer
@@ -197,7 +176,4 @@ that uses it.
 ::: xmas.spec
     options:
       members:
-        - MASSpec
-        - AgentSpec
         - validate_spec
-        - SPEC_VERSION
