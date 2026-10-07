@@ -1,4 +1,4 @@
-# xmas
+# 🎄 xmas: multi-agent systems, wrapped and ready 🎁
 
 [![CI](https://github.com/gepromptet/xmas/actions/workflows/ci.yml/badge.svg)](https://github.com/gepromptet/xmas/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
@@ -6,16 +6,20 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**xmas is the multi-agent sibling of [promptolution](https://github.com/gepromptet/promptolution).**
-It keeps the same five nouns, Task, Predictor, LLM, Optimizer and ExperimentConfig, and
-lifts them one level: the multi-agent system itself is the Predictor, a structured one
-whose parameters are exposed as ordinary optimizable components, so per-agent prompts,
-the topology wiring the agents together, and the model bound to each node are all things
-an optimizer can improve against a task you care about. Because xmas builds directly on
-promptolution's base classes rather than reimplementing them, a single-agent system is
-not an analogy to a promptolution predictor, it is exactly one, and promptolution's
-optimizers plug in without a port. Within the gepromptet ecosystem that makes
-promptolution the N=1 case and xmas the general one.
+**xmas builds, runs and optimizes a multi-agent system as one object.** A system is a
+set of agents with their prompts, the edges that wire them together and the model bound
+to each node. All three are ordinary optimizable parameters, so an optimizer can improve
+the prompts, the topology and the model choice against a task you care about, and every
+run leaves a full per-agent trace. A single agent is the smallest system, not a special
+case.
+
+xmas is the multi-agent sibling of [promptolution](https://github.com/gepromptet/promptolution):
+it keeps the same five nouns, Task, Predictor, LLM, Optimizer and ExperimentConfig, and
+lifts them one level, the multi-agent system itself being the Predictor. Because xmas
+builds directly on promptolution's base classes rather than reimplementing them, a
+single-agent system is not an analogy to a promptolution predictor, it is exactly one,
+and promptolution's optimizers plug in without a port. Within the gepromptet ecosystem
+that makes promptolution the N=1 case and xmas the general one.
 
 See [docs/design-principles.md](docs/design-principles.md) for the six principles that
 hold the design together.
