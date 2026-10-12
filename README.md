@@ -1,4 +1,4 @@
-# xmas
+# 🎄 xmas
 
 [![CI](https://github.com/gepromptet/xmas/actions/workflows/ci.yml/badge.svg)](https://github.com/gepromptet/xmas/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
@@ -6,97 +6,120 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**xmas is the multi-agent sibling of [promptolution](https://github.com/gepromptet/promptolution).**
-It keeps the same five nouns, Task, Predictor, LLM, Optimizer and ExperimentConfig, and
-lifts them one level: the multi-agent system itself is the Predictor, a structured one
-whose parameters are exposed as ordinary optimizable components, so per-agent prompts,
-the topology wiring the agents together, and the model bound to each node are all things
-an optimizer can improve against a task you care about. Because xmas builds directly on
-promptolution's base classes rather than reimplementing them, a single-agent system is
-not an analogy to a promptolution predictor, it is exactly one, and promptolution's
-optimizers plug in without a port. Within the gepromptet ecosystem that makes
-promptolution the N=1 case and xmas the general one.
+🎁 **xmas builds, runs and optimizes multi-agent systems.** A system is a set of agents,
+the edges that wire them together and the model behind each agent. xmas treats all of it
+as one object whose parts are ordinary parameters, so an optimizer can improve every
+agent's prompt, the wiring and the choice of model against a task you care about. Every
+run leaves a full per-agent trace, so you always know who was naughty and who was nice.
 
-See [docs/design-principles.md](docs/design-principles.md) for the six principles that
-hold the design together.
+### Key Features
 
-> **Status: pre-alpha.** Core inference and the optimization loop are in place.
-> Attribution methods, topology search and the experiment layer are not.
+- **Your first system in minutes:** a few `Agent` objects and their edges, and it runs.
+- **Save and share as YAML:** a whole system (prompts, wiring, models) in one file anyone can load.
+- **Optimization built in:** improve every agent's prompt, the wiring and the models against your task.
 
-## Installation
+See [docs/design-principles.md](docs/design-principles.md) for the principles behind the
+design.
 
-xmas is not published to a package index. Install from source:
+> **Status: beta.** Inference, the optimization loop, CANTANTE and topology search are in
+> place; the experiment layer is still to come.
+
+## 🔧 Installation
+
+xmas is not on PyPI yet. To use it in your own project:
+
+```bash
+uv add git+https://github.com/gepromptet/xmas
+```
+
+To work on xmas itself, clone it:
 
 ```bash
 git clone https://github.com/gepromptet/xmas.git
 cd xmas
 uv sync
+cp .env.example .env   # then set XMAS_BASE_URL and XMAS_API_KEY
 ```
 
-The core depends on `promptolution` and little else. Heavy backends live behind
-extras:
+Tools served over MCP need `uv sync --extra mcp`.
 
-```bash
-uv sync --extra mcp      # MCPTools: tools served over MCP
-```
+## 💡 Your first system in minutes
 
-## Quickstart
+Two agents: an intern drafts an answer, and the boss turns it into the final one.
+`{query}` and `{draft}` name what each agent reads; the intern's `output` is what the boss
+receives.
 
 ```python
-from xmas import Agent, MAS, APILLM
+from xmas import MAS, APILLM, Agent
 
-llm = APILLM(model="llama-3.1-8b", base_url="https://api.tomzehle.com/v1")
+llm = APILLM(model="llama-3.1-8b")  # endpoint and key come from XMAS_BASE_URL / XMAS_API_KEY
 
-solver = Agent("solver", prompt="Solve step by step.", output="draft")
-checker = Agent("checker", prompt="Verify and answer.", inputs=["query", "draft"], output="prediction")
+intern = Agent("intern", prompt="Answer this question, showing your working: {query}", output="draft")
+boss = Agent(
+    "boss",
+    prompt="Question: {query}\nYour intern's draft: {draft}\nGive the final answer in one sentence, as your own.",
+    inputs=["query", "draft"],
+    output="prediction",
+)
 
-mas = MAS([solver, checker], edges=[("solver", "checker")], llm=llm)
+mas = MAS([intern, boss], edges=[("intern", "boss")], llm=llm)
 
-answer = mas("What is 17 * 23?")  # __call__ runs it
-trace = mas.last_trace  # full per-agent record of that call
-
-mas.to_yaml("gsm8k.yaml")  # serialization as methods
-mas2 = MAS.from_yaml("gsm8k.yaml", llm=llm)
-new = mas.copy(prompts={"solver": "..."})  # optimizers derive candidates this way
+print(mas("Why is the sky blue?"))  # the boss's answer
+print(mas.last_trace["intern"][0].outputs)  # who really did the work
 ```
 
-Agents are addressable and mutable through the system:
+Each agent can run on its own model: give it `model="..."` and pass the models by name
+through `MAS(..., llms={...})`.
+
+## 💾 Save and share as YAML
+
+One file holds the whole system: prompts, wiring and models, never keys or endpoints.
 
 ```python
-mas.agents["solver"].prompt = "Solve carefully, showing each step."
+mas.to_yaml("team.yaml")
+team = MAS.from_yaml("team.yaml", llm=llm)
 ```
 
-## The degenerate case
+## 🧠 Optimization built in
 
-A one-agent system is a promptolution predictor, not an analogue of one, so
-promptolution's own optimizers run against it with no adapter:
+CANTANTE improves every agent's prompt at once, splitting each score into credit per agent.
 
 ```python
-from promptolution.tasks.classification_tasks import ClassificationTask
-from promptolution.utils.prompt import Prompt
+from promptolution.optimizers import OPRO
+from xmas import GSM8KTask
+from xmas.optimization import CantanteOptimizer, ContrastiveAttributor
 
-mas = MAS([Agent("solver", prompt="Classify: {query}", output="prediction")], llm=llm)
-task = ClassificationTask(df, x_column="x", y_column="y")
-
-result = task.evaluate(Prompt("Classify: {query}"), predictor=mas)
+task = GSM8KTask.from_huggingface(split="train", n=50)  # needs: uv run --with datasets
+optimizer = CantanteOptimizer(mas, task, ContrastiveAttributor(llm), OPRO, optimizer_kwargs={"meta_llm": llm})
+best = optimizer.optimize(n_steps=5)
+best.to_yaml("team-optimized.yaml")
 ```
 
-## Optimizing
+## 🔗 xmas and promptolution
 
-Every part of a system is a component an optimizer can change. The loop is
-propose, evaluate through the task, select:
+xmas builds on [promptolution](https://github.com/gepromptet/promptolution): a system is a
+promptolution predictor and a task is a promptolution task, so promptolution's optimizers
+run on any agent unchanged.
 
-```python
-from xmas.optimization import PrefixSearchOptimizer
-from xmas.tasks.gsm8k import GSM8KTask
+## 📚 Scientific Publications
 
-task = GSM8KTask.from_huggingface(split="test", n=50)
-best = PrefixSearchOptimizer(mas, task).optimize(n_steps=3)
-```
+Methods implemented in xmas:
 
-`PrefixSearchOptimizer` is deliberately trivial and exists as a control: it
-exercises the whole loop with no algorithm in the way. Real methods arrive as
-`Attributor` and `Updater` implementations, not as new frameworks.
+- **CANTANTE: Optimizing Agentic Systems via Contrastive Credit Attribution** — Zehle, 2026. [arXiv](https://arxiv.org/abs/2605.13295) · `CantanteOptimizer`, `ContrastiveAttributor`
+
+xmas builds on:
+
+- **promptolution: A Unified, Modular Framework for Prompt Optimization** — Zehle et al., 2026. [EACL 2026](https://aclanthology.org/2026.eacl-demo.21/)
+- **CAPO: Cost-Aware Prompt Optimization** — Zehle et al., 2025. [AutoML 2025](https://proceedings.mlr.press/v293/zehle25a.html)
+
+## 🏗 Components
+
+- **`Agent`** – One node: a prompt template, the values it reads and the value it writes.
+- **`MAS`** – The system and the predictor: agents, edges, models and tools; runs a query and keeps its trace.
+- **`Trace`** – The per-agent record of one run: rendered prompts, outputs, tokens, tool calls.
+- **`MASTask`** – A dataset plus a reward over the system's answers, e.g. `GSM8KTask`.
+- **`APILLM`** – Any OpenAI-compatible endpoint, with scoring, tool turns and a per-call log.
+- **`MASOptimizer`** – Propose, evaluate through the task, select; CANTANTE and topology search build on it.
 
 ## Configuration
 
@@ -107,23 +130,6 @@ credential is ever read from or written to the repository.
 |---|---|
 | `XMAS_BASE_URL` | Base URL of an OpenAI-compatible endpoint |
 | `XMAS_API_KEY` | API key for that endpoint |
-
-Copy the template and fill it in locally:
-
-```bash
-cp .env.example .env
-```
-
-`.env` is gitignored, `.env.example` holds dummy values only, and a
-[gitleaks](https://github.com/gitleaks/gitleaks) pre-commit hook scans every commit for
-credentials. If you need a key in CI, add it as a repository secret and expose it as an
-environment variable in the workflow. Never inline it.
-
-Tests that need a live model run against the gateway at
-[`api.tomzehle.com`](https://api.tomzehle.com), which speaks the OpenAI protocol. Point
-`XMAS_BASE_URL` at it and set `XMAS_API_KEY` to your gateway key. Tests that require a
-gateway are skipped when the variables are absent, so a fresh clone is green without any
-credential.
 
 ## Development
 
@@ -139,6 +145,6 @@ uv run mkdocs serve                       # docs at http://127.0.0.1:8000
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, commit convention and review
 expectations.
 
-## License
+## 📄 License
 
 MIT. See [LICENSE](LICENSE).
