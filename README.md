@@ -147,4 +147,4 @@ expectations.
 
 ## 📄 License
 
-MIT. See [LICENSE](LICENSE).
+See [LICENSE](LICENSE).
