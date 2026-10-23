@@ -11,29 +11,18 @@ import pytest
 
 from xmas import MAS, Agent, Box, Budget, ErrorKind, TokenUsage
 from xmas.edges import Edge, EdgeKind
-from xmas.llms.meta import CallMeta
 
-from .test_v2_values import MetaLLM
+from .conftest import MockLLM
 
-
-class FlakyLLM(MetaLLM):
-    """A scripted model whose answer ``TIMEOUT`` is a timeout instead."""
-
-    def generate_with_meta(self, prompt: str, system_prompt: str = "") -> tuple[str, CallMeta]:
-        """Give the next answer, or raise for ``TIMEOUT``."""
-        text, meta = super().generate_with_meta(prompt, system_prompt)
-        if text == "TIMEOUT":
-            raise TimeoutError("the model took too long")
-        return text, meta
+TIMEOUT = TimeoutError("the model took too long")
 
 
-def build(answers: list[str], **kwargs: Any) -> tuple[MAS, Box]:
+def shorten_and_post(answers: list[str | Exception], **kwargs: Any) -> MAS:
     """Writer, then the box ``shorten`` (a one-agent inner system), then poster; a timeout routes to apology."""
-    llm = FlakyLLM(answers)
+    llm = MockLLM(answers=answers, meta=True)
     cutter = Agent("cutter", "Cut this to half its length: {page}", output="short", inputs=["page"])
     inner = MAS([cutter], inputs={"page": "text"}, llm=llm)
-    box = Box("shorten", inner, reads={"page": "draft"}, writes={"short": "draft"})
-    outer = MAS(
+    return MAS(
         [
             Agent("writer", "Write about {query}", output="draft"),
             Agent("poster", "Post {draft}", output="post", inputs=["draft"]),
@@ -44,20 +33,19 @@ def build(answers: list[str], **kwargs: Any) -> tuple[MAS, Box]:
             ("shorten", "poster"),
             Edge("shorten", "apology", EdgeKind.ERROR, errors=("timeout",)),
         ],
-        boxes=[box],
+        boxes=[Box("shorten", inner, reads={"page": "draft"}, writes={"short": "draft"})],
         state={"draft": {"merge": "last"}, "post": {"merge": "last"}},
         llm=llm,
         **kwargs,
     )
-    return outer, box
 
 
-def test_box_maps_in_and_out_and_nests_records() -> None:
-    outer, _ = build(["A long draft about cats.", "Cats.", "Posted."])
+def test_a_box_maps_its_values_in_and_out_and_nests_its_records() -> None:
+    outer = shorten_and_post(["A long draft about cats.", "Cats.", "Posted."])
     trace = outer.run("cats")
     assert trace.error is None and trace.output == "Posted."
 
-    # maps: the outer draft goes in as the inner page; the inner short comes back as the draft
+    # the outer draft goes in as the inner page; the inner short comes back as the draft
     (box,) = trace["shorten"]
     assert box.kind == "box" and box.route == ("poster",)
     assert box.inputs == {"draft": "A long draft about cats."} and box.outputs == {"draft": "Cats."}
@@ -68,7 +56,7 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
     assert box.cost_usd == pytest.approx(0.01) and box.tokens == TokenUsage(10, 2)
     assert box.usage == box.inner.records[0].usage
 
-    # nested records: the trace keeps them inside the box, walk() names the path
+    # the trace keeps the inner records inside the box, and walk() names the path
     assert [r.agent for r in trace.records] == ["writer", "shorten", "poster"]
     assert [(path, r.agent) for path, r in trace.walk()] == [
         ((), "writer"),
@@ -80,8 +68,9 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
     assert data["kind"] == "box" and [r["agent"] for r in data["inner"]["records"]] == ["cutter"]
     assert "inner" not in trace.to_dict()["records"][0]
 
-    # a box inside a box: the path names both
-    again, _ = build(["A long draft about cats.", "Cats.", "Posted.", "Echoed."])
+
+def test_a_box_inside_a_box_names_both_in_the_path() -> None:
+    again = shorten_and_post(["A long draft about cats.", "Cats.", "Posted.", "Echoed."])
     wrapper = MAS(
         [Agent("echo", "Echo {post}", output="echoed", inputs=["post"])],
         [("all", "echo")],
@@ -99,15 +88,17 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
         ((), "echo"),
     ]
 
-    # one budget: the outer max_calls counts the inner call
-    limited, _ = build(["A long draft about cats.", "Cats.", "Posted."], budget=Budget(max_calls=2))
+
+def test_the_outer_budget_counts_the_inner_calls() -> None:
+    limited = shorten_and_post(["A long draft about cats.", "Cats.", "Posted."], budget=Budget(max_calls=2))
     failed = limited.run("cats")
     assert failed.error_kind == ErrorKind.BUDGET
     assert [r.agent for r in failed.records] == ["writer", "shorten"]
     assert failed.health is not None and failed.health.budget["calls"] == {"spent": 2, "limit": 2}
 
-    # an inner failure leaves the box with its kind, and the outer `on error` routes it
-    routed_mas, _ = build(["A long draft about cats.", "TIMEOUT", "Sorry."])
+
+def test_an_inner_failure_fails_the_box_with_its_kind_and_the_outer_error_edge_routes_it() -> None:
+    routed_mas = shorten_and_post(["A long draft about cats.", TIMEOUT, "Sorry."])
     routed = routed_mas.run("cats")
     assert routed.error is None and routed.output == "Sorry."
     (failed_box,) = routed["shorten"]
@@ -120,7 +111,7 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
 
 def test_a_failed_box_keeps_its_inner_trace_and_cost() -> None:
     """The inner system's paid calls before its failure stay in the box's failed record, and in the trace's cost."""
-    llm = FlakyLLM(["A draft.", "Cut.", "TIMEOUT", "Sorry."])
+    llm = MockLLM(answers=[], meta=True)
     inner = MAS(
         [
             Agent("cutter", "Cut {page}", output="short", inputs=["page"]),
@@ -138,7 +129,7 @@ def test_a_failed_box_keeps_its_inner_trace_and_cost() -> None:
         llm=llm,
     )
     for _ in range(2):  # a second run on the same inner system shows only its own records
-        llm.answers = ["A draft.", "Cut.", "TIMEOUT", "Sorry."]
+        llm.answers = ["A draft.", "Cut.", TIMEOUT, "Sorry."]
         trace = outer.run("cats")
         assert trace.error is None and trace.output == "Sorry."
         (box,) = trace["shorten"]

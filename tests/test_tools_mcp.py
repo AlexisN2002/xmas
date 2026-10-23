@@ -25,9 +25,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from xmas import MAS, Agent, ToolCall
 from xmas.errors import XmasError
+from xmas.nodes import Step
+from xmas.tools import index_tools
 from xmas.tools.mcp import MCPTools, result_text
+from xmas.values import JSON, TEXT
 
-from .test_tools import ToolMockLLM, req
+from .conftest import MockLLM, req
 
 KEY = "sk-sx-good"
 
@@ -87,6 +90,16 @@ class Server:
             await asyncio.sleep(ms / 1000)
             self.in_flight -= 1
             return "slept"
+
+        @mcp.tool()
+        def shout(text: str) -> str:
+            """Shout a text."""
+            return text.upper() + "!"
+
+        @mcp.tool()
+        def tally(text: str) -> str:
+            """Count a text's characters, as JSON."""
+            return json.dumps({"chars": len(text)})
 
         @mcp.tool(name="bad.name")
         def bad() -> str:
@@ -149,7 +162,7 @@ def remote(server: tuple[Server, str]) -> Iterator[MCPTools]:
 
 def test_lists_tools_once_and_skips_names_openai_would_refuse(remote: MCPTools) -> None:
     names = [t.name for t in remote.tools()]
-    assert names == ["run_python", "refuse", "slow"]
+    assert names == ["run_python", "refuse", "slow", "shout", "tally"]
     run_python = remote.tools()[0]
     assert run_python.fn is None
     assert run_python.description == "Run Python code."
@@ -234,7 +247,7 @@ def test_http_refusals(server: tuple[Server, str], key: str, status: int, match:
 
 def test_a_mas_runs_remote_tools_and_ends_on_a_refusal(remote: MCPTools) -> None:
     agent = Agent("coder", "Compute {query}", output="answer", tools=["run_python", "refuse"])
-    llm = ToolMockLLM([("", [req("run_python", '{"code": "2**10"}')]), ("1024", [])])
+    llm = MockLLM(turns=[("", [req("run_python", '{"code": "2**10"}')]), ("1024", [])])
     mas = MAS(agents=[agent], llm=llm, tools=[remote])
     trace = mas.run("2**10")
     assert trace.error is None
@@ -244,6 +257,30 @@ def test_a_mas_runs_remote_tools_and_ends_on_a_refusal(remote: MCPTools) -> None
     llm.turns = [("", [req("refuse", '{"code": "too_many_concurrent", "status": 429, "retry_after_s": 1}')])]
     trace = mas.run("again")
     assert trace.error == "XmasError: mcp: too_many_concurrent (429): too_many_concurrent happened"
+
+
+def test_one_remote_callable_is_a_tool_and_a_step(server: tuple[Server, str]) -> None:
+    with MCPTools(server[1], KEY, writes={"tally": {"tally": "json"}}) as remote:
+        listed = {spec.name: spec for spec in remote.tools()}
+        assert listed["shout"].reads == {"text": TEXT} and listed["shout"].writes == {"shout": TEXT}
+        assert listed["tally"].writes == {"tally": JSON}
+
+        llm = MockLLM(turns=[("", [req("shout", '{"text": "hi"}')]), ("said hi", [])])
+        writer = Agent("writer", "Greet {query}.", output="draft", tools=["shout"])
+        steps = [
+            Step("loud", "shout", reads={"text": "draft"}, writes={"shout": "loud"}),
+            Step("size", "tally", reads={"text": "loud"}),
+        ]
+        mas = MAS([writer], [("writer", "loud"), ("loud", "size")], steps=steps, llm=llm, tools=[remote])
+        assert list(index_tools(mas.tools)) == ["run_python", "refuse", "slow", "shout", "tally"]
+        trace = mas.run("Tom")
+
+    assert trace.error is None
+    called, loud, size = trace.records
+    assert called.tool_calls == (ToolCall("shout", {"text": "hi"}, "HI!"),)
+    assert (loud.kind, loud.inputs, loud.outputs) == ("step", {"draft": "said hi"}, {"loud": "SAID HI!"})
+    assert (size.inputs, size.outputs) == ({"loud": "SAID HI!"}, {"tally": '{"chars": 8}'})
+    assert trace.output == '{"chars": 8}'
 
 
 # ------------------------------------------------------------- construction

@@ -38,9 +38,8 @@ pytest.importorskip("mcp")
 from xmas import APILLM, MAS, Agent
 from xmas.tools.mcp import MCPTools
 
-from .conftest import requires_gateway
+from .conftest import MockLLM, req, requires_gateway
 from .test_live_gateway import GATEWAY_CONCURRENCY, MODEL
-from .test_tools import ToolMockLLM, req
 
 SERVING_XMAS_DIR = Path(os.environ.get("XMAS_SERVING_XMAS_DIR", Path.home() / "serving-xmas"))
 """The serving-xmas checkout the dev server is started from."""
@@ -216,7 +215,7 @@ def coder() -> Agent:
 @requires_docker
 def test_a_scripted_model_runs_python_on_the_dev_server(serving_xmas: DevServer) -> None:
     """The server plumbing without a gateway: a scripted model, a real sandboxed run."""
-    llm = ToolMockLLM([("", [req("run_python", '{"code": "print(2**20)"}')]), (ANSWER, [])])
+    llm = MockLLM(turns=[("", [req("run_python", '{"code": "print(2**20)"}')]), (ANSWER, [])])
     with MCPTools(serving_xmas.url, serving_xmas.key, timeout_s=120) as remote:
         assert [t.name for t in remote.tools()] == ["run_python"]
         trace = MAS(agents=[coder()], llm=llm, tools=[remote]).run(QUESTION)

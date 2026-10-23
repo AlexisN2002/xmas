@@ -12,17 +12,10 @@ import pydantic
 import pytest
 import yaml
 
-from xmas.errors import BudgetExceeded, ErrorKind, RunStatus, classify, kind_of_finish
+from xmas.errors import BudgetExceeded, ErrorKind, RunStatus, XmasError, classify, kind_of_finish
 from xmas.trace import AgentRecord, TokenUsage, Trace
 
-URL = "https://gateway.example/v1/chat/completions"
-
-
-def status_error(
-    cls: type[openai.APIStatusError], status: int, message: str = "", body: object | None = None
-) -> openai.APIStatusError:
-    response = httpx2.Response(status, request=httpx2.Request("POST", URL))
-    return cls(message or f"Error code: {status}", response=response, body=body)
+from .conftest import URL, status_error
 
 
 def validation_error() -> pydantic.ValidationError:
@@ -69,6 +62,9 @@ def cyclic(error: BaseException) -> BaseException:
         (httpx2.ConnectError("refused", request=httpx2.Request("POST", URL)), ErrorKind.OUTAGE),
         (httpx2.ReadTimeout("slow", request=httpx2.Request("POST", URL)), ErrorKind.TIMEOUT),
         (raised_from(httpx2.RemoteProtocolError("closed", request=httpx2.Request("POST", URL))), ErrorKind.OUTAGE),
+        (XmasError("mcp: unauthorized (401): bad key", status=401), ErrorKind.REFUSAL),
+        (XmasError("mcp: tool_not_in_scope (403): nope", status=403), ErrorKind.REFUSAL),
+        (XmasError("mcp: too_many_concurrent (429): 4 in flight", status=429, retry_after=1.0), ErrorKind.RATE_LIMITED),
     ],
     ids=[
         "402",
@@ -86,6 +82,9 @@ def cyclic(error: BaseException) -> BaseException:
         "httpx2-connect",
         "httpx2-timeout",
         "mcp-failure-from-httpx2",
+        "tool-source-401",
+        "tool-source-403",
+        "tool-source-429",
     ],
 )
 def test_classify_reads_types_statuses_bodies_and_chains(error: BaseException, kind: ErrorKind) -> None:

@@ -6,7 +6,7 @@ The models are scripted doubles.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+import re
 from typing import Any
 
 import pytest
@@ -14,101 +14,33 @@ import pytest
 from xmas import END, MAS, Agent, Budget, ErrorKind
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BudgetExceeded
+from xmas.graph import classify_joins
 from xmas.nodes import Step
 from xmas.tools import tool
 
-from .conftest import MockLLM
-from .test_v2_values import MetaLLM
-
-# ----------------------------------------------------------------- callables
-
-
-@tool(writes={"counts": "json"})
-def count_words(draft: str) -> dict[str, int]:
-    """Count the words of a draft."""
-    return {"words": len(draft.split())}
-
-
-@tool(writes={"published": "text"})
-def publish_text(text: str) -> str:
-    """Publish a text."""
-    return f"Published: {text}"
-
-
-@tool(writes={"published": "text"})
-def apology_text(query: str) -> str:
-    """Apologize for a query."""
-    return f"Sorry, no short answer about {query}."
-
+from .conftest import VERDICT, MockLLM, worked_example
 
 OK = '{"fits": true, "action": "publish"}'
-
-VERDICT = {
-    "fits": {"type": "bool", "means": "the draft makes one claim in under 300 words"},
-    "action": {"type": "text", "one of": ["publish", "shorten"], "means": "what should happen next"},
-}
+NO = '{"fits": false, "action": "publish"}'
 
 
-def worked_example(verdicts: Iterator[str], **kwargs: Any) -> MAS:
-    """§3's system without the box and web_fetch, the judge answering from ``verdicts``."""
-    llm = MockLLM(lambda p: "A short draft about cats." if p.startswith("Answer") else next(verdicts))
-    writer = Agent(
-        "writer",
-        "Answer {query} in a short draft. The last verdict, empty at first: {verdict}",
-        output="draft",
-        inputs=["query", "verdict"],
-    )
-    judge = Agent(
-        "judge",
-        "Judge this draft: {draft}\nIts word counts: {counts}",
-        output="verdict",
-        inputs=["draft", "counts"],
-        output_type="json",
-        schema=VERDICT,
-    )
-    return MAS(
-        [writer, judge],
-        [
-            ("writer", "count"),
-            ("count", "judge"),
-            Edge("judge", "writer", EdgeKind.WHILE, when="not verdict.fits", max_visits=3),
-            Edge("judge", "publish", EdgeKind.SWITCH, switch="verdict.action"),
-            Edge("judge", "apology", EdgeKind.ELSE),
-        ],
-        steps=[
-            Step("count", "count_words"),
-            Step("publish", "publish_text", {"text": "draft"}),
-            Step("apology", "apology_text"),
-        ],
-        state={"published": {"merge": "last"}},
-        llm=llm,
-        tools=[count_words, publish_text, apology_text],
-        **kwargs,
-    )
-
-
-# --------------------------------------------------------------------- tests
-
-
-def test_when_else_while_switch() -> None:
-    no, yes = '{"fits": false, "action": "publish"}', '{"fits": true, "action": "publish"}'
-
-    # the back edge twice, then the switch case
-    trace = worked_example(iter([no, no, yes])).run("cats")
+def test_a_while_edge_loops_back_until_the_switch_routes_on() -> None:
+    trace = worked_example(iter([NO, NO, OK])).run("cats")
     assert trace.error is None
     assert [r.agent for r in trace.records] == ["writer", "count", "judge"] * 3 + ["publish"]
     assert [r.route for r in trace["judge"]] == [("writer",), ("writer",), ("publish",)]
     assert [r.route for r in trace.records if r.agent != "judge"] == [None] * 7
     assert not any(r.capped for r in trace.records)
-    assert trace["writer"][1].inputs["verdict"] == '{"fits": false, "action": "publish"}'
+    assert trace["writer"][1].inputs["verdict"] == NO
     assert trace["writer"][0].inputs["verdict"] == ""  # a first-visit gap renders empty, so nothing is unfilled
     assert trace.output == "Published: A short draft about cats."
     assert trace.health is not None and trace.health.loops == {"judge -> writer": {"taken": 2, "cap_hit": False}}
     assert trace.to_dict()["records"][2]["route"] == ["writer"]
     assert "capped" not in trace.to_dict()["records"][2]
 
-    # the loop at its cap: capped, and the else route (§7's 2b snippet)
-    trace = worked_example(itertools.repeat(no)).run("cats")
+
+def test_a_loop_at_its_cap_is_capped_and_takes_the_else_route() -> None:
+    trace = worked_example(itertools.repeat(NO)).run("cats")
     assert [r.agent for r in trace.records] == ["writer", "count", "judge"] * 3 + ["apology"]
     assert [(r.route, r.capped) for r in trace["judge"]] == [(("writer",), False)] * 2 + [(("apology",), True)]
     assert trace.output == "Sorry, no short answer about cats."
@@ -122,12 +54,14 @@ def test_when_else_while_switch() -> None:
     assert trace.to_dict()["records"][8]["capped"] is True
     assert trace.to_dict()["health"]["loops"] == {"judge -> writer": {"taken": 2, "cap_hit": True}}
 
-    # a switch value outside the cases takes else
+
+def test_a_switch_value_outside_the_cases_takes_else() -> None:
     trace = worked_example(iter(['{"fits": true, "action": "shorten"}'])).run("cats")
     assert [r.agent for r in trace.records] == ["writer", "count", "judge", "apology"]
     assert trace["judge"][0].route == ("apology",)
 
-    # a when edge: the first that holds wins, in declared order
+
+def test_the_first_when_edge_that_holds_wins_in_declared_order() -> None:
     llm = MockLLM(lambda p: "12" if p.startswith("Score") else f"done: {p}")
     scorer = Agent("scorer", "Score {query}", output="score", output_type="json")
     high, low = Agent("high", "High {score}", output="note", inputs=["score"]), Agent("low", "Low", output="note")
@@ -145,8 +79,8 @@ def test_when_else_while_switch() -> None:
     assert [r.agent for r in trace.records] == ["scorer", "high"] and trace.output == "done: High 12"
 
 
-def test_merges_and_joins() -> None:
-    """S2: a loop with a when/else merge ``m`` inside joins a parallel chain at ``fin``, which runs once."""
+def test_a_merge_inside_a_loop_joins_a_parallel_chain_that_runs_once() -> None:
+    """A loop whose when/else merge ``m`` feeds ``fin``, which also waits for the chain s1 -> s2 -> s3."""
     drafts = iter(["A rather long first draft.", "Short.", "Short."])
 
     def answer(prompt: str) -> str:
@@ -157,17 +91,14 @@ def test_merges_and_joins() -> None:
         """Say whether a draft is long."""
         return {"long": len(draft) > 10}
 
-    def agent(name: str, prompt: str, output: str, inputs: list[str]) -> Agent:
-        return Agent(name, prompt, output=output, inputs=inputs)
-
     agents = [
-        agent("s1", "S1: {query}", "one", ["query"]),
-        agent("s2", "S2: {one}", "two", ["one"]),
-        agent("s3", "S3: {two}", "three", ["two"]),
-        agent("w", "Draft {query}", "draft", ["query"]),
-        agent("a", "A: {draft}", "cut", ["draft"]),
-        agent("m", "M: {draft}", "note", ["draft"]),
-        agent("fin", "Fin: {three} {note}", "final", ["three", "note"]),
+        Agent("s1", "S1: {query}", output="one", inputs=["query"]),
+        Agent("s2", "S2: {one}", output="two", inputs=["one"]),
+        Agent("s3", "S3: {two}", output="three", inputs=["two"]),
+        Agent("w", "Draft {query}", output="draft", inputs=["query"]),
+        Agent("a", "A: {draft}", output="cut", inputs=["draft"]),
+        Agent("m", "M: {draft}", output="note", inputs=["draft"]),
+        Agent("fin", "Fin: {three} {note}", output="final", inputs=["three", "note"]),
     ]
     mas = MAS(
         agents,
@@ -199,7 +130,9 @@ def test_merges_and_joins() -> None:
     assert "__in__.fin.1" not in names  # a relay runs, but leaves no record
 
 
-def test_on_error_routes_by_kind() -> None:
+def fetch_and_join() -> MAS:
+    """``fetch`` (failing as its query says) and ``side`` feed the join ``j``; a timeout of fetch goes to ``fb``."""
+
     @tool(writes={"page": "text"})
     def fetch(query: str) -> str:
         """Fetch a page, or fail as the query says."""
@@ -220,7 +153,7 @@ def test_on_error_routes_by_kind() -> None:
         return f"note on {query}"
 
     joiner = Agent("j", "Join {page} and {extra}", output="answer", inputs=["page", "extra"])
-    mas = MAS(
+    return MAS(
         [joiner],
         [
             ("fetch", "j"),
@@ -234,13 +167,17 @@ def test_on_error_routes_by_kind() -> None:
         tools=[fetch, fallback, side],
     )
 
-    ok = mas.run("cats")
+
+def test_a_node_that_succeeds_takes_its_plain_route() -> None:
+    ok = fetch_and_join().run("cats")
     assert ok.error is None and ok.output == "JOIN PAGE ON CATS AND NOTE ON CATS"
     assert sorted(r.agent for r in ok.records) == ["fetch", "j", "side"]
     assert ok["fetch"][0].route == ("j",)
 
-    # a timeout takes its route: a failed record, no writes, and the join still runs once
-    routed = mas.run("slow")
+
+def test_a_failure_of_a_routed_kind_takes_its_error_route() -> None:
+    """A failed record without writes, and the join still runs once."""
+    routed = fetch_and_join().run("slow")
     assert routed.error is None and routed.error_kind is None
     assert routed.output == "JOIN CACHED PAGE ON SLOW AND NOTE ON SLOW"
     assert [r.agent for r in routed.records].count("j") == 1
@@ -252,17 +189,21 @@ def test_on_error_routes_by_kind() -> None:
     assert routed.health is not None
     assert [(f.signal, f.node) for f in routed.health.flags] == [("error_routed", "fetch")]
 
-    # an outage has no route: the run fails as in phase 1, and keeps the failed record
-    unrouted = mas.run("down")
+
+def test_a_failure_without_a_route_fails_the_run_and_keeps_the_failed_record() -> None:
+    unrouted = fetch_and_join().run("down")
     assert unrouted.error_kind == ErrorKind.OUTAGE and unrouted.output == ""
     assert [(r.agent, r.error_kind) for r in unrouted.records if r.error] == [("fetch", ErrorKind.OUTAGE)]
     assert unrouted["fetch"][0].route is None
 
-    # a bad format after the retry is routed with the cost of both paid attempts
-    judge = Agent("judge", "Judge {query}", output="verdict", output_type="json", schema=VERDICT)
-    sorry = Agent("sorry", "Sorry about {query}", output="verdict_text")
-    llm = MetaLLM(["not json", "still not json", "We are sorry."])
-    mas = MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=llm)
+
+JUDGE = Agent("judge", "Judge {query}", output="verdict", output_type="json", schema=VERDICT)
+SORRY = Agent("sorry", "Sorry about {query}", output="verdict_text")
+
+
+def test_a_bad_format_is_routed_with_the_cost_of_both_paid_attempts() -> None:
+    llm = MockLLM(answers=["not json", "still not json", "We are sorry."], meta=True)
+    mas = MAS([JUDGE, SORRY], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=llm)
     trace = mas.run("cats")
     assert trace.error is None and trace.output == "We are sorry."
     (failed,) = trace["judge"]
@@ -271,22 +212,25 @@ def test_on_error_routes_by_kind() -> None:
     assert trace.health is not None
     assert [f.signal for f in trace.health.flags] == ["bad_format", "error_routed"]
 
-    # the same system with a judge that answers well: a node whose only out-edge is an error edge
-    # ends the run when it succeeds, so its answer is the output
-    good = MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=MetaLLM([OK]))
+
+def test_a_node_whose_only_out_edge_is_an_error_edge_ends_the_run_when_it_succeeds() -> None:
+    llm = MockLLM(answers=[OK], meta=True)
+    good = MAS([JUDGE, SORRY], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=llm)
     assert sorted(good.graph.predecessors(END)) == ["judge", "sorry"]
     assert good.to_dict()["edges"] == [{"judge -> sorry": {"on error": ["bad_format"]}}]  # the END wiring is implicit
     trace = good.run("cats")
     assert trace.error is None and [r.agent for r in trace.records] == ["judge"]
     assert trace.output == OK and trace["judge"][0].route == (END,)
 
-    # a budget refusal is never routed, not even by `any`, and no edge may name it
+
+def test_a_budget_refusal_is_never_routed() -> None:
+    """Not even by ``any``, and no edge may name it or a stop."""
+    llm = MockLLM(answers=["unused"], meta=True)
     for kind in ("budget", "stopped"):
         with pytest.raises(ValueError, match=kind):
-            MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=(kind,))], llm=llm)
-    llm = MetaLLM(["unused"])
+            MAS([JUDGE, SORRY], [Edge("judge", "sorry", EdgeKind.ERROR, errors=(kind,))], llm=llm)
     mas = MAS(
-        [judge, sorry],
+        [JUDGE, SORRY],
         [Edge("judge", "sorry", EdgeKind.ERROR, errors=("any",))],
         llm=llm,
         budget=Budget(max_calls=0),
@@ -315,7 +259,13 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
             *error_edges,
         ]
         state = {"final": {"merge": "last"}}
-        return MAS([writer, done, again], edges, state=state, tools=[long_enough], llm=MetaLLM(["a draft"] * 3))
+        return MAS(
+            [writer, done, again],
+            edges,
+            state=state,
+            tools=[long_enough],
+            llm=MockLLM(answers=["a draft"] * 3, meta=True),
+        )
 
     unrouted = build().run("cats")
     assert unrouted.error is not None and "returned str, not bool" in unrouted.error
@@ -333,7 +283,7 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
         ],
         state={"final": {"merge": "last"}},
         tools=[long_enough],
-        llm=MetaLLM(["a draft", "We are sorry."]),
+        llm=MockLLM(answers=["a draft", "We are sorry."], meta=True),
     )
     routed = mas.run("cats")
     assert routed.error is None and routed.output == "We are sorry."
@@ -353,7 +303,7 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
             ],
             state={"final": {"merge": "last"}},
             tools=[long_enough],
-            llm=MetaLLM([]),
+            llm=MockLLM(answers=[], meta=True),
         )
 
 
@@ -383,3 +333,75 @@ def test_a_falsy_switch_case_is_a_case() -> None:
     assert [mas.run(query).output for query in ("cats", "", "kittens")] == ["zero", "no", "other"]
     restored = MAS.from_dict(dict(mas.to_dict()), llm=MockLLM(lambda p: p), tools=[score_of])
     assert [edge.case for edge in restored.edges] == [0, False, None]
+
+
+# Shapes of fan-in: (nodes, edges as (source, target, kind)) -> what each node with several inputs is, or the refusal.
+KINDS: dict[str, dict[str, Any]] = {
+    "plain": {},
+    "when": {"kind": EdgeKind.WHEN, "when": "flag"},
+    "switch": {"kind": EdgeKind.SWITCH, "switch": "verdict.action"},
+    "else": {"kind": EdgeKind.ELSE},
+    "while": {"kind": EdgeKind.WHILE, "when": "flag", "max_visits": 3},
+    "error": {"kind": EdgeKind.ERROR, "errors": ("any",)},
+}
+SHAPES: dict[str, tuple[str, list[tuple[str, str, str]], dict[str, str] | str]] = {
+    "loop with an exit": (
+        "writer render measure judge assemble sign_off",
+        [("writer", "render", "plain"), ("render", "measure", "plain"), ("measure", "judge", "plain"),
+         ("judge", "writer", "while"), ("judge", "assemble", "else"), ("assemble", "sign_off", "plain")],
+        {},
+    ),
+    "when/else diamond": (
+        "a b c m", [("a", "b", "when"), ("a", "c", "else"), ("b", "m", "plain"), ("c", "m", "plain")], {"m": "merge"}
+    ),
+    "parallel diamond": (
+        "a b c j", [("a", "b", "plain"), ("a", "c", "plain"), ("b", "j", "plain"), ("c", "j", "plain")],
+        {"j": "join, 2 groups"},
+    ),
+    "on-error fallback into a join": (
+        "f p1 p2 fb j",
+        [("f", "p1", "plain"), ("f", "p2", "plain"), ("p1", "j", "plain"), ("p1", "fb", "error"),
+         ("fb", "j", "plain"), ("p2", "j", "plain")],
+        {"j": "join, 2 groups"},
+    ),
+    "ambiguous": (
+        "f b x d e j",
+        [("f", "b", "plain"), ("f", "x", "plain"), ("x", "d", "when"), ("x", "e", "else"),
+         ("b", "j", "plain"), ("d", "j", "plain")],
+        "node 'j' is neither a merge nor a join: d -> j does not run on every pass that runs b -> j",
+    ),
+    "loop exit joins a parallel chain": (
+        "w c a b m s1 s3 fin",
+        [("w", "c", "plain"), ("c", "a", "when"), ("c", "b", "else"), ("a", "m", "plain"), ("b", "m", "plain"),
+         ("m", "w", "while"), ("m", "fin", "else"), ("s1", "s3", "plain"), ("s3", "fin", "plain")],
+        {"m": "merge", "fin": "join, 2 groups"},
+    ),
+    "parallel join with an inner diamond": (
+        "f b x y z w j",
+        [("f", "b", "plain"), ("f", "x", "plain"), ("x", "y", "when"), ("x", "z", "else"),
+         ("y", "w", "plain"), ("z", "w", "plain"), ("w", "j", "plain"), ("b", "j", "plain")],
+        {"w": "merge", "j": "join, 2 groups"},
+    ),
+    "switch to two terminals": (
+        "judge post hold", [("judge", "post", "switch"), ("judge", "hold", "else")], {END: "merge"}
+    ),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+def test_each_fan_in_shape_is_a_merge_or_a_join(shape: str) -> None:
+    names, triples, expected = SHAPES[shape]
+    edges = [Edge(source, target, **KINDS[kind]) for source, target, kind in triples]
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            classify_joins(names.split(), edges)
+        return
+    joins = classify_joins(names.split(), edges)
+    assert {n: j.kind if j.kind == "merge" else f"join, {len(j.groups)} groups" for n, j in joins.items()} == expected
+    relays = {name: join.relays for name, join in joins.items() if join.kind == "join"}
+    assert relays == {
+        "parallel diamond": {"j": (None, None)},
+        "on-error fallback into a join": {"j": ("__in__.j.0", None)},  # p1's ok route or fb
+        "loop exit joins a parallel chain": {"fin": ("__in__.fin.0", None)},  # m's else route
+        "parallel join with an inner diamond": {"j": (None, None)},
+    }.get(shape, {})

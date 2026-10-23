@@ -6,7 +6,6 @@ import re
 import time
 from pathlib import Path
 
-import httpx2
 import openai
 import pytest
 
@@ -17,7 +16,7 @@ from xmas.graph import END, START
 from xmas.optimization.attribution import ContrastiveAttributor
 from xmas.optimization.attribution import prompt as attribution_prompt
 
-from .conftest import MockLLM
+from .conftest import MockLLM, status_error
 
 
 def build_pair(llm: MockLLM) -> MAS:
@@ -32,12 +31,6 @@ def solve_and_check(llm: MockLLM, budget: Budget | None = None) -> MAS:
     solver = Agent("solver", prompt="Solve {query}", output="draft")
     checker = Agent("checker", prompt="Check {draft}", inputs=["draft"], output="prediction")
     return MAS([solver, checker], edges=[("solver", "checker")], llm=llm, budget=budget)
-
-
-def status_error(cls: type[openai.APIStatusError], status: int, message: str) -> openai.APIStatusError:
-    """An openai error as the client raises it for an HTTP error status."""
-    response = httpx2.Response(status, request=httpx2.Request("POST", "https://gateway.example/v1/chat/completions"))
-    return cls(message, response=response, body=None)
 
 
 def test_quickstart_runs_and_returns_the_terminal_output(mock_llm: MockLLM) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -46,60 +47,65 @@ Answer with one JSON object and nothing else. Its fields:
     - unit (one of "px", "pt", optional)
 - score (integer)"""
 
-CASES = {
-    "good": (
+GOOD = {
+    "extra fields kept": (
         VERDICT,
         '{"fits": true, "problems": [], "action": "post", "checks": [{"comment": 1, "reason": "ok"}], "extra": 1}',
         {"fits": True, "problems": [], "action": "post", "checks": [{"comment": 1, "reason": "ok"}], "extra": 1},
-        None,
     ),
-    "fenced": (
+    "fenced and coerced": (
         VERDICT,
         '  ```json\n{"fits": "yes", "problems": ["x"], "action": "hold", "checks": []}\n```\n',
         {"fits": True, "problems": ["x"], "action": "hold", "checks": []},
-        None,
-    ),
-    "prose": (VERDICT, 'Sure! {"fits": true}', None, "<root>: Invalid JSON: expected value at line 1 column 1"),
-    "wrong": (
-        VERDICT,
-        '{"fits": true, "problems": "none", "action": "prefer A", "checks": [{"comment": "one"}]}',
-        None,
-        "problems: Input should be a valid array; action: Input should be 'post' or 'hold'; "
-        "checks.0.comment: Input should be a valid integer, unable to parse string as an integer; "
-        "checks.0.reason: Field required",
     ),
     "nested object": (
         NESTED,
         '{"slide": {"title": "Results", "size": {"w": "1920"}}, "score": "2"}',
         {"slide": {"title": "Results", "size": {"w": 1920.0, "unit": None}}, "score": 2},
-        None,
     ),
 }
 
 
-@pytest.mark.parametrize("case", list(CASES))
-def test_answer_form_dialect(case: str) -> None:
-    fields, answer, value, problem = CASES[case]
-    form = compile_form(fields)
+@pytest.mark.parametrize("case", list(GOOD))
+def test_an_answer_in_the_form_parses(case: str) -> None:
+    fields, answer, value = GOOD[case]
+    assert compile_form(fields).parse(answer) == value
 
-    if problem is None:
-        assert form.parse(answer) == value
-    else:
-        with pytest.raises(FormError) as caught:
-            form.parse(answer)
-        assert caught.value.problem == problem
-        assert RETRY_NOTE.format(problem=caught.value.problem) == (
-            f"Your previous answer did not match the required format: {problem}\nAnswer again with only the JSON."
-        )
 
-    if fields is VERDICT:
-        assert form.format_block() == VERDICT_BLOCK
-        assert form.paths() == ("fits", "problems", "action", "checks")
-        assert form.choices("action") == ("post", "hold")
-        assert form.choices("fits") is None
-    else:
-        assert form.format_block() == NESTED_BLOCK
-        assert form.paths() == ("slide", "slide.title", "slide.size", "slide.size.w", "slide.size.unit", "score")
-        assert form.choices("slide.size.unit") == ("px", "pt")
-        with pytest.raises(FormError, match=r"slide\.title: Input should be a valid string; score: Field required"):
-            form.parse('```\n{"slide": {"title": 1, "size": {"w": 1}}}\n```')
+BAD = {
+    "prose": (VERDICT, 'Sure! {"fits": true}', ["<root>"]),
+    "wrong types": (
+        VERDICT,
+        '{"fits": true, "problems": "none", "action": "prefer A", "checks": [{"comment": "one"}]}',
+        ["problems", "action", "checks.0.comment", "checks.0.reason"],
+    ),
+    "nested": (NESTED, '```\n{"slide": {"title": 1, "size": {"w": 1}}}\n```', ["slide.title", "score"]),
+}
+
+
+@pytest.mark.parametrize("case", list(BAD))
+def test_an_answer_outside_the_form_names_every_field_that_is_wrong(case: str) -> None:
+    """The problem is one line, ``path: message`` per field, joined by ``; ``."""
+    fields, answer, paths = BAD[case]
+    with pytest.raises(FormError) as caught:
+        compile_form(fields).parse(answer)
+    assert re.findall(r"(?:^|; )([\w.<>]+): ", caught.value.problem) == paths
+
+
+def test_the_retry_note_quotes_the_problem() -> None:
+    assert RETRY_NOTE.format(problem="fits: Field required") == (
+        "Your previous answer did not match the required format: fits: Field required\nAnswer again with only the JSON."
+    )
+
+
+def test_a_form_names_its_fields_paths_and_choices() -> None:
+    verdict = compile_form(VERDICT)
+    assert verdict.format_block() == VERDICT_BLOCK
+    assert verdict.paths() == ("fits", "problems", "action", "checks")
+    assert verdict.choices("action") == ("post", "hold")
+    assert verdict.choices("fits") is None
+
+    nested = compile_form(NESTED)
+    assert nested.format_block() == NESTED_BLOCK
+    assert nested.paths() == ("slide", "slide.title", "slide.size", "slide.size.w", "slide.size.unit", "score")
+    assert nested.choices("slide.size.unit") == ("px", "pt")

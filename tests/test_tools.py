@@ -6,20 +6,16 @@ No network: the model is a scripted double and the tool source a recording one.
 from __future__ import annotations
 
 import asyncio
-import json
-from collections.abc import Sequence
 from typing import Annotated, Any
 
 import httpx2
 import openai
 import pytest
-from openai.types.chat import ChatCompletion
 from pydantic import Field
 
 import xmas.tools
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
-from xmas.errors import Stopped, XmasError, classify
-from xmas.llms.api_llm import APILLM
+from xmas.errors import Stopped, XmasError
 from xmas.llms.call_log import CallLog
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
@@ -34,64 +30,10 @@ from xmas.tools import (
 )
 from xmas.utils import timestamp
 
-from .conftest import MockLLM
+from .conftest import URL, FakeToolSource, MockLLM, add, answer, recording_llm, req, status_error
 
-# --------------------------------------------------------------------- doubles
-
-Turn = tuple[str, list[ToolCallRequest]]
-
-
-class ToolMockLLM(MockLLM):
-    """A MockLLM that can also take tool turns, scripted or produced by a function."""
-
-    def __init__(self, turns: list[Turn] | None = None, default: Turn = ("done", [])) -> None:
-        """Script the tool turns; ``default`` answers once the script runs out."""
-        super().__init__()
-        self.turns = list(turns or [])
-        self.default = default
-        self.seen: list[tuple[list[dict[str, Any]], list[str]]] = []
-
-    def get_tool_response(self, messages: list[dict[str, Any]], tools: Sequence[Tool]) -> Turn:
-        """Record a snapshot of the history and the tools offered, and answer from the script."""
-        self.seen.append((json.loads(json.dumps(messages)), [t.name for t in tools]))
-        return self.turns.pop(0) if self.turns else self.default
-
-
-class FakeToolSource(ToolSource):
-    """A ToolSource with scripted answers; records every call."""
-
-    def __init__(
-        self,
-        names: Sequence[str] = ("run_python",),
-        answers: dict[str, Any] | None = None,
-        properties: dict[str, Any] | None = None,
-    ) -> None:
-        """Offer ``names``; ``answers`` maps a name to its result, or to an exception to raise.
-
-        ``properties`` is the JSON Schema ``properties`` every tool declares.
-        """
-        schema = {"type": "object", "properties": dict(properties or {})}
-        self.specs = [Tool(name, f"{name} tool", schema) for name in names]
-        self.answers = answers or {}
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.listed = 0
-
-    def tools(self) -> list[Tool]:
-        """Return the tools, counting how often they were listed."""
-        self.listed += 1
-        return list(self.specs)
-
-    def call(self, name: str, arguments: dict[str, Any]) -> str:
-        """Record the call and answer it."""
-        self.calls.append((name, arguments))
-        answer = self.answers.get(name, f"{name} ok")
-        if isinstance(answer, Exception):
-            raise answer
-        return str(answer)
-
-
-def req(name: str, arguments: str = "{}", call_id: str | None = None) -> ToolCallRequest:
-    return ToolCallRequest(call_id or f"call_{name}", name, arguments)
+TOKENS = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+"""The usage block of a provider answer that reports its counts."""
 
 
 def coder(tools: list[str] | None = None) -> Agent:
@@ -99,23 +41,6 @@ def coder(tools: list[str] | None = None) -> Agent:
 
 
 # -------------------------------------------------------------- schema: @tool
-
-
-@tool
-def add(a: int, b: int = 2) -> int:
-    """Add two integers.
-
-    Longer prose that is not part of the description.
-
-    Args:
-        a: The first summand.
-        b: The second summand,
-            continued on a second line.
-
-    Returns:
-        The sum.
-    """
-    return a + b
 
 
 def test_tool_derives_name_description_and_schema() -> None:
@@ -270,17 +195,17 @@ def test_local_tools_reject_remote_tools_and_duplicate_names() -> None:
 
 def test_unknown_tool_name_fails_at_construction() -> None:
     with pytest.raises(ValueError, match=r"unknown tools \['nope'\]; available: \['run_python'\]"):
-        MAS(agents=[coder(["nope"])], llm=ToolMockLLM(), tools=[FakeToolSource()])
+        MAS(agents=[coder(["nope"])], llm=MockLLM(turns=[]), tools=[FakeToolSource()])
 
 
 def test_tool_names_need_a_source_at_all() -> None:
     with pytest.raises(ValueError, match="unknown tools"):
-        MAS(agents=[coder()], llm=ToolMockLLM())
+        MAS(agents=[coder()], llm=MockLLM(turns=[]))
 
 
 def test_duplicate_tool_names_across_sources_fail() -> None:
     with pytest.raises(ValueError, match="offered by both"):
-        MAS(agents=[coder()], llm=ToolMockLLM(), tools=[FakeToolSource(), FakeToolSource()])
+        MAS(agents=[coder()], llm=MockLLM(turns=[]), tools=[FakeToolSource(), FakeToolSource()])
 
     @tool(name="run_python")
     def local_python(code: str) -> str:
@@ -288,18 +213,18 @@ def test_duplicate_tool_names_across_sources_fail() -> None:
         return code
 
     with pytest.raises(ValueError, match="offered by both"):
-        MAS(agents=[coder()], llm=ToolMockLLM(), tools=[local_python, FakeToolSource()])
+        MAS(agents=[coder()], llm=MockLLM(turns=[]), tools=[local_python, FakeToolSource()])
 
 
 def test_the_same_object_listed_twice_counts_once() -> None:
     source = FakeToolSource()
-    mas = MAS(agents=[coder(["run_python", "add"])], llm=ToolMockLLM(), tools=[source, add, source, add])
+    mas = MAS(agents=[coder(["run_python", "add"])], llm=MockLLM(turns=[]), tools=[source, add, source, add])
     assert set(mas.resolve_tools(mas.agents["coder"])) == {"run_python", "add"}
 
 
 def test_local_and_remote_tools_mix() -> None:
     source = FakeToolSource()
-    llm = ToolMockLLM([("", [req("add", '{"a": 40}'), req("run_python")])])
+    llm = MockLLM(turns=[("", [req("add", '{"a": 40}'), req("run_python")])])
     mas = MAS(agents=[coder(["add", "run_python"])], llm=llm, tools=[add, source])
     trace = mas.run("q")
     assert trace.error is None
@@ -320,15 +245,15 @@ def test_a_mas_without_tool_agents_never_touches_its_sources() -> None:
 
 def test_bad_tools_items_and_rounds_are_rejected() -> None:
     with pytest.raises(TypeError, match="Tool objects and tool sources"):
-        MAS(agents=[coder()], llm=ToolMockLLM(), tools=["run_python"])  # type: ignore[list-item]
+        MAS(agents=[coder()], llm=MockLLM(turns=[]), tools=["run_python"])  # type: ignore[list-item]
     with pytest.raises(ValueError, match="max_tool_rounds"):
-        MAS(agents=[coder()], llm=ToolMockLLM(), tools=[FakeToolSource()], max_tool_rounds=-1)
+        MAS(agents=[coder()], llm=MockLLM(turns=[]), tools=[FakeToolSource()], max_tool_rounds=-1)
 
 
 def test_copy_from_dict_and_rebuild_keep_tools() -> None:
     source = FakeToolSource()
     budget = Budget(max_calls=7)
-    mas = MAS(agents=[coder()], llm=ToolMockLLM(), tools=[source], max_tool_rounds=2, budget=budget)
+    mas = MAS(agents=[coder()], llm=MockLLM(turns=[]), tools=[source], max_tool_rounds=2, budget=budget)
 
     copied = mas.copy(prompts={"coder": "Again {query}"})
     assert copied.tools == (source,)
@@ -336,10 +261,10 @@ def test_copy_from_dict_and_rebuild_keep_tools() -> None:
     assert copied.budget is budget
     assert "budget" not in mas.to_dict()
 
-    restored = MAS.from_dict(dict(mas.to_dict()), llm=ToolMockLLM(), tools=[source])
+    restored = MAS.from_dict(dict(mas.to_dict()), llm=MockLLM(turns=[]), tools=[source])
     assert restored.agents["coder"].tools == ["run_python"]
     with pytest.raises(ValueError, match="unknown tools"):
-        MAS.from_dict(dict(mas.to_dict()), llm=ToolMockLLM())
+        MAS.from_dict(dict(mas.to_dict()), llm=MockLLM(turns=[]))
 
     updater = GraphUpdater(MechanicalSynthesizer(), TopologyBudget(min_agents=1, max_agents=3, max_edges=6))
     rebuilt = updater.rebuild(mas, ["coder", "helper"], [("helper", "coder")])
@@ -352,15 +277,15 @@ def test_copy_from_dict_and_rebuild_keep_tools() -> None:
 
 def test_from_yaml_takes_tools(tmp_path: Any) -> None:
     source = FakeToolSource()
-    mas = MAS(agents=[coder()], llm=ToolMockLLM(), tools=[source])
+    mas = MAS(agents=[coder()], llm=MockLLM(turns=[]), tools=[source])
     path = tmp_path / "mas.yaml"
     mas.to_yaml(path)
-    assert MAS.from_yaml(path, llm=ToolMockLLM(), tools=[source]).agents["coder"].tools == ["run_python"]
+    assert MAS.from_yaml(path, llm=MockLLM(turns=[]), tools=[source]).agents["coder"].tools == ["run_python"]
 
 
 def test_editing_agent_tools_recompiles() -> None:
     source = FakeToolSource()
-    llm = ToolMockLLM(default=("final", []))
+    llm = MockLLM(turns=[], default=("final", []))
     mas = MAS(agents=[Agent("coder", "{query}", output="answer")], llm=llm, tools=[source])
     assert mas.run("q").output == "echo:q"
     before = mas.structure
@@ -374,7 +299,7 @@ def test_editing_agent_tools_recompiles() -> None:
 
 def test_one_round_feeds_the_result_back_as_a_tool_message() -> None:
     source = FakeToolSource(answers={"run_python": "1267650600228229401496703205376"})
-    llm = ToolMockLLM([("thinking", [req("run_python", '{"code": "print(2**100)"}', "c1")]), ("2**100 is big", [])])
+    llm = MockLLM(turns=[("thinking", [req("run_python", '{"code": "print(2**100)"}', "c1")]), ("2**100 is big", [])])
     trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("2**100")
 
     assert trace.error is None
@@ -407,7 +332,7 @@ def test_one_round_feeds_the_result_back_as_a_tool_message() -> None:
 
 def test_calls_in_one_round_run_in_order() -> None:
     source = FakeToolSource(names=("a", "b"))
-    llm = ToolMockLLM([("", [req("b", call_id="1"), req("a", call_id="2")])])
+    llm = MockLLM(turns=[("", [req("b", call_id="1"), req("a", call_id="2")])])
     trace = MAS(agents=[coder(["a", "b"])], llm=llm, tools=[source]).run("q")
     assert [name for name, _ in source.calls] == ["b", "a"]
     assert [c.tool for c in trace["coder"][0].tool_calls] == ["b", "a"]
@@ -417,7 +342,7 @@ def test_calls_in_one_round_run_in_order() -> None:
 
 @pytest.mark.parametrize("rounds", [5, 2, 0])
 def test_endless_requests_stop_after_max_rounds_plus_a_final_turn_without_tools(rounds: int) -> None:
-    llm = ToolMockLLM(default=("again", [req("run_python")]))
+    llm = MockLLM(turns=[], default=("again", [req("run_python")]))
     source = FakeToolSource()
     trace = MAS(agents=[coder()], llm=llm, tools=[source], max_tool_rounds=rounds).run("q")
 
@@ -429,15 +354,15 @@ def test_endless_requests_stop_after_max_rounds_plus_a_final_turn_without_tools(
 
 
 def test_default_is_five_rounds() -> None:
-    llm = ToolMockLLM(default=("again", [req("run_python")]))
+    llm = MockLLM(turns=[], default=("again", [req("run_python")]))
     MAS(agents=[coder()], llm=llm, tools=[FakeToolSource()]).run("q")
     assert len(llm.seen) == 6
 
 
 def test_failed_calls_are_fed_back_and_the_run_goes_on() -> None:
     source = FakeToolSource(answers={"run_python": XmasError("exit_code=1 killed=none\nTraceback")})
-    llm = ToolMockLLM(
-        [
+    llm = MockLLM(
+        turns=[
             ("", [req("run_python", "{not json", "1"), req("run_python", "[1]", "2")]),
             ("", [req("nope", "{}", "3"), req("run_python", '{"code": "x"}', "4")]),
             ("gave up", []),
@@ -467,7 +392,7 @@ def test_failed_calls_are_fed_back_and_the_run_goes_on() -> None:
 )
 def test_refusals_end_the_run(error: Exception, expected: str) -> None:
     source = FakeToolSource(answers={"run_python": error})
-    llm = ToolMockLLM([("", [req("run_python")])])
+    llm = MockLLM(turns=[("", [req("run_python")])])
     mas = MAS(agents=[coder()], llm=llm, tools=[source])
 
     trace = mas.run("q")
@@ -481,7 +406,7 @@ def test_refusals_end_the_run(error: Exception, expected: str) -> None:
 
 
 def test_tools_inside_a_cycle_start_fresh_each_visit() -> None:
-    llm = ToolMockLLM()
+    llm = MockLLM(turns=[])
     llm.turns = [("", [req("run_python")]), ("<continue>", [])] * 5
     agents = [
         Agent("solver", "Solve {query} {feedback}", output="draft", inputs=["query", "feedback"]),
@@ -507,7 +432,7 @@ def test_a_plain_agent_in_a_mixed_mas_sends_exactly_what_it_did_before() -> None
         ]
         return MAS(agents=agents, edges=[("planner", "coder")], llm=llm, tools=[FakeToolSource()])
 
-    plain, mixed = MockLLM(), ToolMockLLM(default=("tool answer", []))
+    plain, mixed = MockLLM(), MockLLM(turns=[], default=("tool answer", []))
     plain_trace = build(plain, with_tools=False).run("q")
     mixed_trace = build(mixed, with_tools=True).run("q")
     assert mixed.calls == plain.calls[:1] == ["Plan q"]
@@ -529,7 +454,7 @@ def test_an_identical_repeat_is_answered_from_the_earlier_result() -> None:
     source = FakeToolSource(answers={"run_python": "1048576"}, properties=RUN_PYTHON_SCHEMA)
     first = '{"code": "print(2**20)", "timeout_s": 20}'
     again = '{"timeout_s": 20, "code": "print(2**20)"}'  # key order does not matter
-    llm = ToolMockLLM([("", [req("run_python", first, "1")]), ("", [req("run_python", again, "2")]), ("done", [])])
+    llm = MockLLM(turns=[("", [req("run_python", first, "1")]), ("", [req("run_python", again, "2")]), ("done", [])])
     trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
 
     assert trace.error is None
@@ -545,8 +470,8 @@ def test_an_identical_repeat_is_answered_from_the_earlier_result() -> None:
 @pytest.mark.usefixtures("dedupe")
 def test_a_numeric_string_for_an_integer_parameter_is_the_same_call() -> None:
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
-    llm = ToolMockLLM(
-        [
+    llm = MockLLM(
+        turns=[
             ("", [req("run_python", '{"code": "x", "timeout_s": 20}', "1")]),
             ("", [req("run_python", '{"code": "x", "timeout_s": "20"}', "2")]),
             ("done", []),
@@ -571,7 +496,7 @@ def test_a_numeric_string_for_an_integer_parameter_is_the_same_call() -> None:
 @pytest.mark.usefixtures("dedupe")
 def test_different_arguments_run_again(first: str, second: str) -> None:
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
-    llm = ToolMockLLM([("", [req("run_python", first, "1"), req("run_python", second, "2")]), ("done", [])])
+    llm = MockLLM(turns=[("", [req("run_python", first, "1"), req("run_python", second, "2")]), ("done", [])])
     trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
     assert len(source.calls) == 2
     assert not any(call.result.startswith(REPEATED_CALL_NOTE) for call in trace["coder"][0].tool_calls)
@@ -587,8 +512,8 @@ def test_a_failed_call_is_run_again() -> None:
             return "ok"
 
     source = FlakySource()
-    llm = ToolMockLLM(
-        [("", [req("run_python", '{"code": "x"}', "1")]), ("", [req("run_python", '{"code": "x"}', "2")])]
+    llm = MockLLM(
+        turns=[("", [req("run_python", '{"code": "x"}', "1")]), ("", [req("run_python", '{"code": "x"}', "2")])]
     )
     trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
     assert len(source.calls) == 2
@@ -608,8 +533,8 @@ def test_a_local_tool_repeat_compares_after_validation() -> None:
         seen.append((base, exp))
         return int(base**exp)
 
-    llm = ToolMockLLM(
-        [
+    llm = MockLLM(
+        turns=[
             ("", [req("power", '{"base": 2, "exp": 20}', "1")]),
             ("", [req("power", '{"base": "2", "exp": "20"}', "2"), req("power", '{"base": 2}', "3")]),
             ("done", []),
@@ -622,11 +547,11 @@ def test_a_local_tool_repeat_compares_after_validation() -> None:
 
 
 def test_dedupe_is_off_by_default() -> None:
-    """A tool call need not be idempotent: version 1 runs every call, as on main."""
+    """A tool call need not be idempotent: version 1 runs every call."""
     assert xmas.tools.DEDUPE_TOOL_CALLS is False
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
     call = '{"code": "x", "timeout_s": 20}'
-    llm = ToolMockLLM([("", [req("run_python", call, "1")]), ("", [req("run_python", call, "2")]), ("done", [])])
+    llm = MockLLM(turns=[("", [req("run_python", call, "1")]), ("", [req("run_python", call, "2")]), ("done", [])])
     trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
     assert len(source.calls) == 2
     assert [c.result for c in trace["coder"][0].tool_calls] == ["run_python ok"] * 2
@@ -634,7 +559,7 @@ def test_dedupe_is_off_by_default() -> None:
 
 def test_run_batch_with_tools() -> None:
     source = FakeToolSource()
-    llm = ToolMockLLM(default=("done", []))
+    llm = MockLLM(turns=[], default=("done", []))
     traces = MAS(agents=[coder()], llm=llm, tools=[source]).run_batch(["a", "b", "c"])
     assert [t.output for t in traces] == ["done"] * 3
     assert all(t.error is None for t in traces)
@@ -643,46 +568,10 @@ def test_run_batch_with_tools() -> None:
 # ------------------------------------------------------ APILLM.get_tool_response
 
 
-def completion(content: str | None, calls: list[dict[str, Any]] | None = None, usage: bool = True) -> ChatCompletion:
-    message: dict[str, Any] = {"role": "assistant", "content": content}
-    if calls:
-        message["tool_calls"] = calls
-    body: dict[str, Any] = {
-        "id": "x",
-        "object": "chat.completion",
-        "created": 0,
-        "model": "m",
-        "choices": [{"index": 0, "finish_reason": "tool_calls" if calls else "stop", "message": message}],
-    }
-    if usage:
-        body["usage"] = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
-    return ChatCompletion.model_validate(body)
-
-
-def api_llm(
-    monkeypatch: pytest.MonkeyPatch, answers: list[Any], **kwargs: Any
-) -> tuple[APILLM, list[dict[str, Any]], CallLog]:
-    log = CallLog()
-    llm = APILLM(
-        model="m", base_url="https://gateway.example/v1", api_key="k", call_log=log, retry_base_delay_s=0, **kwargs
-    )
-    sent: list[dict[str, Any]] = []
-
-    async def create(**kwargs: Any) -> ChatCompletion:
-        sent.append(kwargs)
-        answer = answers.pop(0)
-        if isinstance(answer, Exception):
-            raise answer
-        assert isinstance(answer, ChatCompletion)
-        return answer
-
-    monkeypatch.setattr(llm.client.chat.completions, "create", create)
-    return llm, sent, log
-
-
 def test_api_llm_offers_tools_and_parses_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     call = {"id": "c1", "type": "function", "function": {"name": "add", "arguments": '{"a": 1}'}}
-    llm, sent, log = api_llm(monkeypatch, [completion(None, [call])])
+    log = CallLog()
+    llm, sent = recording_llm(monkeypatch, [answer(None, calls=[call], usage=TOKENS)], call_log=log)
     assert hasattr(llm, "get_tool_response")
 
     messages = [{"role": "user", "content": "hi"}]
@@ -698,7 +587,7 @@ def test_api_llm_offers_tools_and_parses_calls(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_api_llm_omits_tools_on_the_final_turn_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    llm, sent, _ = api_llm(monkeypatch, [RuntimeError("flaky"), completion("42", usage=False)])
+    llm, sent = recording_llm(monkeypatch, [RuntimeError("flaky"), answer("42")])
     text, requests = llm.get_tool_response([{"role": "user", "content": "hi there"}], [])
     assert (text, requests) == ("42", [])
     assert len(sent) == 2
@@ -710,27 +599,27 @@ SAMPLING = ("temperature", "top_p", "stop")
 
 def test_api_llm_sends_no_sampling_parameters_unless_set(monkeypatch: pytest.MonkeyPatch) -> None:
     """Routes that refuse temperature or stop (require_parameters) must still serve a default model."""
-    llm, sent, _ = api_llm(monkeypatch, [completion("a")])
+    llm, sent = recording_llm(monkeypatch, [answer("a")])
     llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
     assert set(sent[0]) == {"model", "messages", "max_tokens", "tools"}
 
     chosen = {"temperature": 0.2, "top_p": 0.9, "stop": ["\n\n"]}
-    llm, sent, _ = api_llm(monkeypatch, [completion("a")], call_kwargs=chosen)
+    llm, sent = recording_llm(monkeypatch, [answer("a")], call_kwargs=chosen)
     llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
     assert {key: sent[0][key] for key in SAMPLING} == chosen
 
 
 def test_api_llm_records_a_failed_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    llm, _, log = api_llm(monkeypatch, [RuntimeError("down")] * 6)
+    log = CallLog()
+    llm, _ = recording_llm(monkeypatch, [RuntimeError("down")] * 6, call_log=log)
     with pytest.raises(RuntimeError, match="down"):
         llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
     assert log.records[-1].ok is False
 
 
 def test_a_cut_tool_turn_fails_as_a_cut_plain_answer_does(monkeypatch: pytest.MonkeyPatch) -> None:
-    cut = completion(None)
-    cut.choices[0].finish_reason = "length"
-    llm, sent, log = api_llm(monkeypatch, [cut])
+    log = CallLog()
+    llm, sent = recording_llm(monkeypatch, [answer(None, finish="length")], call_log=log)
     trace = MAS(agents=[coder(["add"])], llm=llm, tools=[add]).run("q")
     assert trace.error_kind == ErrorKind.LENGTH_CUT and trace.output == ""
     assert trace.error is not None and trace.error.startswith("EmptyResponse: Empty content from model")
@@ -743,14 +632,15 @@ def test_stopped_in_a_local_tool_stops_the_run() -> None:
         """Work slowly, until Stop is pressed."""
         raise Stopped("stop pressed")
 
-    llm = ToolMockLLM([("", [req("slow", '{"text": "x"}')]), ("finished anyway", [])])
+    llm = MockLLM(turns=[("", [req("slow", '{"text": "x"}')]), ("finished anyway", [])])
     trace = MAS(agents=[coder(["slow"])], llm=llm, tools=[slow]).run("q")
     assert trace.error_kind == ErrorKind.STOPPED and trace.output == ""
     assert trace.error == "Stopped: stop pressed"
 
 
 def test_api_llm_tool_turn_records_carry_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
-    llm, _, log = api_llm(monkeypatch, [completion("ok"), *([RuntimeError("down")] * 6)])
+    log = CallLog()
+    llm, _ = recording_llm(monkeypatch, [answer("ok"), *([RuntimeError("down")] * 6)], call_log=log)
     before = timestamp()
     llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
     with pytest.raises(RuntimeError, match="down"):
@@ -766,7 +656,7 @@ def test_api_llm_tool_turn_records_carry_provenance(monkeypatch: pytest.MonkeyPa
 
 def test_api_llm_drives_a_whole_tool_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     call = {"id": "c1", "type": "function", "function": {"name": "add", "arguments": '{"a": 40}'}}
-    llm, sent, _ = api_llm(monkeypatch, [completion("", [call]), completion("42")])
+    llm, sent = recording_llm(monkeypatch, [answer("", calls=[call], usage=TOKENS), answer("42", usage=TOKENS)])
     trace = MAS(agents=[coder(["add"])], llm=llm, tools=[add]).run("q")
     assert trace.error is None
     assert trace.output == "42"
@@ -777,32 +667,11 @@ def test_api_llm_drives_a_whole_tool_agent(monkeypatch: pytest.MonkeyPatch) -> N
     assert (record.served_model, record.finish_reason) == ("m", "stop")  # the last turn's
     assert record.latency_s is not None
 
-    llm, sent, _ = api_llm(monkeypatch, [completion("", [call]), completion("unreachable")])
+    llm, sent = recording_llm(monkeypatch, [answer("", calls=[call]), answer("unreachable")])
     over = MAS(agents=[coder(["add"])], llm=llm, tools=[add], budget=Budget(max_calls=1)).run("q")
     assert len(sent) == 1  # the second turn is refused before it is sent
     assert over.status == "over_budget"
     assert over.error == "BudgetExceeded: calls 1 >= max 1 before call 2"
-
-
-@pytest.mark.parametrize(
-    ("error", "kind"),
-    [
-        (XmasError("mcp: unauthorized (401): bad key", status=401), ErrorKind.REFUSAL),
-        (XmasError("mcp: tool_not_in_scope (403): nope", status=403), ErrorKind.REFUSAL),
-        (XmasError("mcp: too_many_concurrent (429): 4 in flight", status=429, retry_after=1.0), ErrorKind.RATE_LIMITED),
-    ],
-    ids=["401", "403", "429"],
-)
-def test_a_refused_tool_source_is_classified_by_its_status(error: XmasError, kind: ErrorKind) -> None:
-    assert classify(error) is kind
-
-
-URL = "https://gateway.example/v1/chat/completions"
-
-
-def status_error(cls: type[openai.APIStatusError], status: int, message: str = "") -> openai.APIStatusError:
-    response = httpx2.Response(status, request=httpx2.Request("POST", URL))
-    return cls(message or f"Error code: {status}", response=response, body=None)
 
 
 @pytest.fixture
@@ -832,7 +701,8 @@ def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 def test_api_llm_does_not_retry_a_permanent_client_error(
     monkeypatch: pytest.MonkeyPatch, slept: list[float], cls: type[openai.APIStatusError], status: int
 ) -> None:
-    llm, sent, log = api_llm(monkeypatch, [status_error(cls, status), completion("unreachable")])
+    log = CallLog()
+    llm, sent = recording_llm(monkeypatch, [status_error(cls, status), answer("unreachable")], call_log=log)
     llm.retry_base_delay_s = 1.0
     with pytest.raises(cls):
         llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
@@ -857,13 +727,13 @@ def test_api_llm_does_not_retry_a_permanent_client_error(
 def test_api_llm_sends_a_money_error_once(
     monkeypatch: pytest.MonkeyPatch, slept: list[float], error: openai.APIStatusError
 ) -> None:
-    llm, sent, _ = api_llm(monkeypatch, [error, completion("unreachable")])
+    llm, sent = recording_llm(monkeypatch, [error, answer("unreachable")])
     llm.retry_base_delay_s = 1.0
-    with pytest.raises(type(error)) as raised:
+    with pytest.raises(type(error)):
         llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
-    assert (classify(raised.value), len(sent), slept) == (ErrorKind.MONEY, 1, [])
+    assert (len(sent), slept) == (1, [])
 
-    llm, sent, _ = api_llm(monkeypatch, [error, completion("unreachable")])  # the plain path too
+    llm, sent = recording_llm(monkeypatch, [error, answer("unreachable")])  # the plain path too
     with pytest.raises(type(error)):
         llm.generate_with_meta("hi")
     assert len(sent) == 1
@@ -871,7 +741,7 @@ def test_api_llm_sends_a_money_error_once(
 
 def test_a_tool_less_route_fails_the_run_after_one_call(monkeypatch: pytest.MonkeyPatch, slept: list[float]) -> None:
     refused = status_error(openai.NotFoundError, 404, "No endpoints found that support tool use (Tool Compatibility)")
-    llm, sent, _ = api_llm(monkeypatch, [refused, completion("unreachable")])
+    llm, sent = recording_llm(monkeypatch, [refused, answer("unreachable")])
     llm.retry_base_delay_s = 1.0
     trace = MAS(agents=[coder(["add"])], llm=llm, tools=[add]).run("q")
     assert trace.error is not None
@@ -896,7 +766,8 @@ def test_a_tool_less_route_fails_the_run_after_one_call(monkeypatch: pytest.Monk
 def test_api_llm_retries_transient_errors_up_to_the_limit(
     monkeypatch: pytest.MonkeyPatch, slept: list[float], error: Exception
 ) -> None:
-    llm, sent, log = api_llm(monkeypatch, [error] * 6)
+    log = CallLog()
+    llm, sent = recording_llm(monkeypatch, [error] * 6, call_log=log)
     llm.retry_base_delay_s = 1.0
     assert llm.max_retries == 5
     with pytest.raises(type(error)):
@@ -908,7 +779,7 @@ def test_api_llm_retries_transient_errors_up_to_the_limit(
 
 def test_api_llm_recovers_after_a_connection_error(monkeypatch: pytest.MonkeyPatch, slept: list[float]) -> None:
     dropped = openai.APIConnectionError(request=httpx2.Request("POST", URL))
-    llm, sent, _ = api_llm(monkeypatch, [dropped, completion("42")])
+    llm, sent = recording_llm(monkeypatch, [dropped, answer("42")])
     assert llm.get_tool_response([{"role": "user", "content": "hi"}], []) == ("42", [])
     assert len(sent) == 2
     assert len(slept) == 1

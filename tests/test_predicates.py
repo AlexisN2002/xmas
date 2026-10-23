@@ -1,4 +1,4 @@
-"""Predicates: the grammar, the built-ins, and what is refused (plan test 8)."""
+"""Predicates: the grammar, the built-ins, and what is refused."""
 
 from __future__ import annotations
 
@@ -55,21 +55,20 @@ REFUSED = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("text", "expected", "roots"),
-    [*EVALUATE, *((text, problem, None) for text, problem in REFUSED)],
-    ids=range(len(EVALUATE) + len(REFUSED)),
-)
-def test_grammar(text: str, expected: bool | str, roots: set[str] | None) -> None:
-    if isinstance(expected, str):  # refused when parsed, or (an unknown function) when evaluated
-        with pytest.raises(PredicateError, match=re.escape(expected)) as raised:
-            parse_predicate(text).evaluate(Context(VALUES))
-        assert isinstance(raised.value, ValueError)
-        if "position" in expected:
-            assert raised.value.position == int(expected.rsplit(" ", 1)[1])
-        return
+@pytest.mark.parametrize(("text", "expected", "roots"), EVALUATE, ids=range(len(EVALUATE)))
+def test_a_predicate_evaluates_and_names_its_roots(text: str, expected: bool, roots: set[str]) -> None:
     predicate = parse_predicate(text)
     assert predicate.evaluate(CTX) is expected
     assert set(predicate.roots()) == roots
     assert predicate.functions() == ({"is_long"} if "is_long" in text else set())
     assert str(predicate) == text
+
+
+@pytest.mark.parametrize(("text", "problem"), REFUSED, ids=range(len(REFUSED)))
+def test_a_predicate_is_refused_when_parsed_or_evaluated(text: str, problem: str) -> None:
+    """An unknown function is refused when evaluated, everything else when parsed."""
+    with pytest.raises(PredicateError, match=re.escape(problem)) as raised:
+        parse_predicate(text).evaluate(Context(VALUES))
+    assert isinstance(raised.value, ValueError)
+    if "position" in problem:
+        assert raised.value.position == int(problem.rsplit(" ", 1)[1])

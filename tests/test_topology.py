@@ -33,9 +33,8 @@ from xmas.optimization.topology import (
     within_budget,
 )
 from xmas.optimization.updaters import PromptUpdater
-from xmas.tools import tool
 
-from .conftest import MockLLM
+from .conftest import MockLLM, count_words
 
 SEED_NAMES = ["solver", "checker"]
 SEED_EDGES = [("solver", "checker")]
@@ -319,17 +318,6 @@ def test_the_population_keeps_the_best_candidates_as_future_parents() -> None:
 # ----------------------------------------------------------------- version 2
 
 
-@tool(writes={"counts": "json"})
-def count_words(draft: str) -> dict[str, int]:
-    """Count the words of a draft."""
-    return {"words": len(draft.split())}
-
-
-def _answer(prompt: str) -> str:
-    """Script the models: the judge answers JSON, everyone else a draft."""
-    return '{"fits": true}' if prompt.startswith("Judge") else "A short draft."
-
-
 def _judged(*, branches: bool = False) -> MAS:
     """Build planner -> writer -> count -> judge, with a step, a frozen json judge and every runtime field set.
 
@@ -356,12 +344,16 @@ def _judged(*, branches: bool = False) -> MAS:
             ("apology", "final"),
         ]
         state["published"] = {"merge": "last"}
+
+    def answer(prompt: str) -> str:
+        return '{"fits": true}' if prompt.startswith("Judge") else "A short draft."
+
     return MAS(
         agents=agents,
         edges=edges,
         steps=[Step("count", uses="count_words")],
-        llm=MockLLM(_answer),
-        llms={"strong": MockLLM(_answer)},
+        llm=MockLLM(answer),
+        llms={"strong": MockLLM(answer)},
         max_steps=17,
         default_model="base-model",
         tools=[count_words],
@@ -374,9 +366,8 @@ def _judged(*, branches: bool = False) -> MAS:
 
 
 def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Phase 1's worst review defect was a field dropped where an optimizer
-    # rebuilt a system; in version 2 the same rebuild also turned every step
-    # into an agent. Steps stay steps, every field reaches the candidate, and a
+    # A rebuild must not drop a field of the system, nor turn a step into an
+    # agent: steps stay steps, every field reaches the candidate, and a
     # candidate the check refuses (say the writer was removed, so nothing
     # writes the draft) is dropped rather than raised.
     budget = TopologyBudget(min_agents=2, max_agents=7, max_edges=12)
