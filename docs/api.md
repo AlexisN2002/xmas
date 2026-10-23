@@ -113,9 +113,7 @@ Functions an agent may call while it answers: `Agent.tools` names resolve
 against `MAS(..., tools=[...])` when the system is built. `MCPTools` needs the
 `mcp` extra. A tool turn sends sampling parameters (`temperature`, `top_p`,
 `stop`, ...) only when they are set in the model's `call_kwargs`, never as
-defaults. Every requested call runs, since a tool call need not be idempotent;
-`xmas.tools.DEDUPE_TOOL_CALLS = True` opts in to answering a repeated successful
-call (same tool, same arguments) from its earlier result.
+defaults. Every requested call runs, since a tool call need not be idempotent.
 
 ::: xmas.tools
     options:
@@ -126,7 +124,6 @@ call (same tool, same arguments) from its earlier result.
         - ToolCallRequest
         - LocalTools
         - run_step
-        - DEDUPE_TOOL_CALLS
 
 ::: xmas.tools.mcp.MCPTools
 

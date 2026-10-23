@@ -52,18 +52,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.budget import RunMeter, VisitMeter
     from xmas.llms.meta import CallMeta, SupportsMeta
 
-DEDUPE_TOOL_CALLS = False
-"""Whether the tool loop answers a repeated successful call from its earlier result.
-
-Off, every call runs, as a tool call need not be idempotent. Two calls are the
-same when they name the same tool and their arguments are equal as sorted-key
-JSON, after the tool's own validation (or, for a remote tool, after numeric
-strings are read as numbers). Failed calls always run again.
-"""
-
-REPEATED_CALL_NOTE = "[same call as before; result repeated]"
-"""Prefixed to the earlier result when a repeated call is answered without running it."""
-
 
 def _return_type(fn: Callable[..., Any] | None) -> ValueType:
     """Return the type a callable's single write has: text for a ``str`` return hint or a remote tool, else json."""
@@ -424,39 +412,6 @@ def _numbers_from_strings(arguments: dict[str, Any], parameters: dict[str, Any])
     return out
 
 
-def _call_key(tools: ToolIndex, request: ToolCallRequest) -> tuple[str, str] | None:
-    """Return what makes a request the same call as another, or ``None`` for a request that would fail."""
-    try:
-        arguments = json.loads(request.arguments or "{}")
-    except json.JSONDecodeError:
-        return None
-    entry = tools.get(request.name)
-    if not isinstance(arguments, dict) or entry is None:
-        return None
-    spec, _ = entry
-    try:
-        if spec.arguments_model is not None:
-            canonical = spec.validate(arguments)
-        elif spec.fn is None:
-            canonical = _numbers_from_strings(arguments, spec.parameters)
-        else:
-            canonical = arguments
-        return spec.name, json.dumps(canonical, sort_keys=True, default=repr)
-    except (XmasError, TypeError, ValueError):
-        return None
-
-
-def _run_or_repeat(tools: ToolIndex, request: ToolCallRequest, succeeded: dict[tuple[str, str], str]) -> ToolCall:
-    """Run one requested call, or, with ``DEDUPE_TOOL_CALLS``, repeat the result of an equal call that succeeded."""
-    key = _call_key(tools, request) if DEDUPE_TOOL_CALLS else None
-    if key is not None and key in succeeded:
-        return ToolCall(request.name, json.loads(request.arguments or "{}"), f"{REPEATED_CALL_NOTE}\n{succeeded[key]}")
-    call = execute_tool_call(tools, request)
-    if key is not None and not call.failed:
-        succeeded[key] = call.result
-    return call
-
-
 def _turn_usage(
     count: Callable[[str], float], messages: list[dict[str, Any]], text: str, requests: Sequence[ToolCallRequest]
 ) -> TokenUsage:
@@ -504,7 +459,6 @@ def run_tool_loop(
     ]
     specs = [spec for spec, _ in tools.values()]
     calls: list[ToolCall] = []
-    succeeded: dict[tuple[str, str], str] = {}
     usage = TokenUsage()
     meta: CallMeta | None = None
     with_meta = cast("SupportsMeta", llm) if supports_meta(llm) else None
@@ -540,7 +494,7 @@ def run_tool_loop(
         ]
         messages.append({"role": "assistant", "content": text or None, "tool_calls": wired})
         for request in requests:
-            call = _run_or_repeat(tools, request, succeeded)
+            call = execute_tool_call(tools, request)
             calls.append(call)
             messages.append({"role": "tool", "tool_call_id": request.id, "content": call.result})
     text, _ = turn([])

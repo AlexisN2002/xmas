@@ -13,7 +13,6 @@ import openai
 import pytest
 from pydantic import Field
 
-import xmas.tools
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
 from xmas.errors import Stopped, XmasError
 from xmas.llms.call_log import CallLog
@@ -21,11 +20,11 @@ from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
 from xmas.optimization.topology import TopologyBudget
 from xmas.tools import (
-    REPEATED_CALL_NOTE,
     LocalTools,
     Tool,
     ToolCallRequest,
     ToolSource,
+    _numbers_from_strings,
     tool,
 )
 from xmas.utils import timestamp
@@ -443,66 +442,13 @@ def test_a_plain_agent_in_a_mixed_mas_sends_exactly_what_it_did_before() -> None
 RUN_PYTHON_SCHEMA = {"code": {"type": "string"}, "timeout_s": {"type": "integer"}}
 
 
-@pytest.fixture
-def dedupe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Opt in to answering a repeated successful call from its earlier result."""
-    monkeypatch.setattr(xmas.tools, "DEDUPE_TOOL_CALLS", True)
+def test_a_numeric_string_reads_as_a_number_only_where_the_schema_types_one() -> None:
+    parameters = {"properties": {**RUN_PYTHON_SCHEMA, "scale": {"type": ["number", "null"]}}}
+    arguments = {"code": "20", "timeout_s": "20", "scale": "-1.5"}
+    assert _numbers_from_strings(arguments, parameters) == {"code": "20", "timeout_s": 20, "scale": -1.5}
+    assert _numbers_from_strings({"timeout_s": "20.0"}, parameters) == {"timeout_s": "20.0"}  # not an integer
 
 
-@pytest.mark.usefixtures("dedupe")
-def test_an_identical_repeat_is_answered_from_the_earlier_result() -> None:
-    source = FakeToolSource(answers={"run_python": "1048576"}, properties=RUN_PYTHON_SCHEMA)
-    first = '{"code": "print(2**20)", "timeout_s": 20}'
-    again = '{"timeout_s": 20, "code": "print(2**20)"}'  # key order does not matter
-    llm = MockLLM(turns=[("", [req("run_python", first, "1")]), ("", [req("run_python", again, "2")]), ("done", [])])
-    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
-
-    assert trace.error is None
-    assert len(source.calls) == 1
-    earlier, repeated = trace["coder"][0].tool_calls
-    assert earlier == ToolCall("run_python", {"code": "print(2**20)", "timeout_s": 20}, "1048576")
-    assert repeated.result == f"{REPEATED_CALL_NOTE}\n1048576"
-    assert not repeated.failed
-    assert repeated.arguments == {"timeout_s": 20, "code": "print(2**20)"}
-    assert llm.seen[2][0][-1] == {"role": "tool", "tool_call_id": "2", "content": repeated.result}
-
-
-@pytest.mark.usefixtures("dedupe")
-def test_a_numeric_string_for_an_integer_parameter_is_the_same_call() -> None:
-    source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
-    llm = MockLLM(
-        turns=[
-            ("", [req("run_python", '{"code": "x", "timeout_s": 20}', "1")]),
-            ("", [req("run_python", '{"code": "x", "timeout_s": "20"}', "2")]),
-            ("done", []),
-        ]
-    )
-    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
-    assert len(source.calls) == 1
-    repeated = trace["coder"][0].tool_calls[1]
-    assert repeated.arguments == {"code": "x", "timeout_s": "20"}  # recorded as the model sent it
-    assert repeated.result.startswith(REPEATED_CALL_NOTE)
-
-
-@pytest.mark.parametrize(
-    ("first", "second"),
-    [
-        ('{"code": "x"}', '{"code": "y"}'),
-        ('{"code": "x", "timeout_s": 20}', '{"code": "x", "timeout_s": 21}'),
-        ('{"code": "20"}', '{"code": 20}'),  # a string parameter: no numeric reading
-        ('{"code": "x", "timeout_s": 20}', '{"code": "x", "timeout_s": "20.0"}'),  # not an integer literal
-    ],
-)
-@pytest.mark.usefixtures("dedupe")
-def test_different_arguments_run_again(first: str, second: str) -> None:
-    source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
-    llm = MockLLM(turns=[("", [req("run_python", first, "1"), req("run_python", second, "2")]), ("done", [])])
-    trace = MAS(agents=[coder()], llm=llm, tools=[source]).run("q")
-    assert len(source.calls) == 2
-    assert not any(call.result.startswith(REPEATED_CALL_NOTE) for call in trace["coder"][0].tool_calls)
-
-
-@pytest.mark.usefixtures("dedupe")
 def test_a_failed_call_is_run_again() -> None:
     class FlakySource(FakeToolSource):
         def call(self, name: str, arguments: dict[str, Any]) -> str:
@@ -523,32 +469,8 @@ def test_a_failed_call_is_run_again() -> None:
     )
 
 
-@pytest.mark.usefixtures("dedupe")
-def test_a_local_tool_repeat_compares_after_validation() -> None:
-    seen: list[tuple[int, int]] = []
-
-    @tool
-    def power(base: int, exp: int = 2) -> int:
-        """Raise base to exp."""
-        seen.append((base, exp))
-        return int(base**exp)
-
-    llm = MockLLM(
-        turns=[
-            ("", [req("power", '{"base": 2, "exp": 20}', "1")]),
-            ("", [req("power", '{"base": "2", "exp": "20"}', "2"), req("power", '{"base": 2}', "3")]),
-            ("done", []),
-        ]
-    )
-    trace = MAS(agents=[coder(["power"])], llm=llm, tools=[power]).run("q")
-    assert seen == [(2, 20), (2, 2)]  # "2"/"20" coerce to the first call; exp=2 is new
-    results = [call.result for call in trace["coder"][0].tool_calls]
-    assert results == ["1048576", f"{REPEATED_CALL_NOTE}\n1048576", "4"]
-
-
-def test_dedupe_is_off_by_default() -> None:
-    """A tool call need not be idempotent: version 1 runs every call."""
-    assert xmas.tools.DEDUPE_TOOL_CALLS is False
+def test_a_repeated_call_runs_again() -> None:
+    """A tool call need not be idempotent, so the same call twice runs twice."""
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
     call = '{"code": "x", "timeout_s": 20}'
     llm = MockLLM(turns=[("", [req("run_python", call, "1")]), ("", [req("run_python", call, "2")]), ("done", [])])
