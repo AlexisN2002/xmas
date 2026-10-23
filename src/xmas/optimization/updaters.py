@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from promptolution.optimizers.base_optimizer import BaseOptimizer
@@ -13,24 +15,19 @@ from xmas.tasks.base import MASTask
 
 
 def movable_agents(mas: MAS) -> list[str]:
-    """Return the agents a prompt optimizer may change, in the system's order.
-
-    A frozen agent (``MAS(frozen=...)``) keeps its prompt, model, reads and
-    writes through every optimizer, so it is never a target.
-
-    Args:
-        mas: The system.
-
-    Returns:
-        Every agent not frozen.
-
-    Raises:
-        ValueError: If every agent is frozen, which leaves nothing to optimize.
-    """
+    """Return the agents not frozen, in the system's order; ``ValueError`` when every agent is frozen."""
     names = [name for name in mas.agents if name not in mas.frozen]
     if not names:
         raise ValueError(f"Every agent is frozen ({sorted(mas.frozen)}); there is no prompt to optimize.")
     return names
+
+
+def weakest(names: Sequence[str], credit: Mapping[str, Sequence[float]]) -> str | None:
+    """Return the one of ``names`` with the least mean credit, ``NaN`` ignored, or ``None`` with no credit for any."""
+    allowed = set(names)
+    scored = {name: [v for v in values if not math.isnan(v)] for name, values in credit.items() if name in allowed}
+    usable = {name: values for name, values in scored.items() if values}
+    return min(usable, key=lambda name: sum(usable[name]) / len(usable[name])) if usable else None
 
 
 class PromptUpdater:
@@ -54,14 +51,7 @@ class PromptUpdater:
         steps: int = 1,
         **optimizer_kwargs: Any,
     ) -> None:
-        """Initialize the updater.
-
-        Args:
-            optimizer_cls: A promptolution optimizer class, e.g. ``CAPO``.
-            task: The task to optimize the agent's prompt against.
-            steps: Inner optimization steps per call to :meth:`propose`.
-            **optimizer_kwargs: Forwarded when the optimizer is constructed.
-        """
+        """Initialize the updater; ``optimizer_kwargs`` go to the optimizer, e.g. ``CAPO``."""
         self.optimizer_cls = optimizer_cls
         self.task = task
         self.steps = steps
@@ -74,34 +64,12 @@ class PromptUpdater:
         system back, so it is where a prompt change has the most to gain. With no
         credit available, the first agent in graph order is used, which is
         deterministic and therefore reproducible. A frozen agent is never chosen.
-
-        Args:
-            mas: The current system.
-            credit: Per-agent credit, possibly empty.
-
-        Returns:
-            The chosen agent's name.
-
-        Raises:
-            ValueError: If every agent is frozen.
         """
         names = movable_agents(mas)
-        scored = {name: values for name, values in credit.items() if name in names and values}
-        if not scored:
-            return names[0]
-        return min(scored, key=lambda name: sum(scored[name]) / len(scored[name]))
+        return weakest(names, credit) or names[0]
 
     def propose(self, mas: MAS, credit: dict[str, list[float]], n: int) -> list[MAS]:
-        """Propose candidates that differ in one agent's prompt.
-
-        Args:
-            mas: The current system.
-            credit: Per-agent credit, used to choose which agent to work on.
-            n: How many candidates to return.
-
-        Returns:
-            Up to ``n`` candidates.
-        """
+        """Propose up to ``n`` candidates that differ in the prompt of :meth:`target_agent`."""
         agent = self.target_agent(mas, credit)
         view = AgentPromptView(mas, agent)
         optimizer = self.optimizer_cls(
@@ -118,9 +86,9 @@ class AgentPromptView(BasePredictor):
     """One agent of a MAS, presented as a single-prompt predictor.
 
     A promptolution optimizer improves a prompt for a predictor, and this view is
-    that predictor. It
-    accepts one agent's prompt, holds every other agent fixed, and runs the whole
-    system. The optimizer never learns it is inside a multi-agent graph.
+    that predictor. It accepts one agent's prompt, holds every other agent fixed,
+    and runs the whole system. The optimizer never learns it is inside a
+    multi-agent graph.
 
     Attributes:
         mas: The system the agent belongs to.
@@ -128,15 +96,7 @@ class AgentPromptView(BasePredictor):
     """
 
     def __init__(self, mas: MAS, agent: str) -> None:
-        """Initialize the view.
-
-        Args:
-            mas: The system to run.
-            agent: Name of the agent whose prompt this view exposes.
-
-        Raises:
-            KeyError: If the MAS has no such agent.
-        """
+        """Expose ``agent``'s prompt; ``KeyError`` if the MAS has no such agent."""
         if agent not in mas.agents:
             raise KeyError(f"MAS has no agent {agent!r}; it has {sorted(mas.agents)}.")
         self.mas = mas
@@ -149,16 +109,7 @@ class AgentPromptView(BasePredictor):
         xs: list[str],
         system_prompts: str | list[str] | None = None,
     ) -> tuple[list[str], list[str]]:
-        """Run the system with each prompt substituted into this view's agent.
-
-        Args:
-            prompts: Candidate prompts for this agent, one per input.
-            xs: The inputs.
-            system_prompts: Passed through to the underlying system.
-
-        Returns:
-            A ``(predictions, sequences)`` pair, matching ``BasePredictor``.
-        """
+        """Run the system on ``xs`` with each prompt in this view's agent; ``BasePredictor``'s pair."""
         candidates = [prompts] * len(xs) if isinstance(prompts, str) else list(prompts)
         base = self.mas.prompts()
         encoded = [encode_prompts({**base, self.agent: prompt}) for prompt in candidates]
