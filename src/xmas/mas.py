@@ -264,13 +264,7 @@ class MAS(BasePredictor):
         return self.tool_index
 
     def resolve_tools(self, agent: Agent) -> ToolIndex:
-        """Return the tools an agent may call, keyed by name.
-
-        Args:
-            agent: The agent whose tools are wanted.
-
-        Returns:
-            Each of its tools with the source that runs it.
+        """Return the tools an agent may call, each with the source that runs it.
 
         Raises:
             ValueError: If a name is unknown, or the agent's model cannot call tools.
@@ -279,17 +273,7 @@ class MAS(BasePredictor):
         return select_tools(self._callables(), agent, llm)
 
     def resolve_callable(self, step: Step) -> tuple[Tool, ToolSource]:
-        """Return the callable a step uses, with the source that runs it.
-
-        Args:
-            step: The step.
-
-        Returns:
-            ``(tool, source)`` from the same registry ``Agent.tools`` resolve in.
-
-        Raises:
-            ValueError: If no tool or tool source offers ``step.uses``.
-        """
+        """Return the callable a step uses, with the source that runs it, from the registry ``Agent.tools`` use."""
         index = self._callables()
         if step.uses not in index:
             raise ValueError(f"Step {step.name!r} uses unknown callable {step.uses!r}; available: {sorted(index)}.")
@@ -307,17 +291,7 @@ class MAS(BasePredictor):
         return tuple((edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.WHILE)
 
     def resolve_llm(self, agent: Agent) -> BaseLLM:
-        """Return the model that serves an agent.
-
-        Args:
-            agent: The agent whose model is wanted.
-
-        Returns:
-            The agent's bound model, or the MAS default when it has none.
-
-        Raises:
-            ValueError: If neither a binding nor a default is available.
-        """
+        """Return the agent's bound model, or the MAS default; ``ValueError`` when there is neither."""
         if agent.model is not None:
             return self.llms[agent.model]
         if self.llm is None:
@@ -325,17 +299,7 @@ class MAS(BasePredictor):
         return self.llm
 
     def __call__(self, query: str) -> str:
-        """Run the MAS on one input and return the terminal agent's output.
-
-        Args:
-            query: The input, bound to the ``query`` state variable.
-
-        Returns:
-            The terminal agent's output.
-
-        Raises:
-            RuntimeError: If the run failed.
-        """
+        """Run the MAS on one input and return its output; a failed run raises ``RuntimeError``."""
         trace = self.run(query)
         self.last_trace = trace
         if trace.error is not None:
@@ -343,11 +307,7 @@ class MAS(BasePredictor):
         return trace.output
 
     def _check_runs_on_query(self) -> None:
-        """Refuse to run a system whose inputs are not the one ``query`` text.
-
-        Raises:
-            ValueError: If the system declares other inputs.
-        """
+        """Refuse to run a system whose inputs are not the one ``query`` text."""
         if self.inputs != _QUERY_ONLY:
             declared = {name: str(vtype) for name, vtype in self.inputs.items()}
             raise ValueError(
@@ -356,35 +316,17 @@ class MAS(BasePredictor):
             )
 
     def run(self, query: str) -> Trace:
-        """Run the MAS on one input and return the full record of the run.
+        """Run the MAS on one input and return the trace of the run.
 
-        This is :meth:`__call__` without the shared-state convenience: the trace
-        is returned rather than stashed, which is what concurrent callers want.
-
-        Args:
-            query: The input, bound to the ``query`` state variable.
-
-        Returns:
-            The trace, whose ``output`` field is what :meth:`__call__` returns.
-
-        Raises:
-            ValueError: If the system's inputs are not ``{query: text}``.
+        This is :meth:`__call__` without the shared state: the trace is returned
+        rather than stashed, which is what concurrent callers want. A system
+        whose inputs are not ``{query: text}`` raises ``ValueError``.
         """
         self._check_runs_on_query()
         return runtime.run_one(self, query, self.prompts())
 
     def run_batch(self, queries: list[str]) -> list[Trace]:
-        """Run the MAS over several inputs, concurrently where the LLM allows.
-
-        Args:
-            queries: The inputs.
-
-        Returns:
-            One trace per query, in the order given.
-
-        Raises:
-            ValueError: If the system's inputs are not ``{query: text}``.
-        """
+        """Run the MAS over several inputs, concurrently where the LLM allows; one trace per query, in order."""
         self._check_runs_on_query()
         prompts = self.prompts()
         traces = runtime.run_many(self, queries, [prompts] * len(queries))
@@ -410,15 +352,9 @@ class MAS(BasePredictor):
 
         The MAS itself is not mutated; each element runs against its own prompts.
 
-        Args:
-            prompts: Encoded prompt sets, one per input.
-            xs: The inputs.
-            system_prompts: Accepted for interface compatibility. Agent prompts
-                already carry their instructions, so this is not applied.
-
-        Returns:
-            A ``(predictions, sequences)`` pair, matching ``BasePredictor``. A
-            failed rollout's sequence is empty.
+        ``system_prompts`` is accepted for the interface and not applied: agent
+        prompts carry their instructions. Returns ``(predictions, sequences)``,
+        matching ``BasePredictor``; a failed rollout's sequence is empty.
         """
         if not xs:
             return [], []
@@ -434,8 +370,7 @@ class MAS(BasePredictor):
         self.last_traces = tuple(traces)
 
         preds = [trace.output for trace in traces]
-        # A failed rollout keeps its finished agents' records, but promptolution
-        # gets an empty sequence for it, as it did before records were kept.
+        # A failed rollout keeps its finished records, but promptolution gets an empty sequence for it.
         seqs = [
             "" if trace.failed else "\n".join(f"{r.rendered_prompt}\n{r.raw_response}" for r in trace.records)
             for trace in traces
@@ -462,18 +397,10 @@ class MAS(BasePredictor):
         original by reference, and the budget is carried over; everything else is
         copied, so the original is never touched.
 
-        Args:
-            prompts: Replacement prompts, keyed by agent name.
-            edges: A replacement topology. Replaces the edge set entirely.
-            models: Replacement model bindings, keyed by agent name. A ``None``
-                value unbinds an agent back to the MAS default.
-
-        Returns:
-            The derived MAS.
-
-        Raises:
-            ValueError: If a key names an unknown agent, or the result is not
-                runnable.
+        ``prompts`` and ``models`` are keyed by agent name; a ``None`` model
+        unbinds an agent back to the MAS default. ``edges`` replaces the edge
+        set entirely. A key naming an unknown agent, or a result that is not
+        runnable, raises ``ValueError``.
         """
         prompts = prompts or {}
         models = models or {}
@@ -593,12 +520,8 @@ class MAS(BasePredictor):
         A spec with ``version: 2`` is read as version 2; any other goes through
         :func:`~xmas.spec.validate_spec` as version 1.
 
-        Args:
-            data: A spec produced by :meth:`to_dict`.
-            llm: Default model to attach.
-            llms: Models by name, resolving the spec's bindings.
-            tools: Tools and tool sources, resolving the agents' tool names and
-                the steps' callables.
+        ``llm``, ``llms`` and ``tools`` resolve the spec's model bindings, the
+        agents' tool names and the steps' callables.
 
         Raises:
             ValueError: If the spec is malformed, binds to an unsupplied model,
@@ -688,9 +611,6 @@ class MAS(BasePredictor):
     def to_yaml(self, path: str | Path) -> None:
         """Write the spec to a YAML file.
 
-        Args:
-            path: Destination file.
-
         Raises:
             ValueError: For a version 2 system: its file format comes with the
                 ``.mas`` bundle; :meth:`to_dict` gives its spec.
@@ -713,17 +633,7 @@ class MAS(BasePredictor):
         llms: dict[str, BaseLLM] | None = None,
         tools: Sequence[ToolSource | Tool] = (),
     ) -> MAS:
-        """Read a MAS spec from a YAML file.
-
-        Args:
-            path: Source file.
-            llm: Default model to attach.
-            llms: Models by name, resolving the spec's bindings.
-            tools: Tools and tool sources, resolving the agents' tool names.
-
-        Returns:
-            The reconstructed MAS.
-        """
+        """Read a MAS spec from a YAML file, as :meth:`from_dict` reads it."""
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(data, llm=llm, llms=llms, tools=tools)
 
@@ -817,15 +727,12 @@ class MAS(BasePredictor):
         """What the compiled graph depends on, and what makes two MASs swappable.
 
         Two systems with the same structure differ only in prompts, so one can
-        evaluate the other's prompt sets. An optimizer uses this to batch a whole
-        population of prompt candidates through a single predictor.
-
-        Prompts are deliberately absent: they travel in the run state, so editing
-        one must not throw away a compilation. Anything else about an agent, its
-        wiring or its model, changes the graph itself. A version 2 system adds
-        lines for its steps, edges, answer types and forms, inputs, merges and
-        boxes (each with its inner structure, indented); frozen nodes and health
-        settings change no compiled graph and stay out.
+        evaluate the other's prompt sets; an optimizer batches a population of
+        prompt candidates through one predictor this way. Prompts travel in the
+        run state, so they are absent. A version 2 system adds lines for its
+        steps, edges, answer types and forms, inputs, merges and boxes (each with
+        its inner structure, indented); frozen nodes and health settings change
+        no compiled graph and stay out.
         """
         lines = [
             f"{agent.name} {','.join(agent.inputs)} -> {agent.output} model={agent.model} tools={','.join(agent.tools)}"
@@ -852,11 +759,7 @@ class MAS(BasePredictor):
 
     @property
     def compiled(self) -> Any:
-        """The compiled executable graph, rebuilt whenever the structure changes.
-
-        The compiled object's type is an implementation detail and never appears
-        in a public signature.
-        """
+        """The compiled executable graph, rebuilt whenever the structure changes; its type is not API."""
         if self.compilation is None or self.compilation[0] != self.structure:
             self.compilation = (self.structure, runtime.compile_mas(self))
         return self.compilation[1]

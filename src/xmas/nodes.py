@@ -29,10 +29,6 @@ class Step:
             another name; a parameter not listed reads the value of its own name.
         writes: ``{callable write: value in the graph}`` for writes stored under
             another name; a write not listed keeps its own name.
-
-    Raises:
-        ValueError: If ``name`` or ``uses`` is empty, or a map holds a name that
-            is not a non-empty string.
     """
 
     name: str
@@ -83,12 +79,6 @@ class Box:
             inner system declares.
         writes: ``{inner value: outer value}`` for the inner writes the outer
             system keeps; at least one.
-
-    Raises:
-        ValueError: If ``name`` is empty, ``system`` is not version 2, a map
-            holds a name that is not a non-empty string, ``reads`` does not
-            name exactly the inner inputs, or ``writes`` names no inner write
-            or one the inner system does not write.
     """
 
     name: str

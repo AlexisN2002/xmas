@@ -22,20 +22,12 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Budget:
-    """Limits for one run; ``None`` means no limit.
+    """Limits for one run, in USD, wall seconds and model calls; ``None`` means no limit.
 
     A call may start only while the run is below every limit, so a limit of ``0``
     starts no call. A cost limit that cannot be checked, because a call reported
     no cost and the model has no price, refuses the next call instead of silently
-    not binding.
-
-    Attributes:
-        max_cost_usd: The most the run may spend, in USD.
-        max_wall_s: The most wall seconds the run may take.
-        max_calls: The most model calls the run may start.
-
-    Raises:
-        ValueError: If a limit is negative or NaN.
+    not binding. A negative or NaN limit is refused.
     """
 
     max_cost_usd: float | None = None
@@ -43,7 +35,7 @@ class Budget:
     max_calls: int | None = None
 
     def __post_init__(self) -> None:
-        """Refuse negative limits."""
+        """Refuse negative and NaN limits."""
         for name in ("max_cost_usd", "max_wall_s", "max_calls"):
             value = getattr(self, name)
             if value is not None and not value >= 0:
@@ -84,12 +76,12 @@ class RunMeter(_Metering):
             inherits this meter can tell it is not its own, unless the meter
             adopted that MAS (:meth:`adopt`).
         started_s: ``time.monotonic()`` when the meter was made, then when the
-            run's first agent started (:meth:`start`).
+            run's first node started (:meth:`start`).
         calls: Calls started so far.
         cost_usd: Cost reported or priced so far, in USD.
         uncosted_calls: Finished calls whose cost is unknown.
-        records: Records of the owner's agents that finished, in wall-clock
-            order; an adopted system's are kept apart (:meth:`records_of`).
+        records: Records of the owner's finished visits, in wall-clock order;
+            an adopted system's are kept apart (:meth:`records_of`).
     """
 
     def __init__(self, budget: Budget | None = None, owner: object | None = None) -> None:
@@ -106,14 +98,7 @@ class RunMeter(_Metering):
         self._started = False
 
     def adopt(self, system: object) -> None:
-        """Let a nested system, such as a box's, run on this meter: one budget for both.
-
-        Its calls, cost and wall time count against this meter's limits, and its
-        records are kept apart from the owner's, per system.
-
-        Args:
-            system: The nested system.
-        """
+        """Let a nested system, such as a box's, run on this meter: one budget for both, its records kept apart."""
         with self._lock:
             self._adopted.setdefault(id(system), (system, []))
 
@@ -133,7 +118,7 @@ class RunMeter(_Metering):
         return time.monotonic() - self.started_s
 
     def start(self) -> None:
-        """Restart the clock when the run's first agent starts; later calls do nothing.
+        """Restart the clock when the run's first node starts; later calls do nothing.
 
         A batch makes every item's meter before it runs any, and an item can wait
         for a free worker; that wait is not the run's wall time.
@@ -144,27 +129,17 @@ class RunMeter(_Metering):
                 self.started_s = time.monotonic()
 
     def before_call(self) -> None:
-        """Count a call that is about to start, or refuse it.
+        """Count a call that is about to start, or refuse it with :class:`~xmas.errors.BudgetExceeded`.
 
-        Raises:
-            BudgetExceeded: If the run has made ``max_calls`` calls, has run for
-                ``max_wall_s``, has a cost limit and a call of unknown cost
-                (limit ``"cost_unknown"``), or has spent ``max_cost_usd``; checked
-                in that order.
+        The limits are checked in order: calls, wall time, a cost limit with a
+        call of unknown cost (``"cost_unknown"``), cost.
         """
         with self._lock:
             self._check(count_calls=True)
             self.calls += 1
 
     def check_boundary(self) -> None:
-        """Check the wall and cost limits before work that makes no model call, such as a step.
-
-        Nothing is counted: ``max_calls`` limits model calls only.
-
-        Raises:
-            BudgetExceeded: If the run has run for ``max_wall_s``, has a cost
-                limit and a call of unknown cost, or has spent ``max_cost_usd``.
-        """
+        """Check the wall and cost limits before work that makes no model call, such as a step; nothing is counted."""
         with self._lock:
             self._check(count_calls=False)
 
@@ -185,11 +160,7 @@ class RunMeter(_Metering):
                 raise BudgetExceeded("cost_usd", self.cost_usd, budget.max_cost_usd, self.calls)
 
     def after_call(self, meta: CallMeta | None) -> None:
-        """Add a finished call's cost, or count it as uncosted when it is unknown.
-
-        Args:
-            meta: The call's metadata, or ``None`` when the model gives none.
-        """
+        """Add a finished call's cost, or count it as uncosted when it is unknown."""
         cost = None if meta is None else meta.cost_usd
         with self._lock:
             if cost is None:
@@ -198,13 +169,7 @@ class RunMeter(_Metering):
                 self.cost_usd += cost
 
     def keep(self, record: AgentRecord, system: object | None = None) -> None:
-        """Keep the record of an agent that finished, so a failed run still has it.
-
-        Args:
-            record: The finished agent's record.
-            system: The system the agent belongs to, when it is an adopted one;
-                ``None`` or the owner keeps it in :attr:`records`.
-        """
+        """Keep a finished visit's record, so a failed run still has it; ``system`` names an adopted system."""
         with self._lock:
             self.records_of(self.owner if system is None else system).append(record)
 
@@ -212,16 +177,10 @@ class RunMeter(_Metering):
 class VisitMeter(_Metering):
     """One node visit's share of a run's meter.
 
-    Every call counts on the run's meter as before; the visit also keeps the
-    metadata of its own finished calls, so a visit that fails after paid
-    attempts still records what they cost. A box's visit keeps the trace of its
-    inner system when that fails.
-
-    Attributes:
-        run: The run's meter.
-        metas: The metadata of the visit's finished calls, in order; ``None``
-            for a call whose model gives none.
-        inner: The inner system's trace of a box whose inner system failed.
+    Every call counts on the run's meter; the visit also keeps the metadata of
+    its own finished calls (``metas``, ``None`` for a model that gives none),
+    so a visit that fails after paid attempts still records what they cost. A
+    box's visit keeps the trace of its inner system when that fails (``inner``).
     """
 
     def __init__(self, run: RunMeter) -> None:
@@ -231,11 +190,11 @@ class VisitMeter(_Metering):
         self.inner: Trace | None = None
 
     def before_call(self) -> None:
-        """Count a call that is about to start on the run's meter, or refuse it (:meth:`RunMeter.before_call`)."""
+        """Count a call that is about to start on the run's meter, or refuse it."""
         self.run.before_call()
 
     def check_boundary(self) -> None:
-        """Check the run's wall and cost limits (:meth:`RunMeter.check_boundary`)."""
+        """Check the run's wall and cost limits."""
         self.run.check_boundary()
 
     def after_call(self, meta: CallMeta | None) -> None:
