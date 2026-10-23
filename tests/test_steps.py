@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -20,42 +20,13 @@ from xmas import runtime as engine
 from xmas.budget import RunMeter
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BadFormat, EmptyResponse, XmasError
-from xmas.llms.meta import CallMeta
 from xmas.nodes import Step
 from xmas.schemas import RETRY_NOTE
 from xmas.tools import Tool, ToolSource, index_tools, tool
 from xmas.trace import Rejected
 from xmas.values import JSON, TEXT
 
-from .test_tools import ToolMockLLM, Turn, req
-
-# --------------------------------------------------------------------- doubles
-
-
-META = CallMeta(latency_s=0.5, tokens=TokenUsage(10, 2), cost_usd=0.01)
-
-
-class MetaLLM(ToolMockLLM):
-    """A scripted model that reports call metadata, so the meter can sum cost."""
-
-    full_response = True
-
-    def __init__(self, answers: list[str] | None = None, turns: list[Turn] | None = None) -> None:
-        """Script the plain answers (in order) and the tool turns."""
-        super().__init__(turns)
-        self.answers = list(answers or [])
-
-    def generate_with_meta(self, prompt: str, system_prompt: str = "") -> tuple[str, CallMeta]:
-        """Record the prompt and give the next scripted answer."""
-        self.calls.append(prompt)
-        return self.answers.pop(0), META
-
-    def get_tool_response_meta(
-        self, messages: list[dict[str, Any]], tools: Sequence[Tool]
-    ) -> tuple[str, Any, CallMeta]:
-        """Answer from the tool script, with metadata."""
-        text, requests = self.get_tool_response(messages, tools)
-        return text, requests, META
+from .conftest import META, MockLLM, req
 
 
 def invoke(mas: MAS, query: str) -> tuple[RunMeter, dict[str, Any] | BaseException]:
@@ -94,9 +65,8 @@ def test_a_step_runs_between_agents_with_typed_values() -> None:
     def answer(prompt: str) -> str:
         return "```json\n" + json.dumps(PLAN) + "\n```" if prompt.startswith("Plan") else "A note."
 
-    def build(**kwargs: Any) -> tuple[MAS, ToolMockLLM]:
-        llm = ToolMockLLM()
-        llm.responder = answer
+    def build(**kwargs: Any) -> tuple[MAS, MockLLM]:
+        llm = MockLLM(answer)
         planner = Agent("planner", "Plan a note on {query}.", output="plan", output_type="json", schema=FORM)
         writer = Agent("writer", "Write about {plan} using {counts}.", output="note", inputs=["plan", "counts"])
         mas = MAS(
@@ -181,7 +151,7 @@ def mcp_server() -> Iterator[str]:
 @pytest.mark.parametrize("where", ["local", "mcp"])
 def test_one_callable_is_a_tool_and_a_step(where: str) -> None:
     def run(tools: list[Any]) -> Any:
-        llm = ToolMockLLM([("", [req("shout", '{"text": "hi"}')]), ("said hi", [])])
+        llm = MockLLM(turns=[("", [req("shout", '{"text": "hi"}')]), ("said hi", [])])
         writer = Agent("writer", "Greet {query}.", output="draft", tools=["shout"])
         steps = [Step("loud", "shout", reads={"text": "draft"}, writes={"shout": "loud"})]
         edges = [("writer", "loud")]
@@ -225,7 +195,7 @@ JUDGE_PROMPT = (
 PROSE = "<root>: Invalid JSON: expected value at line 1 column 1"
 
 
-def judge_mas(llm: MetaLLM, tools: list[Any] | None = None) -> MAS:
+def judge_mas(llm: MockLLM, tools: list[Any] | None = None) -> MAS:
     judge = Agent(
         "judge",
         "Judge {query}.",
@@ -243,7 +213,7 @@ def test_answer_form_retries_once_then_bad_format(case: str) -> None:
     retry = RETRY_NOTE.format(problem=PROSE)
 
     if case == "plain ok after retry":
-        llm = MetaLLM(['Sure: {"fits": true}', '{"fits": true}'])
+        llm = MockLLM(answers=['Sure: {"fits": true}', '{"fits": true}'], meta=True)
         meter, state = invoke(judge_mas(llm), "this")
         assert not isinstance(state, BaseException)
         assert llm.calls == [rendered, f"{rendered}\n\n{retry}"]
@@ -255,12 +225,12 @@ def test_answer_form_retries_once_then_bad_format(case: str) -> None:
         assert record.cost_usd == pytest.approx(0.02)
         assert record.tokens == TokenUsage(20, 4)
         assert meter.calls == 2 and meter.cost_usd == pytest.approx(0.02)
-        trace = judge_mas(MetaLLM(['Sure: {"fits": true}', '{"fits": true}'])).run("this")
+        trace = judge_mas(MockLLM(answers=['Sure: {"fits": true}', '{"fits": true}'], meta=True)).run("this")
         assert trace.output == '{"fits": true}'
         assert trace.to_dict()["records"][0]["rejected"] == [{"raw_response": 'Sure: {"fits": true}', "error": PROSE}]
 
     elif case == "plain bad twice":
-        llm = MetaLLM(["Sure.", '{"fits": "perhaps"}'])
+        llm = MockLLM(answers=["Sure.", '{"fits": "perhaps"}'], meta=True)
         meter, error = invoke(judge_mas(llm), "this")
         assert isinstance(error, BadFormat)
         assert error.node == "judge"
@@ -269,16 +239,16 @@ def test_answer_form_retries_once_then_bad_format(case: str) -> None:
         assert meter.calls == 2 and meter.cost_usd == pytest.approx(0.02)
         assert [(r.agent, r.error_kind) for r in meter.records] == [("judge", ErrorKind.BAD_FORMAT)]
         assert meter.records[0].cost_usd == pytest.approx(0.02)
-        trace = judge_mas(MetaLLM(["Sure.", "Sure."])).run("this")
+        trace = judge_mas(MockLLM(answers=["Sure.", "Sure."], meta=True)).run("this")
         assert trace.error_kind == ErrorKind.BAD_FORMAT
         assert trace.error is not None and "after the retry" in trace.error
         # the retry passes the meter too: with one call allowed it is refused
-        limited = judge_mas(MetaLLM(["Sure.", '{"fits": true}']))
+        limited = judge_mas(MockLLM(answers=["Sure.", '{"fits": true}'], meta=True))
         limited.budget = Budget(max_calls=1)
         assert limited.run("this").error_kind == ErrorKind.BUDGET
 
     else:
-        llm = MetaLLM(turns=[("", [req("shout", '{"text": "hi"}')]), ("Sure.", []), ('{"fits": true}', [])])
+        llm = MockLLM(meta=True, turns=[("", [req("shout", '{"text": "hi"}')]), ("Sure.", []), ('{"fits": true}', [])])
         meter, state = invoke(judge_mas(llm, tools=[shout]), "this")
         assert not isinstance(state, BaseException)
         offered = [names for _, names in llm.seen]
@@ -295,7 +265,7 @@ def test_answer_form_retries_once_then_bad_format(case: str) -> None:
         assert record.rejected == (Rejected("Sure.", PROSE),)
         assert meter.calls == 3 and meter.cost_usd == record.cost_usd == pytest.approx(0.03)
         # a second miss fails the run with both problems
-        again = MetaLLM(turns=[("Sure.", []), ("Sure!", [])])
+        again = MockLLM(meta=True, turns=[("Sure.", []), ("Sure!", [])])
         _, error = invoke(judge_mas(again, tools=[shout]), "this")
         assert isinstance(error, BadFormat) and error.problems == (PROSE, PROSE)
 
@@ -308,20 +278,13 @@ def test_a_trace_costs_what_the_meter_paid() -> None:
         [("writer", "shout")],
         steps=[Step("shout", "shout", {"text": "draft"})],
         tools=[shout],
-        llm=MetaLLM(["a draft"]),
+        llm=MockLLM(answers=["a draft"], meta=True),
     )
     trace = mas.run("cats")
     assert [(r.agent, r.cost_usd) for r in trace.records] == [("writer", 0.01), ("shout", 0.0)]
     assert trace.cost_usd == pytest.approx(0.01) and trace.output == "A DRAFT!"
 
-    class CutRetry(MetaLLM):
-        """Answers outside the form, then is cut on the retry."""
-
-        def generate_with_meta(self, prompt: str, system_prompt: str = "") -> tuple[str, CallMeta]:
-            if "did not match" in prompt:
-                self.calls.append(prompt)
-                raise EmptyResponse("Empty content from model", kind=ErrorKind.LENGTH_CUT, meta=META)
-            return super().generate_with_meta(prompt, system_prompt)
+    cut = EmptyResponse("Empty content from model", kind=ErrorKind.LENGTH_CUT, meta=META)  # on the retry
 
     class Refusing(ToolSource):
         """Offers shout, and refuses every call of it."""
@@ -336,10 +299,10 @@ def test_a_trace_costs_what_the_meter_paid() -> None:
     judge = Agent("judge", "Judge {query}", output="verdict", output_type="json", schema={"fits": {"type": "bool"}})
     caller = Agent("judge", "Judge {query}", output="verdict", tools=["shout"])
     cases = [
-        (judge, CutRetry(["Sure.", "We are sorry."]), (), ErrorKind.LENGTH_CUT, 0.02),
+        (judge, MockLLM(answers=["Sure.", cut, "We are sorry."], meta=True), (), ErrorKind.LENGTH_CUT, 0.02),
         (
             caller,
-            MetaLLM(["We are sorry."], turns=[("", [req("shout", '{"text": "hi"}')])]),
+            MockLLM(answers=["We are sorry."], meta=True, turns=[("", [req("shout", '{"text": "hi"}')])]),
             [Refusing()],
             ErrorKind.REFUSAL,
             0.01,
@@ -364,15 +327,21 @@ def test_optional_text_parameter_and_json_null() -> None:
 
     assert tidy.reads == {"draft": TEXT}  # str | None reads text, so a text value may feed it
     writer = Agent("writer", "Write {query}", output="draft")
-    mas = MAS([writer], [("writer", "tidy")], steps=[Step("tidy", "tidy")], tools=[tidy], llm=MetaLLM([" cats "]))
+    mas = MAS(
+        [writer],
+        [("writer", "tidy")],
+        steps=[Step("tidy", "tidy")],
+        tools=[tidy],
+        llm=MockLLM(answers=[" cats "], meta=True),
+    )
     assert mas.run("q").output == "CATS"
 
     # a json null is a value and renders as null (a value not there yet renders empty: test_operators)
     judge = Agent("judge", "Judge {query}", output="verdict", output_type="json")
     reader = Agent("reader", "Read {verdict}", output="note", inputs=["verdict"])
-    llm = MetaLLM(["null", "noted"])
+    llm = MockLLM(answers=["null", "noted"], meta=True)
     trace = MAS([judge, reader], [("judge", "reader")], llm=llm, inputs={"query": "text"}).run("q")
     assert trace["judge"][0].outputs == {"verdict": "null"}
     assert trace["reader"][0].inputs == {"verdict": "null"} and llm.calls[1] == "Read null"
-    alone = MAS([judge], llm=MetaLLM(["null"]), inputs={"query": "text"}).run("q")
+    alone = MAS([judge], llm=MockLLM(answers=["null"], meta=True), inputs={"query": "text"}).run("q")
     assert alone.output == "null" and alone.health is not None and alone.health.flags == ()

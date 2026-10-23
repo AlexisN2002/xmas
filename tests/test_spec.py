@@ -15,8 +15,6 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.conftest import MockLLM
-from tests.test_tools import ToolMockLLM
 from xmas import END, MAS, START, Agent
 from xmas.check import check_system
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
@@ -25,6 +23,8 @@ from xmas.health import HealthSettings
 from xmas.nodes import Box, Step
 from xmas.spec import validate_spec
 from xmas.tools import Tool, ToolSource, tool
+
+from .conftest import MockLLM
 
 
 @tool
@@ -119,7 +119,7 @@ def example() -> dict[str, Any]:
 
 def load(data: dict[str, Any]) -> MAS:
     return MAS.from_dict(
-        data, llms={"text-model": ToolMockLLM()}, tools=[count_words, publish_text, repeat, RemoteTools()]
+        data, llms={"text-model": MockLLM(turns=[])}, tools=[count_words, publish_text, repeat, RemoteTools()]
     )
 
 
@@ -397,7 +397,7 @@ def full() -> dict[str, Any]:
 
 def load_full(data: dict[str, Any]) -> MAS:
     return MAS.from_dict(
-        data, llms={"text-model": ToolMockLLM()}, tools=[counted, published, apologized, RemoteTools()]
+        data, llms={"text-model": MockLLM(turns=[])}, tools=[counted, published, apologized, RemoteTools()]
     )
 
 

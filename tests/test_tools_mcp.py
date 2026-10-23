@@ -27,7 +27,7 @@ from xmas import MAS, Agent, ToolCall
 from xmas.errors import XmasError
 from xmas.tools.mcp import MCPTools, result_text
 
-from .test_tools import ToolMockLLM, req
+from .conftest import MockLLM, req
 
 KEY = "sk-sx-good"
 
@@ -234,7 +234,7 @@ def test_http_refusals(server: tuple[Server, str], key: str, status: int, match:
 
 def test_a_mas_runs_remote_tools_and_ends_on_a_refusal(remote: MCPTools) -> None:
     agent = Agent("coder", "Compute {query}", output="answer", tools=["run_python", "refuse"])
-    llm = ToolMockLLM([("", [req("run_python", '{"code": "2**10"}')]), ("1024", [])])
+    llm = MockLLM(turns=[("", [req("run_python", '{"code": "2**10"}')]), ("1024", [])])
     mas = MAS(agents=[agent], llm=llm, tools=[remote])
     trace = mas.run("2**10")
     assert trace.error is None

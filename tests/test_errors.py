@@ -15,14 +15,7 @@ import yaml
 from xmas.errors import BudgetExceeded, ErrorKind, RunStatus, classify, kind_of_finish
 from xmas.trace import AgentRecord, TokenUsage, Trace
 
-URL = "https://gateway.example/v1/chat/completions"
-
-
-def status_error(
-    cls: type[openai.APIStatusError], status: int, message: str = "", body: object | None = None
-) -> openai.APIStatusError:
-    response = httpx2.Response(status, request=httpx2.Request("POST", URL))
-    return cls(message or f"Error code: {status}", response=response, body=body)
+from .conftest import URL, status_error
 
 
 def validation_error() -> pydantic.ValidationError:

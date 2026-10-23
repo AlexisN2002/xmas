@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import pickle
 from typing import Any
@@ -17,11 +16,9 @@ from xmas.budget import RunMeter
 from xmas.errors import BudgetExceeded, EmptyResponse, ErrorKind, XmasError
 from xmas.llms.api_llm import APILLM
 from xmas.llms.meta import TokenPrice, supports_meta
-from xmas.tools import ToolCallRequest, tool
+from xmas.tools import ToolCallRequest
 
-from .conftest import requires_gateway
-
-BASE_URL = "https://gateway.example/v1"
+from .conftest import BASE_URL, add, answer, recording_llm, requires_gateway
 
 
 def build_llm() -> APILLM:
@@ -138,58 +135,6 @@ def test_score_against_the_live_gateway() -> None:
 
 
 # ------------------------------------------------- full_response: call metadata
-
-
-@tool
-def add(a: int, b: int = 2) -> int:
-    """Add two integers.
-
-    Args:
-        a: The first summand.
-        b: The second summand.
-    """
-    return a + b
-
-
-def answer(
-    content: str | None,
-    *,
-    finish: str = "stop",
-    calls: list[dict[str, Any]] | None = None,
-    usage: dict[str, Any] | None = None,
-    model: str = "m",
-    **extra: Any,
-) -> ChatCompletion:
-    """A chat completion as a provider would send it; ``extra`` lands at the top level."""
-    message: dict[str, Any] = {"role": "assistant", "content": content}
-    if calls:
-        message["tool_calls"] = calls
-    body: dict[str, Any] = {
-        "id": "x",
-        "object": "chat.completion",
-        "created": 0,
-        "model": model,
-        "choices": [{"index": 0, "finish_reason": finish, "message": message}],
-        **extra,
-    }
-    if usage is not None:
-        body["usage"] = usage
-    return ChatCompletion.model_validate(body)
-
-
-def recording_llm(
-    monkeypatch: pytest.MonkeyPatch, answers: list[ChatCompletion], cls: type[APILLM] = APILLM, **kwargs: Any
-) -> tuple[APILLM, list[dict[str, Any]]]:
-    """An APILLM whose client records each request, as sent, and replays ``answers``."""
-    llm = cls(model="m", base_url=BASE_URL, api_key="k", retry_base_delay_s=0, **kwargs)
-    sent: list[dict[str, Any]] = []
-
-    async def create(**request: Any) -> ChatCompletion:
-        sent.append(copy.deepcopy(request))  # the tool loop appends to the same messages list later
-        return answers.pop(0)
-
-    monkeypatch.setattr(llm.client.chat.completions, "create", create)
-    return llm, sent
 
 
 def wire(requests: list[dict[str, Any]]) -> list[str]:

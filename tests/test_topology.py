@@ -33,9 +33,8 @@ from xmas.optimization.topology import (
     within_budget,
 )
 from xmas.optimization.updaters import PromptUpdater
-from xmas.tools import tool
 
-from .conftest import MockLLM
+from .conftest import MockLLM, count_words
 
 SEED_NAMES = ["solver", "checker"]
 SEED_EDGES = [("solver", "checker")]
@@ -317,12 +316,6 @@ def test_the_population_keeps_the_best_candidates_as_future_parents() -> None:
 
 
 # ----------------------------------------------------------------- version 2
-
-
-@tool(writes={"counts": "json"})
-def count_words(draft: str) -> dict[str, int]:
-    """Count the words of a draft."""
-    return {"words": len(draft.split())}
 
 
 def _answer(prompt: str) -> str:

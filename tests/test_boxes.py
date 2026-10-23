@@ -11,25 +11,15 @@ import pytest
 
 from xmas import MAS, Agent, Box, Budget, ErrorKind, TokenUsage
 from xmas.edges import Edge, EdgeKind
-from xmas.llms.meta import CallMeta
 
-from .test_steps import MetaLLM
+from .conftest import MockLLM
 
-
-class FlakyLLM(MetaLLM):
-    """A scripted model whose answer ``TIMEOUT`` is a timeout instead."""
-
-    def generate_with_meta(self, prompt: str, system_prompt: str = "") -> tuple[str, CallMeta]:
-        """Give the next answer, or raise for ``TIMEOUT``."""
-        text, meta = super().generate_with_meta(prompt, system_prompt)
-        if text == "TIMEOUT":
-            raise TimeoutError("the model took too long")
-        return text, meta
+TIMEOUT = TimeoutError("the model took too long")
 
 
-def build(answers: list[str], **kwargs: Any) -> tuple[MAS, Box]:
+def build(answers: list[str | Exception], **kwargs: Any) -> tuple[MAS, Box]:
     """Writer, then the box ``shorten`` (a one-agent inner system), then poster; a timeout routes to apology."""
-    llm = FlakyLLM(answers)
+    llm = MockLLM(answers=answers, meta=True)
     cutter = Agent("cutter", "Cut this to half its length: {page}", output="short", inputs=["page"])
     inner = MAS([cutter], inputs={"page": "text"}, llm=llm)
     box = Box("shorten", inner, reads={"page": "draft"}, writes={"short": "draft"})
@@ -107,7 +97,7 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
     assert failed.health is not None and failed.health.budget["calls"] == {"spent": 2, "limit": 2}
 
     # an inner failure leaves the box with its kind, and the outer `on error` routes it
-    routed_mas, _ = build(["A long draft about cats.", "TIMEOUT", "Sorry."])
+    routed_mas, _ = build(["A long draft about cats.", TIMEOUT, "Sorry."])
     routed = routed_mas.run("cats")
     assert routed.error is None and routed.output == "Sorry."
     (failed_box,) = routed["shorten"]
@@ -120,7 +110,7 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
 
 def test_a_failed_box_keeps_its_inner_trace_and_cost() -> None:
     """The inner system's paid calls before its failure stay in the box's failed record, and in the trace's cost."""
-    llm = FlakyLLM(["A draft.", "Cut.", "TIMEOUT", "Sorry."])
+    llm = MockLLM(answers=[], meta=True)
     inner = MAS(
         [
             Agent("cutter", "Cut {page}", output="short", inputs=["page"]),
@@ -138,7 +128,7 @@ def test_a_failed_box_keeps_its_inner_trace_and_cost() -> None:
         llm=llm,
     )
     for _ in range(2):  # a second run on the same inner system shows only its own records
-        llm.answers = ["A draft.", "Cut.", "TIMEOUT", "Sorry."]
+        llm.answers = ["A draft.", "Cut.", TIMEOUT, "Sorry."]
         trace = outer.run("cats")
         assert trace.error is None and trace.output == "Sorry."
         (box,) = trace["shorten"]

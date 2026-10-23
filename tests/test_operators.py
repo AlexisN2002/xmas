@@ -6,7 +6,6 @@ The models are scripted doubles.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -17,75 +16,9 @@ from xmas.errors import BudgetExceeded
 from xmas.nodes import Step
 from xmas.tools import tool
 
-from .conftest import MockLLM
-from .test_steps import MetaLLM
-
-# ----------------------------------------------------------------- callables
-
-
-@tool(writes={"counts": "json"})
-def count_words(draft: str) -> dict[str, int]:
-    """Count the words of a draft."""
-    return {"words": len(draft.split())}
-
-
-@tool(writes={"published": "text"})
-def publish_text(text: str) -> str:
-    """Publish a text."""
-    return f"Published: {text}"
-
-
-@tool(writes={"published": "text"})
-def apology_text(query: str) -> str:
-    """Apologize for a query."""
-    return f"Sorry, no short answer about {query}."
-
+from .conftest import VERDICT, MockLLM, worked_example
 
 OK = '{"fits": true, "action": "publish"}'
-
-VERDICT = {
-    "fits": {"type": "bool", "means": "the draft makes one claim in under 300 words"},
-    "action": {"type": "text", "one of": ["publish", "shorten"], "means": "what should happen next"},
-}
-
-
-def worked_example(verdicts: Iterator[str], **kwargs: Any) -> MAS:
-    """§3's system without the box and web_fetch, the judge answering from ``verdicts``."""
-    llm = MockLLM(lambda p: "A short draft about cats." if p.startswith("Answer") else next(verdicts))
-    writer = Agent(
-        "writer",
-        "Answer {query} in a short draft. The last verdict, empty at first: {verdict}",
-        output="draft",
-        inputs=["query", "verdict"],
-    )
-    judge = Agent(
-        "judge",
-        "Judge this draft: {draft}\nIts word counts: {counts}",
-        output="verdict",
-        inputs=["draft", "counts"],
-        output_type="json",
-        schema=VERDICT,
-    )
-    return MAS(
-        [writer, judge],
-        [
-            ("writer", "count"),
-            ("count", "judge"),
-            Edge("judge", "writer", EdgeKind.WHILE, when="not verdict.fits", max_visits=3),
-            Edge("judge", "publish", EdgeKind.SWITCH, switch="verdict.action"),
-            Edge("judge", "apology", EdgeKind.ELSE),
-        ],
-        steps=[
-            Step("count", "count_words"),
-            Step("publish", "publish_text", {"text": "draft"}),
-            Step("apology", "apology_text"),
-        ],
-        state={"published": {"merge": "last"}},
-        llm=llm,
-        tools=[count_words, publish_text, apology_text],
-        **kwargs,
-    )
-
 
 # --------------------------------------------------------------------- tests
 
@@ -261,7 +194,7 @@ def test_on_error_routes_by_kind() -> None:
     # a bad format after the retry is routed with the cost of both paid attempts
     judge = Agent("judge", "Judge {query}", output="verdict", output_type="json", schema=VERDICT)
     sorry = Agent("sorry", "Sorry about {query}", output="verdict_text")
-    llm = MetaLLM(["not json", "still not json", "We are sorry."])
+    llm = MockLLM(answers=["not json", "still not json", "We are sorry."], meta=True)
     mas = MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=llm)
     trace = mas.run("cats")
     assert trace.error is None and trace.output == "We are sorry."
@@ -273,7 +206,11 @@ def test_on_error_routes_by_kind() -> None:
 
     # the same system with a judge that answers well: a node whose only out-edge is an error edge
     # ends the run when it succeeds, so its answer is the output
-    good = MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=MetaLLM([OK]))
+    good = MAS(
+        [judge, sorry],
+        [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))],
+        llm=MockLLM(answers=[OK], meta=True),
+    )
     assert sorted(good.graph.predecessors(END)) == ["judge", "sorry"]
     assert good.to_dict()["edges"] == [{"judge -> sorry": {"on error": ["bad_format"]}}]  # the END wiring is implicit
     trace = good.run("cats")
@@ -284,7 +221,7 @@ def test_on_error_routes_by_kind() -> None:
     for kind in ("budget", "stopped"):
         with pytest.raises(ValueError, match=kind):
             MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=(kind,))], llm=llm)
-    llm = MetaLLM(["unused"])
+    llm = MockLLM(answers=["unused"], meta=True)
     mas = MAS(
         [judge, sorry],
         [Edge("judge", "sorry", EdgeKind.ERROR, errors=("any",))],
@@ -315,7 +252,13 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
             *error_edges,
         ]
         state = {"final": {"merge": "last"}}
-        return MAS([writer, done, again], edges, state=state, tools=[long_enough], llm=MetaLLM(["a draft"] * 3))
+        return MAS(
+            [writer, done, again],
+            edges,
+            state=state,
+            tools=[long_enough],
+            llm=MockLLM(answers=["a draft"] * 3, meta=True),
+        )
 
     unrouted = build().run("cats")
     assert unrouted.error is not None and "returned str, not bool" in unrouted.error
@@ -333,7 +276,7 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
         ],
         state={"final": {"merge": "last"}},
         tools=[long_enough],
-        llm=MetaLLM(["a draft", "We are sorry."]),
+        llm=MockLLM(answers=["a draft", "We are sorry."], meta=True),
     )
     routed = mas.run("cats")
     assert routed.error is None and routed.output == "We are sorry."
@@ -353,7 +296,7 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
             ],
             state={"final": {"merge": "last"}},
             tools=[long_enough],
-            llm=MetaLLM([]),
+            llm=MockLLM(answers=[], meta=True),
         )
 
 
