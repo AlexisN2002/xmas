@@ -347,7 +347,6 @@ and the system's own check decides which candidates are returned.
         - mas_edges
         - is_valid
         - within_budget
-        - agent_edges
         - sources
         - terminals
         - cycles
@@ -369,7 +368,4 @@ that uses it.
     options:
       members:
         - validate_spec
-        - SPEC_VERSION
-        - MASSpecV2
         - validate_spec_v2
-        - SPEC_VERSION_2

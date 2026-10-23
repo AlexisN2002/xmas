@@ -12,20 +12,7 @@ its prompts in a top-level ``prompts`` section.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
-
-# Names mas.py, runtime.py and graph_updater.py still import; a spec is a plain dict.
-SPEC_VERSION = 1
-SPEC_VERSION_2 = 2
-MASSpec = dict[str, Any]
-MASSpecV2 = dict[str, Any]
-AgentSpecV2 = dict[str, Any]
-HealthSpec = dict[str, Any]
-CallableSpec = dict[str, Any]
-AgentSpec = Mapping[str, Any]
-StepSpec = Mapping[str, Any]
-BoxSpec = Mapping[str, Any]
 
 V2_KEYS: dict[str, Any] = {
     "version": int,
