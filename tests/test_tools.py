@@ -102,11 +102,6 @@ def _positional(a: int, /) -> int:
     return a
 
 
-def _unschemable(a: object) -> int:
-    """Doc."""
-    return 0
-
-
 @pytest.mark.parametrize(
     ("fn", "message"),
     [
