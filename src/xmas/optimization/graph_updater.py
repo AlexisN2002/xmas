@@ -11,12 +11,23 @@ from xmas.graph import START
 from xmas.mas import MAS
 from xmas.optimization.synthesis import PromptSynthesizer, Rewrite
 from xmas.optimization.topology import Edges, TopologyBudget, crossover, mas_edges, mutate
+from xmas.spec import SPEC_VERSION_2
 
 if TYPE_CHECKING:  # pragma: no cover
     pass
 
 NEW_AGENT_PROMPT = "You are {name}. Do your part of the task and pass on your result."
 """Seed text for an agent a mutation invented, before its prompt is written."""
+
+
+def _refuse_v2(mas: MAS) -> None:
+    """Refuse a version 2 system, whose steps, types and forms the mutations do not know yet.
+
+    Raises:
+        ValueError: If ``mas`` is version 2.
+    """
+    if mas.version == SPEC_VERSION_2:
+        raise ValueError("This is a version 2 system; the topology updater learns version 2 in phase 2b.")
 
 
 class GraphUpdater:
@@ -80,7 +91,11 @@ class GraphUpdater:
 
         Returns:
             Up to ``n`` candidates, every one of them runnable.
+
+        Raises:
+            ValueError: If ``mas`` is a version 2 system.
         """
+        _refuse_v2(mas)
         if n <= 0:
             return []
         names, edges = list(mas.agents), self.edges_of(mas)
@@ -109,7 +124,12 @@ class GraphUpdater:
 
         Returns:
             Up to ``n`` candidates, every one of them runnable.
+
+        Raises:
+            ValueError: If either parent is a version 2 system.
         """
+        _refuse_v2(first)
+        _refuse_v2(second)
         parents = ((list(first.agents), self.edges_of(first)), (list(second.agents), self.edges_of(second)))
         entry = self.entry_of(first)
         children = [crossover(parents[0], parents[1], self.budget, self.rng, entry) for _ in range(n)]
@@ -157,6 +177,7 @@ class GraphUpdater:
             tools=mas.tools,
             max_tool_rounds=mas.max_tool_rounds,
             budget=mas.budget,
+            **mas._v2_kwargs(),
         )
 
     def output_of(self, mas: MAS, name: str) -> str:

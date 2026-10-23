@@ -72,6 +72,7 @@ which retries every error.
         - BudgetExceeded
         - Stopped
         - EmptyResponse
+        - BadFormat
         - classify
         - kind_of_status
         - kind_of_finish
@@ -129,6 +130,80 @@ defaults.
       members:
         - assistant_span
         - mask_logprobs
+
+## Version 2: steps, typed values, answer forms
+
+A system is version 2 when it uses anything below (or `MAS(..., version=2)`);
+every version 1 system runs, serializes and compiles exactly as before. What a
+version 2 system can do:
+
+- **Steps.** `MAS(..., steps=[Step("count", uses="count_words")])` runs a
+  callable from `tools=` as a node, with no model call. The same callable can
+  also be an agent's tool. A step reads its parameters and writes one value
+  named like the callable; `Step(reads={param: value}, writes={write: value})`
+  renames them, and `tool(writes={"counts": "json"})` declares other writes.
+- **Typed values.** Every value is `text` or `json` (`TEXT`, `JSON`); a
+  callable's `string` parameters read text, the others json, and its write is
+  text when the function returns `str` (or the tool is remote), else json. A
+  json value reaches a prompt as one line of JSON. Images, files and lists of
+  them are words the format already knows; they run in phase 3.
+- **Answer forms.** `Agent(..., output_type="json", schema={...})` makes the
+  agent answer in JSON. Its prompt ends with format lines no optimizer can
+  drop; an answer that does not fit gets exactly one retry, then the run fails
+  with `BadFormat` (kind `bad_format`). The record keeps the rejected answer.
+- **Joins.** A node fed by several edges waits for all of them and runs once.
+- **Checked when built.** `check_system` lists every problem at once: a read
+  nobody writes before the node runs, two writers of one value (unless
+  `state={value: {"merge": "last"}}`), a placeholder that is not a read, a type
+  that does not fit a parameter, a reserved name (the type words such as
+  `text` and `json`, and `visits`, `cost`, `len`, ...), an unknown callable.
+
+The answer-form dialect, one entry per field:
+`{type, means?, optional?, one of?, fields?}`, where `type` is `text`, `bool`,
+`int`, `number`, `json`, `object` or `list of <type>`, and `fields` describes
+an object or a list's objects.
+
+A version 2 spec (`version: 2`) has the keys `inputs`, `agents` (`reads`,
+`writes: {name: type}`, `schema`, `tools`, `model`), `steps`, `edges` (a
+string is a chain, `a -> b -> c`), `state`, `callables` (what each callable
+reads and writes), `default_model` and `prompts` (one per agent). Models
+appear by name only and keys never appear; in the `.mas` bundle (phase 5)
+endpoints and keys come from configuration, never from the bundle.
+
+Refused until phase 2b, with a message saying so: conditional edges (`when`,
+`else`, `while`, `switch`, `on error`) and every cycle, boxes, `frozen`,
+`health`, `to_yaml` on a version 2 system, and the topology updater on one.
+`run(query)` needs the inputs to be exactly `{query: text}`.
+
+::: xmas.nodes.Step
+
+::: xmas.edges
+    options:
+      members:
+        - Edge
+        - EdgeKind
+
+::: xmas.values
+    options:
+      members:
+        - ValueType
+        - TEXT
+        - JSON
+        - parse_type
+
+::: xmas.schemas
+    options:
+      members:
+        - compile_form
+        - AnswerForm
+        - FormError
+        - RETRY_NOTE
+
+::: xmas.check
+    options:
+      members:
+        - check_system
+        - SystemInfo
 
 ## Prompts
 
@@ -267,3 +342,6 @@ that uses it.
         - AgentSpec
         - validate_spec
         - SPEC_VERSION
+        - MASSpecV2
+        - validate_spec_v2
+        - SPEC_VERSION_2
