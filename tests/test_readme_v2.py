@@ -1,7 +1,3 @@
-# The README writes edge kinds as strings (kind="while"), which Edge accepts at run
-# time, and passes to_dict() output straight to from_dict(); both are annotated more
-# narrowly than they run, so this file checks them as the README spells them.
-# mypy: disable-error-code="arg-type"
 """The README's version 2 sections, executed as written.
 
 Each test mirrors one code block of the README line for line, with a scripted
@@ -15,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import itertools
+import re
 import tomllib
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -25,13 +22,11 @@ import pytest
 import yaml
 
 import xmas
-from xmas import MAS, Agent, Box, Budget, Edge, ErrorKind, GSM8KTask, HealthSettings, Step
-from xmas.edges import EdgeKind
+from xmas import MAS, Agent, Box, Budget, Edge, EdgeKind, ErrorKind, GSM8KTask, HealthSettings, Step, TokenUsage
 from xmas.predicates import Context, parse_predicate
 from xmas.tools import Tool, ToolSource, tool
 
-from .conftest import MockLLM
-from .test_tools import ToolMockLLM, req
+from .conftest import MockLLM, req
 
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -116,10 +111,10 @@ def looping_system(llm: MockLLM, counter: Tool = count_words) -> MAS:
         edges=[
             ("writer", "count"),
             ("count", "judge"),
-            Edge("judge", "writer", kind="while", when="not verdict.fits", max_visits=3),
-            Edge("judge", "publish", kind="switch", switch="verdict.action"),
-            Edge("judge", "sorry", kind="else"),
-            Edge("count", "sorry", kind="error", errors=("timeout", "outage")),
+            Edge("judge", "writer", kind=EdgeKind.WHILE, when="not verdict.fits", max_visits=3),
+            Edge("judge", "publish", kind=EdgeKind.SWITCH, switch="verdict.action"),
+            Edge("judge", "sorry", kind=EdgeKind.ELSE),
+            Edge("count", "sorry", kind=EdgeKind.ERROR, errors=("timeout", "outage")),
         ],
         tools=[counter, publish, apologize],
         llm=llm,
@@ -171,7 +166,8 @@ def test_steps_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None
 
     assert capsys.readouterr().out.splitlines() == ["A fine answer.", "['writer', 'count', 'judge']"]
     count = mas.last_trace["count"][0]
-    assert (count.kind, count.outputs, count.cost_usd) == ("step", {"count_words": "4"}, None)
+    assert (count.kind, count.outputs, count.cost_usd) == ("step", {"count_words": "4"}, 0.0)
+    assert mas.last_trace.cost_usd is None, "the writer's cost is unknown, so the sum is too"
     assert f"Draft, 4 words: {DRAFT}" in llm.calls[-1]
     assert len(llm.calls) == 2, "a step makes no model call"
 
@@ -219,7 +215,7 @@ def test_a_tool_needs_a_docstring_and_a_hint_on_every_parameter() -> None:
 
 
 def test_the_same_function_is_a_step_and_an_agents_tool() -> None:
-    model = ToolMockLLM(turns=[("", [req("count_words", '{"draft": "one two three"}')])], default=(DRAFT, []))
+    model = MockLLM(turns=[("", [req("count_words", '{"draft": "one two three"}')])], default=(DRAFT, []))
     writer = Agent("writer", prompt="Write a short answer to: {query}", output="draft", tools=["count_words"])
     judge = Agent("judge", prompt="{count_words}: {draft}", inputs=["draft", "count_words"], output="review")
     mas = MAS(
@@ -401,7 +397,7 @@ def test_the_check_refuses_two_writers_a_type_clash_and_a_bad_condition() -> Non
             edges=[
                 ("writer", "count"),
                 ("count", "judge"),
-                Edge("judge", "publish", kind="when", when="verdict.fits = true"),
+                Edge("judge", "publish", kind=EdgeKind.WHEN, when="verdict.fits = true"),
             ],
             tools=[count_words, publish],
             llm=llm,
@@ -465,7 +461,7 @@ def test_an_unrouted_error_fails_the_run_and_budget_and_stop_are_never_routable(
             MAS(
                 [Agent("writer", "{query}", output="draft")],
                 steps=[Step("sorry", uses="apologize")],
-                edges=[Edge("writer", "sorry", kind="error", errors=(kind,))],
+                edges=[Edge("writer", "sorry", kind=EdgeKind.ERROR, errors=(kind,))],
                 tools=[apologize],
                 llm=scripted(),
             )
@@ -473,15 +469,15 @@ def test_an_unrouted_error_fails_the_run_and_budget_and_stop_are_never_routable(
 
 def test_the_operator_table_matches_the_edge_kinds_and_the_spec_forms() -> None:
     assert {kind.value for kind in EdgeKind} == {"plain", "when", "else", "while", "switch", "error"}
-    assert Edge("a", "b", kind="switch", switch="verdict.action").case == "b"
+    assert Edge("a", "b", kind=EdgeKind.SWITCH, switch="verdict.action").case == "b"
     forms = {
-        "a -> b: {when: verdict.fits}": Edge("a", "b", kind="when", when="verdict.fits"),
-        "a -> b: else": Edge("a", "b", kind="else"),
+        "a -> b: {when: verdict.fits}": Edge("a", "b", kind=EdgeKind.WHEN, when="verdict.fits"),
+        "a -> b: else": Edge("a", "b", kind=EdgeKind.ELSE),
         "a -> b: {when: not verdict.fits, max_visits: 3}": Edge(
-            "a", "b", kind="while", when="not verdict.fits", max_visits=3
+            "a", "b", kind=EdgeKind.WHILE, when="not verdict.fits", max_visits=3
         ),
-        "a -> b: {switch: verdict.action}": Edge("a", "b", kind="switch", switch="verdict.action"),
-        "a -> b: {on error: [timeout]}": Edge("a", "b", kind="error", errors=("timeout",)),
+        "a -> b: {switch: verdict.action}": Edge("a", "b", kind=EdgeKind.SWITCH, switch="verdict.action"),
+        "a -> b: {on error: [timeout]}": Edge("a", "b", kind=EdgeKind.ERROR, errors=("timeout",)),
     }
     from xmas.edges import parse_edges
 
@@ -576,10 +572,10 @@ def test_health_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> Non
 
 
 def test_health_signal_names_and_a_healthy_run() -> None:
-    from xmas.health import SIGNALS
+    from xmas.health import _record_signals
 
     named = ("retried", "bad_format", "error_routed", "empty", "stuck", "unfilled", "leak", "long", "short")
-    assert named == SIGNALS
+    assert tuple(re.findall(r'found\.append\(\("(\w+)"', inspect.getsource(_record_signals))) == named
     for name in named:
         assert f"`{name}`" in README
 
@@ -686,9 +682,23 @@ def test_box_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None:
     box = trace["shorten"][0]
     assert box.kind == "box"
     assert box.inner is not None
+    assert box.cost_usd is None and trace.cost_usd is None, "a model that reports no cost leaves every sum unknown"
     assert (
         box.inner["cutter"][0].rendered_prompt == "Cut this to half its length: Sunlight hits air, which scatters blue."
     )
+
+
+def test_a_box_costs_its_inner_records_sum() -> None:
+    llm = MockLLM(lambda prompt: "Air scatters blue light.", meta=True)
+    cutter = Agent("cutter", prompt="Cut this to half its length: {page}", inputs=["page"], output="short")
+    shorten = Box("shorten", MAS([cutter], inputs={"page": "text"}, llm=llm), {"page": "draft"}, {"short": "summary"})
+    writer = Agent("writer", prompt="Write a short answer to: {query}", output="draft")
+    trace = MAS([writer], boxes=[shorten], edges=[("writer", "shorten")], llm=llm).run(QUERY)
+
+    (box,) = trace["shorten"]
+    assert box.cost_usd == pytest.approx(0.01)
+    assert box.tokens == TokenUsage(10, 2)
+    assert trace.cost_usd == pytest.approx(0.02)
 
 
 def test_a_box_spends_from_the_outer_budget() -> None:
@@ -743,7 +753,7 @@ def test_version_2_save_block_runs_as_written(capsys: pytest.CaptureFixture[str]
     )
     assert from_yaml_edges.describe()["id"] == mas.describe()["id"]
     assert "http" not in yaml.safe_dump(spec) and "api_key" not in yaml.safe_dump(spec)
-    with pytest.raises(ValueError, match=r"\.mas"):
+    with pytest.raises(ValueError, match=r"\.mas bundle .*to_dict\(\) gives its spec"):
         mas.to_yaml(tmp_path / "team.yaml")
 
 
@@ -815,7 +825,6 @@ def test_error_kinds_the_readme_names_are_the_real_ones() -> None:
         "refusal",
         "stopped",
         "budget",
-        "check_not_run",
         "unknown",
     }
     for kind in ("timeout", "outage", "rate_limited", "money", "length_cut", "bad_format", "refusal"):
@@ -854,3 +863,13 @@ def test_the_readme_keeps_the_rulings() -> None:
     for block in planned.split("```yaml")[1:]:
         assert "http" not in block.split("```", 1)[0]
         assert "key" not in block.split("```", 1)[0]
+
+
+def test_every_component_the_readme_lists_exists() -> None:
+    import xmas.optimization
+
+    components = README.split("## 🏗 Components", 1)[1].split("\n## ", 1)[0]
+    names = [line.split("`")[1] for line in components.splitlines() if line.startswith("- **`")]
+    assert len(names) == 11
+    for name in names:
+        assert hasattr(xmas, name) or hasattr(xmas.optimization, name), name

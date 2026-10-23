@@ -23,14 +23,14 @@ xmas checks the wiring before the first call and draws the picture from the grap
 - **Your first system in minutes:** a few `Agent` objects and their edges, and it runs.
 - **Code and conditions in the graph:** plain Python steps, JSON answers with a fixed shape, and `when`, `while`, `switch` and `on error` edges.
 - **Know what every run cost:** one record per visit with time, tokens and cost, budgets that end a run cleanly, and health signals.
-- **Save and share:** a version 1 system as one YAML file today; a version 2 system as a `.mas` folder, planned.
+- **Save and share:** a version 1 system as one YAML file today; a version 2 system as a `.mas` bundle, planned.
 - **Optimization built in:** improve every agent's prompt, the wiring and the models against your task.
 
 See [docs/design-principles.md](docs/design-principles.md) for the principles behind the
 design.
 
 > **Status: beta.** Inference, the optimization loop, CANTANTE, topology search, code steps,
-> JSON answers, conditions, loops, budgets and health are in place. The `.mas` folder,
+> JSON answers, conditions, loops, budgets and health are in place. The `.mas` bundle,
 > values beyond text, people in the graph and the experiment layer are still to come.
 
 | What | Today |
@@ -49,7 +49,7 @@ design.
 | Images, audio, documents, tables and files as values | planned |
 | Several named inputs and outputs per run | planned |
 | People in the graph, and Stop | planned |
-| The `.mas` folder, its commands and `verify()` | planned |
+| The `.mas` bundle, its commands and `verify()` | planned |
 | Learning from human picks | planned |
 | The experiment layer | planned |
 
@@ -250,7 +250,7 @@ An edge can carry a condition. Here the judge sends the draft back while it does
 then publishes it or says sorry. Two more steps do the publishing and the apology:
 
 ```python
-from xmas import Edge
+from xmas import Edge, EdgeKind
 
 
 @tool
@@ -281,10 +281,10 @@ mas = MAS(
     edges=[
         ("writer", "count"),
         ("count", "judge"),
-        Edge("judge", "writer", kind="while", when="not verdict.fits", max_visits=3),
-        Edge("judge", "publish", kind="switch", switch="verdict.action"),
-        Edge("judge", "sorry", kind="else"),
-        Edge("count", "sorry", kind="error", errors=("timeout", "outage")),
+        Edge("judge", "writer", kind=EdgeKind.WHILE, when="not verdict.fits", max_visits=3),
+        Edge("judge", "publish", kind=EdgeKind.SWITCH, switch="verdict.action"),
+        Edge("judge", "sorry", kind=EdgeKind.ELSE),
+        Edge("count", "sorry", kind=EdgeKind.ERROR, errors=("timeout", "outage")),
     ],
     tools=[count_words, publish, apologize],
     llm=llm,
@@ -304,11 +304,11 @@ colon:
 
 | Operator | Python | In a spec | Today |
 |---|---|---|---|
-| `when` | `Edge("a", "b", kind="when", when="...")` | `a -> b: {when: ...}` | built |
-| `else` | `Edge("a", "b", kind="else")` | `a -> b: else` | built |
-| `while` | `Edge("a", "b", kind="while", when="...", max_visits=3)` | `a -> b: {when: ..., max_visits: 3}` | built |
-| `switch` | `Edge("a", "b", kind="switch", switch="verdict.action")` | `a -> b: {switch: verdict.action}` | built |
-| `on error` | `Edge("a", "b", kind="error", errors=("timeout",))` | `a -> b: {on error: [timeout]}` | built |
+| `when` | `Edge("a", "b", kind=EdgeKind.WHEN, when="...")` | `a -> b: {when: ...}` | built |
+| `else` | `Edge("a", "b", kind=EdgeKind.ELSE)` | `a -> b: else` | built |
+| `while` | `Edge("a", "b", kind=EdgeKind.WHILE, when="...", max_visits=3)` | `a -> b: {when: ..., max_visits: 3}` | built |
+| `switch` | `Edge("a", "b", kind=EdgeKind.SWITCH, switch="verdict.action")` | `a -> b: {switch: verdict.action}` | built |
+| `on error` | `Edge("a", "b", kind=EdgeKind.ERROR, errors=("timeout",))` | `a -> b: {on error: [timeout]}` | built |
 | box | `Box(name, system, reads=..., writes=...)` | `boxes:` | built |
 | `for each` | | | planned |
 | `first of` | | | planned |
@@ -356,7 +356,8 @@ A run ends with a status: `ok`, `failed` or `over_budget`. A failed run keeps
 every record that finished before the failure, and `trace.error_kind` says what kind it
 was. Cost is never guessed as zero. It comes from the endpoint's response, or from a
 price you give the model (`APILLM(price=TokenPrice(...))`, from `xmas.llms.meta`), or
-it stays `None`.
+it stays `None`. A sum with one unknown part is unknown too, so `trace.cost_usd` is
+`None` when any record's cost is. A step costs `0.0`, since it makes no model call.
 
 ### Health
 
@@ -440,6 +441,8 @@ print([(path, record.agent) for path, record in trace.walk()])
 
 The box spends from the outer run's budget. Its record has kind `box` and holds the
 inner trace, and `trace.walk()` yields every record with the path of boxes around it.
+The box's cost and tokens are its inner records' sums, unknown when any of them is, and
+a failed box keeps the inner records that finished.
 
 ## 💾 Save and share
 
@@ -473,9 +476,9 @@ The spec's `edges` read like this in YAML, and `from_dict` accepts them in this 
 
 `callables` records where each function lives and what it reads and writes. Models
 appear by name only. Each agent's prompt sits under `prompts` for now; in the planned
-folder, each prompt gets a file of its own. `to_yaml` refuses a version 2 system with a message: its file
-format is the `.mas` folder, which is planned (see below). Every version 1 file loads,
-runs and saves as before.
+bundle, each prompt gets a file of its own. `to_yaml` refuses a version 2 system, since
+its file format is the `.mas` bundle (see below), and points to `to_dict()` until then.
+Every version 1 file loads, runs and saves as before.
 
 ## 🧠 Optimization built in
 
@@ -513,10 +516,10 @@ optimizers send the same requests to it as to a single prompt.
 > **Planned, not in the code yet.** Nothing in this section runs today. The code below
 > shows how it will read.
 
-### One folder per system: `name.mas/`
+### One bundle per system: `name.mas/`
 
-A version 2 system will save as a folder. Each part has its own file, and no prompt
-text sits in the wiring:
+A version 2 system will save as a bundle, a folder in which each part has its own file.
+No prompt text sits in the wiring:
 
 ```text
 team.mas/
@@ -657,7 +660,7 @@ xmas builds on:
 
 - **`Agent`** – One node: a prompt template, the values it reads and the value it writes.
 - **`Step`** – A node that runs a function or an MCP tool from the system's `tools=`, with no model call.
-- **`Edge`** – One edge with its operator: plain, `when`, `else`, `while`, `switch` or `on error`.
+- **`Edge`** – One edge with its operator, an `EdgeKind`: plain, `when`, `else`, `while`, `switch` or `on error`.
 - **`Box`** – A whole system used as one node of another.
 - **`MAS`** – The system and the predictor: agents, steps, edges, models and tools; runs a query and keeps its trace.
 - **`Trace`** – The per-agent record of one run: rendered prompts, outputs, tokens, cost, time, tool calls, status.
