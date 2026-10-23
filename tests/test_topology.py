@@ -18,6 +18,7 @@ import pytest
 from xmas import MAS, Agent, Budget, Edge, MASTask, Step
 from xmas.edges import EdgeKind
 from xmas.graph import END, START, back_edges
+from xmas.health import HealthSettings
 from xmas.optimization.evolution import EvolutionaryTopologyOptimizer
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import LLMPromptSynthesizer, MechanicalSynthesizer, Rewrite
@@ -319,7 +320,7 @@ def test_the_population_keeps_the_best_candidates_as_future_parents() -> None:
 
 
 def _judged(*, branches: bool = False) -> MAS:
-    """Build planner -> writer -> count -> judge, with a step, a frozen json judge and every runtime field set.
+    """Build planner -> writer -> count -> judge: a step, a frozen json judge, health and every runtime field set.
 
     With ``branches``, the judge decides between ``publish`` and ``apology``,
     which both feed ``final``.
@@ -362,6 +363,7 @@ def _judged(*, branches: bool = False) -> MAS:
         inputs={"query": "text"},
         state=state,
         frozen=("judge",),
+        health=HealthSettings(min_samples=2),
     )
 
 
@@ -380,7 +382,8 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
         assert candidate.steps == mas.steps and isinstance(candidate.steps["count"], Step)
         assert "count" not in candidate.agents
         assert candidate.agents["judge"] == mas.agents["judge"]
-        assert candidate._v2_kwargs() == mas._v2_kwargs()
+        kept = ("version", "inputs", "merges", "boxes", "frozen", "health")
+        assert [getattr(candidate, name) for name in kept] == [getattr(mas, name) for name in kept]
         runtime = ("llm", "llms", "max_steps", "default_model", "tools", "max_tool_rounds", "max_visits", "budget")
         assert [getattr(candidate, name) for name in runtime] == [getattr(mas, name) for name in runtime]
         assert candidate.run("cats").error is None

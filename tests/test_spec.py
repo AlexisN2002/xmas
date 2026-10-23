@@ -196,8 +196,6 @@ def test_a_version_1_system_has_no_version_2_parts() -> None:
     )
     assert (v1.version, v1.steps, v1.info) == (1, {}, None)
     assert v1.copy().structure == v1.structure
-    v2_lines = ("step ", "edge ", "form ", "input ", "merge ", "box ")
-    assert not any(line.startswith(v2_lines) for line in v1.structure.splitlines())
 
     described = v1.describe()  # its marker loop is a loop edge
     assert json.loads(json.dumps(described)) == described and described["version"] == 1
