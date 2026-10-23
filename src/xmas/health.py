@@ -22,7 +22,7 @@ from xmas.errors import ErrorKind
 from xmas.prompts import extract_placeholders
 
 if TYPE_CHECKING:
-    from xmas.budget import Budget, RunMeter
+    from xmas.budget import RunMeter
     from xmas.trace import AgentRecord
 
 DEFAULT_LEAKS = (r"<\|[A-Za-z_]{2,30}\|>", r"</?think>", r"<<<xmas:agent ")
@@ -114,26 +114,24 @@ class Health:
 def summarize(
     records: Sequence[AgentRecord],
     *,
-    budget: Budget | None = None,
     meter: RunMeter | None = None,
     settings: HealthSettings | None = None,
-    while_edges: Iterable[tuple[str, str]] | None = None,
+    while_edges: Iterable[tuple[str, str]] = (),
     values: Iterable[str] | None = None,
 ) -> Health:
     """Read a run's records, in run order, for the health signals.
 
-    The budget is ``meter.budget`` unless given; without a meter nothing was
-    spent, so there is no budget entry. ``while_edges`` are the system's
-    ``(source, target)`` loops; when ``None``, a route to a node that first ran
-    before the deciding node did counts as one. ``values`` are the system's value
-    names: a placeholder naming none of them is literal prompt text, so it is not
+    The budget entry reads ``meter`` against its budget; without a meter nothing
+    was spent, so there is none. ``while_edges`` are the system's
+    ``(source, target)`` loops. ``values`` are the system's value names: a
+    placeholder naming none of them is literal prompt text, so it is not
     ``unfilled``; when ``None``, every placeholder outside a record's inputs is.
     """
     settings = settings or HealthSettings()
     return Health(
         flags=_flags(records, settings, None if values is None else frozenset(values)),
         loops=_loops(records, while_edges),
-        budget=_budget_use(budget, meter),
+        budget=_budget_use(meter),
     )
 
 
@@ -206,22 +204,10 @@ def _route(record: AgentRecord) -> tuple[str, ...]:
     return record.route or ()
 
 
-def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]] | None) -> dict[str, dict[str, Any]]:
+def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]]) -> dict[str, dict[str, Any]]:
     """Return ``{"source -> target": {"taken", "cap_hit"}}`` for each while edge taken or capped."""
-    if while_edges is None:
-        first: dict[str, int] = {}
-        for index, record in enumerate(records):
-            first.setdefault(record.agent, index)
-        edges = {
-            (record.agent, target): None
-            for record in records
-            for target in _route(record)
-            if target in first and first[target] < first[record.agent]
-        }
-    else:
-        edges = dict.fromkeys(while_edges)
     loops: dict[str, dict[str, Any]] = {}
-    for source, target in edges:
+    for source, target in dict.fromkeys(while_edges):
         mine = [record for record in records if record.agent == source]
         taken = sum(target in _route(record) for record in mine)
         cap_hit = any(record.capped and target not in _route(record) for record in mine)
@@ -230,12 +216,10 @@ def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]
     return loops
 
 
-def _budget_use(budget: Budget | None, meter: RunMeter | None) -> dict[str, dict[str, float]]:
-    """Return ``{limit: {"spent", "limit"}}`` for each limit set, read from the meter."""
-    if meter is None:
-        return {}
-    budget = budget if budget is not None else meter.budget
-    if budget is None:
+def _budget_use(meter: RunMeter | None) -> dict[str, dict[str, float]]:
+    """Return ``{limit: {"spent", "limit"}}`` for each limit the meter's budget sets."""
+    budget = None if meter is None else meter.budget
+    if meter is None or budget is None:
         return {}
     use: dict[str, dict[str, float]] = {}
     for name, limit, spent in (

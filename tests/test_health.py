@@ -53,7 +53,7 @@ def spent_meter() -> RunMeter:
 
 
 def test_every_signal_flags_its_record_with_a_detail() -> None:
-    health = summarize(RECORDS, budget=None, meter=spent_meter(), settings=HealthSettings())
+    health = summarize(RECORDS, meter=spent_meter(), settings=HealthSettings(), while_edges=[("judge", "w")])
     assert [(flag.signal, flag.node, flag.step) for flag in health.flags] == [
         ("retried", "judge", 1),
         ("stuck", "judge", 3),
@@ -81,14 +81,13 @@ def test_every_signal_flags_its_record_with_a_detail() -> None:
 
 def test_loops_and_budget_come_from_the_routes_and_the_meter() -> None:
     meter = spent_meter()
-    health = summarize(RECORDS, budget=None, meter=meter, settings=HealthSettings())
-    loops = {"judge -> w": {"taken": 2, "cap_hit": True}}
-    assert health.loops == loops  # read from the records' routes
-    assert summarize(RECORDS, while_edges=[("judge", "w"), ("w", "judge")]).loops == loops
-    assert summarize(RECORDS, while_edges=[]).loops == {}
+    health = summarize(RECORDS, meter=meter, while_edges=[("judge", "w"), ("w", "judge")])
+    assert health.loops == {"judge -> w": {"taken": 2, "cap_hit": True}}  # w -> judge was never taken
+    assert summarize(RECORDS).loops == {}
     assert health.budget == {"calls": {"spent": 4, "limit": 10}, "cost_usd": {"spent": 0.5, "limit": 1.0}}
-    assert summarize(RECORDS, budget=Budget(max_wall_s=60), meter=meter).budget["wall_s"]["limit"] == 60
-    assert summarize(RECORDS, budget=Budget(max_calls=1)).budget == {}  # no meter, nothing spent to report
+    assert summarize(RECORDS, meter=RunMeter(Budget(max_wall_s=60))).budget["wall_s"]["limit"] == 60
+    assert summarize(RECORDS, meter=RunMeter()).budget == {}  # no budget, no limits to report
+    assert summarize(RECORDS).budget == {}  # no meter, nothing spent to report
 
 
 def test_settings_tune_min_samples_length_and_leaks() -> None:
