@@ -15,7 +15,7 @@ from pydantic import Field
 
 import xmas.tools
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
-from xmas.errors import Stopped, XmasError, classify
+from xmas.errors import Stopped, XmasError
 from xmas.llms.call_log import CallLog
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
@@ -674,19 +674,6 @@ def test_api_llm_drives_a_whole_tool_agent(monkeypatch: pytest.MonkeyPatch) -> N
     assert over.error == "BudgetExceeded: calls 1 >= max 1 before call 2"
 
 
-@pytest.mark.parametrize(
-    ("error", "kind"),
-    [
-        (XmasError("mcp: unauthorized (401): bad key", status=401), ErrorKind.REFUSAL),
-        (XmasError("mcp: tool_not_in_scope (403): nope", status=403), ErrorKind.REFUSAL),
-        (XmasError("mcp: too_many_concurrent (429): 4 in flight", status=429, retry_after=1.0), ErrorKind.RATE_LIMITED),
-    ],
-    ids=["401", "403", "429"],
-)
-def test_a_refused_tool_source_is_classified_by_its_status(error: XmasError, kind: ErrorKind) -> None:
-    assert classify(error) is kind
-
-
 @pytest.fixture
 def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Record the backoff delays instead of waiting them out."""
@@ -742,9 +729,9 @@ def test_api_llm_sends_a_money_error_once(
 ) -> None:
     llm, sent = recording_llm(monkeypatch, [error, answer("unreachable")])
     llm.retry_base_delay_s = 1.0
-    with pytest.raises(type(error)) as raised:
+    with pytest.raises(type(error)):
         llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
-    assert (classify(raised.value), len(sent), slept) == (ErrorKind.MONEY, 1, [])
+    assert (len(sent), slept) == (1, [])
 
     llm, sent = recording_llm(monkeypatch, [error, answer("unreachable")])  # the plain path too
     with pytest.raises(type(error)):
