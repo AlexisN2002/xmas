@@ -113,7 +113,9 @@ Functions an agent may call while it answers: `Agent.tools` names resolve
 against `MAS(..., tools=[...])` when the system is built. `MCPTools` needs the
 `mcp` extra. A tool turn sends sampling parameters (`temperature`, `top_p`,
 `stop`, ...) only when they are set in the model's `call_kwargs`, never as
-defaults.
+defaults. Every requested call runs, since a tool call need not be idempotent;
+`xmas.tools.DEDUPE_TOOL_CALLS = True` opts in to answering a repeated successful
+call (same tool, same arguments) from its earlier result.
 
 ::: xmas.tools
     options:
@@ -124,6 +126,7 @@ defaults.
         - ToolCallRequest
         - LocalTools
         - run_step
+        - DEDUPE_TOOL_CALLS
 
 ::: xmas.tools.mcp.MCPTools
 
@@ -221,7 +224,7 @@ taken); a one-key mapping gives the operator:
   `switch` edge of the same node is.
 - **`while`.** `judge -> writer: {when: not verdict.fits, max_visits: 3}` loops
   back until its target ran `max_visits` times; then the record is `capped` and
-  the next edge decides.
+  the `else` edge is taken, even when a later `when` edge holds.
 - **`switch`.** `judge -> shorten: {switch: verdict.action}` is taken when the
   path equals the case (the target's name unless `case:` says otherwise); a
   value outside the cases takes `else`.

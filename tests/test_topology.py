@@ -381,6 +381,7 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
     # writes the draft) is dropped rather than raised.
     budget = TopologyBudget(min_agents=2, max_agents=7, max_edges=12)
     mas = _judged()
+    mas.max_visits = 1  # not the default, so a rebuild that drops it shows
     candidates = updater(seed=2, budget=budget).propose(mas, {}, n=6)
 
     assert candidates
@@ -389,7 +390,7 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
         assert "count" not in candidate.agents
         assert candidate.agents["judge"] == mas.agents["judge"]
         assert candidate._v2_kwargs() == mas._v2_kwargs()
-        runtime = ("llm", "llms", "max_steps", "default_model", "tools", "max_tool_rounds", "budget")
+        runtime = ("llm", "llms", "max_steps", "default_model", "tools", "max_tool_rounds", "max_visits", "budget")
         assert [getattr(candidate, name) for name in runtime] == [getattr(mas, name) for name in runtime]
         assert candidate.run("cats").error is None
 

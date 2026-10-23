@@ -1,9 +1,11 @@
 """Typed errors: what kind of failure ended a call or a run.
 
-xmas classifies exceptions; it never re-wraps them. :func:`classify` reads an
-exception, and the exceptions it was raised from, and returns an
+xmas classifies exceptions rather than matching their words. :func:`classify`
+reads an exception, and the exceptions it was raised from, and returns an
 :class:`ErrorKind`, so callers branch on a closed set instead of matching words
-in ``Trace.error``. :func:`status_for` turns a kind into the run's
+in ``Trace.error``. A wrapper keeps its cause: a version 1 plain call's
+``RuntimeError("LLM batch failed: ...")`` and a local tool's ``XmasError``
+classify by what they wrap. :func:`status_for` turns a kind into the run's
 :class:`RunStatus`.
 
 This is a leaf module: at runtime it imports no other xmas module. ``httpx2``,

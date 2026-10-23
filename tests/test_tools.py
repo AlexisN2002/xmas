@@ -425,7 +425,7 @@ def test_endless_requests_stop_after_max_rounds_plus_a_final_turn_without_tools(
     assert trace.output == "again"
     assert [tools for _, tools in llm.seen] == [["run_python"]] * rounds + [[]]
     assert len(trace["coder"][0].tool_calls) == rounds
-    assert len(source.calls) == min(rounds, 1)  # the same call again is answered from the first result
+    assert len(source.calls) == rounds
 
 
 def test_default_is_five_rounds() -> None:
@@ -518,6 +518,13 @@ def test_a_plain_agent_in_a_mixed_mas_sends_exactly_what_it_did_before() -> None
 RUN_PYTHON_SCHEMA = {"code": {"type": "string"}, "timeout_s": {"type": "integer"}}
 
 
+@pytest.fixture
+def dedupe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt in to answering a repeated successful call from its earlier result."""
+    monkeypatch.setattr(xmas.tools, "DEDUPE_TOOL_CALLS", True)
+
+
+@pytest.mark.usefixtures("dedupe")
 def test_an_identical_repeat_is_answered_from_the_earlier_result() -> None:
     source = FakeToolSource(answers={"run_python": "1048576"}, properties=RUN_PYTHON_SCHEMA)
     first = '{"code": "print(2**20)", "timeout_s": 20}'
@@ -535,6 +542,7 @@ def test_an_identical_repeat_is_answered_from_the_earlier_result() -> None:
     assert llm.seen[2][0][-1] == {"role": "tool", "tool_call_id": "2", "content": repeated.result}
 
 
+@pytest.mark.usefixtures("dedupe")
 def test_a_numeric_string_for_an_integer_parameter_is_the_same_call() -> None:
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
     llm = ToolMockLLM(
@@ -560,6 +568,7 @@ def test_a_numeric_string_for_an_integer_parameter_is_the_same_call() -> None:
         ('{"code": "x", "timeout_s": 20}', '{"code": "x", "timeout_s": "20.0"}'),  # not an integer literal
     ],
 )
+@pytest.mark.usefixtures("dedupe")
 def test_different_arguments_run_again(first: str, second: str) -> None:
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
     llm = ToolMockLLM([("", [req("run_python", first, "1"), req("run_python", second, "2")]), ("done", [])])
@@ -568,6 +577,7 @@ def test_different_arguments_run_again(first: str, second: str) -> None:
     assert not any(call.result.startswith(REPEATED_CALL_NOTE) for call in trace["coder"][0].tool_calls)
 
 
+@pytest.mark.usefixtures("dedupe")
 def test_a_failed_call_is_run_again() -> None:
     class FlakySource(FakeToolSource):
         def call(self, name: str, arguments: dict[str, Any]) -> str:
@@ -588,6 +598,7 @@ def test_a_failed_call_is_run_again() -> None:
     )
 
 
+@pytest.mark.usefixtures("dedupe")
 def test_a_local_tool_repeat_compares_after_validation() -> None:
     seen: list[tuple[int, int]] = []
 
@@ -610,8 +621,9 @@ def test_a_local_tool_repeat_compares_after_validation() -> None:
     assert results == ["1048576", f"{REPEATED_CALL_NOTE}\n1048576", "4"]
 
 
-def test_dedupe_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(xmas.tools, "DEDUPE_TOOL_CALLS", False)
+def test_dedupe_is_off_by_default() -> None:
+    """A tool call need not be idempotent: version 1 runs every call, as on main."""
+    assert xmas.tools.DEDUPE_TOOL_CALLS is False
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
     call = '{"code": "x", "timeout_s": 20}'
     llm = ToolMockLLM([("", [req("run_python", call, "1")]), ("", [req("run_python", call, "2")]), ("done", [])])

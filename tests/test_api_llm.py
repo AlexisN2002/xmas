@@ -403,11 +403,15 @@ def test_the_paid_attempts_behind_an_empty_answer_reach_the_meter(monkeypatch: p
     # cost limit of 0.05 refuses the next call only because of them
     plain = Agent("solver", "Solve {query}", output="answer")
     with_tools = Agent("coder", "Do {query}", output="answer", tools=["add"])
-    for agent, script in ((plain, [answer(None, usage=paid)] * 6), (with_tools, [no_choice] * 6)):
+    # the plain call fails as promptolution's batch call does on main; a tool turn raises its own error
+    for agent, script, form in (
+        (plain, [answer(None, usage=paid)] * 6, "RuntimeError: LLM batch failed: "),
+        (with_tools, [no_choice] * 6, "EmptyResponse: "),
+    ):
         llm, sent = recording_llm(monkeypatch, list(script))
         trace = MAS([agent], llm=llm, tools=[add], budget=Budget(max_cost_usd=0.05)).run("q")
         assert trace.error is not None
-        assert trace.error.startswith("EmptyResponse: Empty content from model after 6 attempts")
+        assert trace.error.startswith(f"{form}Empty content from model after 6 attempts")
         assert (len(sent), trace.records) == (6, ())
         meter = meters[-1]
         assert (meter.calls, meter.uncosted_calls) == (1, 0)

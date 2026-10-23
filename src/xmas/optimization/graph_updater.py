@@ -201,6 +201,7 @@ class GraphUpdater:
             default_model=mas.default_model,
             tools=mas.tools,
             max_tool_rounds=mas.max_tool_rounds,
+            max_visits=mas.max_visits,
             budget=mas.budget,
             **mas._v2_kwargs(),
         )

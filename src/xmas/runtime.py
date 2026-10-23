@@ -171,22 +171,32 @@ def _generate(llm: BaseLLM, rendered: str) -> tuple[str, CallMeta | None]:
     return llm.get_response([rendered])[0], None
 
 
-def _call(llm: BaseLLM, rendered: str, meter: VisitMeter | None) -> tuple[str, CallMeta | None]:
+def _call(
+    llm: BaseLLM, rendered: str, meter: VisitMeter | None, *, batch_error: bool = False
+) -> tuple[str, CallMeta | None]:
     """Make one metered model call: check the budget, call, count what it cost.
+
+    With ``batch_error`` (a version 1 agent) a failed call raises as
+    promptolution's batch call does, so ``Trace.error`` reads ``"RuntimeError:
+    LLM batch failed: ..."`` as it did before call metadata, whichever path the
+    model takes; :func:`~xmas.errors.classify` reads the kind from the cause.
 
     Raises:
         BudgetExceeded: If the meter refuses the call.
         EmptyResponse: If the answer was empty; the meter counts its paid
             attempts first.
+        RuntimeError: With ``batch_error``, from whatever the call raised.
     """
     if meter is not None:
         meter.before_call()
     try:
         response, meta = _generate(llm, rendered)
-    except EmptyResponse as error:  # its attempts were paid: the meter counts them, then the run fails
-        if meter is not None:
+    except Exception as error:
+        if isinstance(error, EmptyResponse) and meter is not None:  # its attempts were paid: count them
             meter.after_call(error.meta)
-        raise
+        if not batch_error or not supports_meta(llm):  # promptolution's get_response wrapped it already
+            raise
+        raise RuntimeError(f"LLM batch failed: {error}") from error
     if meter is not None:
         meter.after_call(meta)
     return response, meta
@@ -284,7 +294,7 @@ def agent_node(
                 llm, rendered, tools, mas.max_tool_rounds, DEFAULT_SYS_PROMPT, count_tokens, meter=meter
             )
         else:
-            response, meta = _call(llm, rendered, meter)
+            response, meta = _call(llm, rendered, meter, batch_error=True)
             usage = _usage(count_tokens, rendered, response)
         record = AgentRecord(
             agent=agent.name,

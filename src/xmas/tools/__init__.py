@@ -55,14 +55,15 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.budget import RunMeter, VisitMeter
     from xmas.llms.meta import CallMeta, SupportsMeta
 
-DEDUPE_TOOL_CALLS = True
-"""Whether the tool loop answers a repeated successful call from its earlier result.
+DEDUPE_TOOL_CALLS = False
+"""Whether the tool loop answers a repeated successful call from its earlier result (off by default).
 
 Two calls are the same when they name the same tool and their arguments are
 equal as sorted-key JSON: after the tool's own validation for a tool built by
 :func:`tool`, and after reading numeric strings as numbers for ``integer`` and
-``number`` parameters of a remote tool. Failed calls always run again. Set to
-``False`` to run every call.
+``number`` parameters of a remote tool. Failed calls always run again. Off,
+every call runs, as a tool call need not be idempotent; set it to ``True`` to
+opt in.
 """
 
 REPEATED_CALL_NOTE = "[same call as before; result repeated]"
