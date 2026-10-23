@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy as _copy
+import dataclasses
 import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
@@ -745,7 +746,7 @@ class MAS(BasePredictor):
             f"step {step.name} uses={step.uses} reads={_canonical(step.reads)} writes={_canonical(step.writes)}"
             for step in sorted(self.steps.values(), key=lambda s: s.name)
         ]
-        lines += [f"edge {_canonical(edge.as_tuple())}" for edge in self.edges]
+        lines += [f"edge {_canonical(dataclasses.astuple(edge))}" for edge in self.edges]
         lines += [
             f"form {agent.name} {parse_type(agent.output_type)} {_canonical(agent.schema)}"
             for agent in sorted(self.agents.values(), key=lambda a: a.name)

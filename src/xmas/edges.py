@@ -100,21 +100,6 @@ class Edge:
         """The edge as a spec names it, ``"a -> b"``."""
         return f"{self.source} {ARROW} {self.target}"
 
-    def as_tuple(
-        self,
-    ) -> tuple[str, str, str, str | None, int | None, str | None, str | int | float | bool | None, tuple[str, ...]]:
-        """Return every field as plain data, in field order (for cache keys)."""
-        return (
-            self.source,
-            self.target,
-            self.kind.value,
-            self.when,
-            self.max_visits,
-            self.switch,
-            self.case,
-            self.errors,
-        )
-
     def spec(self) -> str | dict[str, Any] | None:
         """Return the spec of a conditional edge as a spec writes it, ``None`` for a plain edge."""
         if self.kind is EdgeKind.PLAIN:
