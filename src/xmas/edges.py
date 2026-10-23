@@ -10,10 +10,10 @@ A spec lists its edges as items of two forms::
     - judge -> publish: {switch: verdict.action}              # case defaults to the target
     - judge -> hold: {switch: verdict.action, case: wait}
 
-:func:`parse_edges` reads them into :class:`Edge` objects, one per (source,
-target) pair, and :func:`dump_edges` writes them back canonically. Whether the
-predicates, paths and error kinds make sense is :func:`xmas.check.check_system`'s
-question.
+:func:`parse_edges` reads them into :class:`Edge` objects, one per arrow, and
+:func:`dump_edges` writes them back canonically. Whether the predicates, paths
+and error kinds make sense, and whether a pair of nodes is listed twice, is
+:func:`xmas.check.check_system`'s question.
 """
 
 from __future__ import annotations
@@ -54,15 +54,11 @@ class EdgeKind(StrEnum):
 class Edge:
     """One edge between two nodes.
 
-    Attributes:
-        source: The node the edge leaves.
-        target: The node it enters.
-        kind: What decides whether it is taken.
-        when: The predicate of a ``when`` or ``while`` edge.
-        max_visits: How often a ``while`` edge's target may run.
-        switch: The path a ``switch`` edge compares.
-        case: The value a ``switch`` edge takes; defaults to the target name.
-        errors: The error kinds an ``error`` edge routes, or ``("any",)``.
+    ``when`` is the predicate of a ``when`` or ``while`` edge, and
+    ``max_visits`` how often a ``while`` edge's target may run. ``switch`` is
+    the path a ``switch`` edge compares and ``case`` the value it takes, the
+    target name by default. ``errors`` are the error kinds an ``error`` edge
+    routes, or ``("any",)``.
     """
 
     source: str
@@ -185,19 +181,11 @@ def _text(value: Any, where: str) -> str:
 
 
 def parse_edges(items: Iterable[Any]) -> list[Edge]:
-    """Read a spec's edge list.
+    """Read a spec's edge list into edges, in the order written; a chain gives one edge per arrow.
 
-    Args:
-        items: Chain strings such as ``"a -> b -> c"`` and one-key mappings such
-            as ``{"a -> b": {"when": "..."}}`` or ``{"a -> b": "else"}``.
-
-    Returns:
-        The edges, in the order written; a chain gives one edge per arrow.
-
-    Raises:
-        ValueError: If an item has neither form, a mapping's key is not one
-            source and one target, its spec is malformed, or two items name
-            the same (source, target) pair.
+    The items are chain strings such as ``"a -> b -> c"`` and one-key mappings
+    such as ``{"a -> b": {"when": "..."}}`` or ``{"a -> b": "else"}``; anything
+    else raises ValueError.
     """
     if isinstance(items, (str, dict)):
         raise ValueError("Edges are a list of chains and one-key mappings.")
@@ -214,11 +202,6 @@ def parse_edges(items: Iterable[Any]) -> list[Edge]:
             edges.append(_conditional(names[0], names[1], spec))
         else:
             raise ValueError(f"Edge {item!r} must be a chain such as 'a -> b' or a one-key mapping.")
-    seen: set[tuple[str, str]] = set()
-    for edge in edges:
-        if (edge.source, edge.target) in seen:
-            raise ValueError(f"Edge {edge.label!r} is listed twice; one edge per pair of nodes.")
-        seen.add((edge.source, edge.target))
     return edges
 
 
@@ -230,12 +213,6 @@ def dump_edges(edges: Sequence[Edge]) -> list[str | dict[str, Any]]:
     The caller passes declared edges only, so implicit start and end wiring is
     never written. Dumping what :func:`parse_edges` reads back from a dump
     gives the same list.
-
-    Args:
-        edges: The edges, in declared order.
-
-    Returns:
-        Chain strings and one-key mappings.
     """
     items: list[str | dict[str, Any]] = []
     chain: list[str] = []
