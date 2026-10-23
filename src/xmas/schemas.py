@@ -42,12 +42,7 @@ _ANY_JSON: TypeAdapter[Any] = TypeAdapter(Any)
 
 
 class FormError(ValueError):
-    """An answer does not match its form.
-
-    Attributes:
-        problem: One line naming every problem, such as
-            ``"action: Input should be 'post' or 'hold'; checks.0.reason: Field required"``.
-    """
+    """An answer does not match its form; ``problem`` names every problem on one line."""
 
     kind = ErrorKind.BAD_FORMAT
 
@@ -58,38 +53,22 @@ class FormError(ValueError):
 
 
 class AnswerForm:
-    """A compiled answer form; build it with :func:`compile_form`.
-
-    Attributes:
-        fields: The form as given (a plain copy), or ``None`` for any JSON.
-    """
+    """A compiled answer form; ``fields`` is a plain copy of the form, or ``None`` for any JSON."""
 
     fields: dict[str, dict[str, Any]] | None
 
     def __init__(self, fields: Mapping[str, Mapping[str, Any]] | None) -> None:
-        """Check the form and build its pydantic model.
-
-        Raises:
-            ValueError: If the form breaks the dialect; the message names the field.
-        """
+        """Check the form, naming the field that breaks the dialect, and build its pydantic model."""
         self.fields = None if fields is None else _plain(fields, "")
         self._model = None if self.fields is None else _model(self.fields, "answer")
 
     def parse(self, text: str) -> Any:
-        """Read an answer.
+        """Read an answer, raising :class:`FormError` when it does not match.
 
         Whitespace and at most one surrounding Markdown code fence are stripped;
         the rest must be JSON matching the form. Without a form any JSON passes.
-
-        Args:
-            text: The model's answer.
-
-        Returns:
-            The value: for a form, an object with the form's fields first (an
-            optional field left out is ``None``), then any extra fields.
-
-        Raises:
-            FormError: If the answer is not JSON or does not match the form.
+        A form's object has the form's fields first (an optional field left out
+        is ``None``), then any extra fields.
         """
         body = text.strip()
         if match := _FENCE.match(body):
@@ -131,11 +110,7 @@ class AnswerForm:
         return () if self.fields is None else tuple(_paths(self.fields, ""))
 
     def choices(self, path: str) -> tuple[Any, ...] | None:
-        """Return a field's ``one of`` values, or ``None`` when it has none or is not in the form.
-
-        Args:
-            path: A path from :meth:`paths`.
-        """
+        """Return the ``one of`` values of a field path, or ``None`` when it has none or is not in the form."""
         fields = self.fields
         spec: dict[str, Any] | None = None
         for name in path.split("."):
@@ -151,18 +126,7 @@ class AnswerForm:
 
 
 def compile_form(fields: Mapping[str, Mapping[str, Any]] | None) -> AnswerForm:
-    """Compile an answer form.
-
-    Args:
-        fields: The form in the README's dialect; ``None`` accepts any JSON and
-            ``{}`` any JSON object.
-
-    Returns:
-        The compiled form.
-
-    Raises:
-        ValueError: If the form breaks the dialect; the message names the field.
-    """
+    """Compile an answer form; ``None`` accepts any JSON and ``{}`` any JSON object."""
     return AnswerForm(fields)
 
 
