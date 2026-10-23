@@ -7,14 +7,14 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from promptolution.llms.base_llm import BaseLLM
 from promptolution.predictors.base_predictor import BasePredictor
 
 from xmas import runtime
-from xmas.agent import DEFAULT_INPUT, Agent
+from xmas.agent import Agent
 from xmas.budget import Budget
 from xmas.check import MERGE_LAST, SystemInfo, callable_writes, check_system, step_maps
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
@@ -33,20 +33,7 @@ from xmas.graph import (
 from xmas.health import HealthSettings
 from xmas.nodes import Box, Step
 from xmas.prompts import decode_prompts, encode_prompts
-from xmas.spec import (
-    SPEC_VERSION,
-    SPEC_VERSION_2,
-    AgentSpec,
-    AgentSpecV2,
-    BoxSpec,
-    CallableSpec,
-    HealthSpec,
-    MASSpec,
-    MASSpecV2,
-    StepSpec,
-    validate_spec,
-    validate_spec_v2,
-)
+from xmas.spec import validate_spec, validate_spec_v2
 from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools
 from xmas.trace import Trace
 from xmas.values import TEXT, ValueType, parse_type
@@ -54,7 +41,7 @@ from xmas.values import TEXT, ValueType, parse_type
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
 
-_QUERY_ONLY = {DEFAULT_INPUT: TEXT}
+_QUERY_ONLY = {"query": TEXT}
 
 
 class MAS(BasePredictor):
@@ -73,23 +60,21 @@ class MAS(BasePredictor):
     A system is version 1 or version 2. Version 2 adds steps (nodes that run a
     callable without a model), boxes (nodes that run a whole system), typed
     values, answer forms, declared inputs and conditional edges, and is checked
-    by :func:`xmas.check.check_system` when it is built. A version 1 system
-    behaves, serializes and compiles exactly as before.
+    by :func:`xmas.check.check_system` when it is built.
 
     Attributes:
         agents: Agents keyed by name. Mutable, so ``mas.agents["solver"].prompt``
             is a supported edit.
-        steps: Steps keyed by name (version 2); empty in version 1.
-        boxes: Boxes keyed by name (version 2); empty in version 1.
-        frozen: Names of the nodes no optimizer may change (version 2).
+        steps: Steps keyed by name; empty in version 1.
+        boxes: Boxes keyed by name; empty in version 1.
+        frozen: Names of the nodes no optimizer may change.
         health: The thresholds of the run's health signals, or ``None`` for
             the defaults.
         edges: The declared edges, in order, without the implicit wiring from
             :data:`~xmas.graph.START` and to :data:`~xmas.graph.END`.
         inputs: The values a run starts with, with their types; ``{query: text}``
             unless a version 2 system declares others.
-        merges: ``{value: rule}`` for values several nodes may write (version 2;
-            the rule is ``"last"``).
+        merges: ``{value: "last"}`` for values several nodes may write.
         version: 1 or 2.
         info: What the version 2 check learned (types, writers, joins); ``None``
             in version 1.
@@ -98,18 +83,14 @@ class MAS(BasePredictor):
         llm: The default model, used by any agent without its own binding.
         llms: Additional models by name, which agents bind to via ``Agent.model``.
         default_model: Name recorded for the default model in a serialized spec.
-        budget: Limits for each run, or ``None`` for none. Runtime state, never
-            part of the spec.
+        budget: Limits for each run, or ``None`` for none; never part of the spec.
         max_visits: How often one agent of a version 1 cycle may run in a single
-            query before its back edges close; a version 2 ``while`` edge names
-            its own ``max_visits``.
+            query before its back edges close.
         last_trace: Trace of the most recent :meth:`__call__`, or ``None`` before any.
         last_traces: Traces of the most recent :meth:`predict` or :meth:`run_batch`
-            call. Assigned once, at the end of the batch, so a reader either sees
-            the previous batch or the whole new one; this is the seam an attributor
-            reads after a task evaluation. One MAS instance serves one batch at a
-            time; run concurrent batches on separate instances, or use :meth:`run`,
-            which shares no state at all.
+            call, assigned once at the end of the batch; this is the seam an
+            attributor reads after a task evaluation. One MAS instance serves one
+            batch at a time; :meth:`run` shares no state at all.
     """
 
     agents: dict[str, Agent]
@@ -149,136 +130,132 @@ class MAS(BasePredictor):
         """Initialize a MAS.
 
         Args:
-            agents: The agents, in any order. Names must be unique.
-            edges: Directed ``(source, target)`` pairs between node names, or
+            agents: The agents, in any order.
+            edges: ``(source, target)`` pairs between node names, or
                 :class:`~xmas.edges.Edge` objects. Nodes left unconnected are
-                wired from the source sentinel and to the terminal sentinel
-                automatically.
+                wired from the source sentinel and to the terminal sentinel.
             llm: Default model for agents without their own binding.
             llms: Models by name, for per-agent bindings via ``Agent.model``.
-            max_steps: Cap on executed agent steps per call, so a cyclic topology
+            max_steps: Cap on executed steps per call, so a cyclic topology
                 cannot run forever.
-            default_model: Name to record for the default model when serializing.
-                Defaults to the model id ``llm`` reports.
-            tools: Tool objects and tool sources (e.g. ``MCPTools``), mixed, that
-                ``Agent.tools`` names and ``Step.uses`` resolve against: the
-                callables registry. Runtime state like ``llm``; never part of
-                the spec.
+            default_model: Name to record for the default model when serializing;
+                defaults to the model id ``llm`` reports.
+            tools: Tools and tool sources (e.g. ``MCPTools``), mixed: the
+                callables registry ``Agent.tools`` and ``Step.uses`` resolve in.
+                Runtime state like ``llm``; never part of the spec.
             max_tool_rounds: Model turns per agent visit that may request tools,
                 before one last turn with the tools withheld.
             max_visits: How often one agent may run in a single query before its
-                back edges close, so a version 1 prompt that always loops still
-                ends. A version 2 ``while`` edge carries its own ``max_visits``.
-            budget: Limits for each run: every run, and every item of a batch,
-                gets its own meter with these limits. A run that reaches one
-                ends with status ``over_budget``. Runtime state like ``llm``;
-                never part of the spec.
-            steps: Nodes that run a registered callable (version 2).
-            inputs: The values a run starts with, ``{name: type}`` (version 2).
-                Defaults to ``{"query": "text"}``.
+                version 1 back edges close; a ``while`` edge carries its own.
+            budget: Limits for each run, and for each item of a batch; a run
+                that reaches one ends with status ``over_budget``.
+            steps: Nodes that run a registered callable.
+            inputs: The values a run starts with, ``{name: type}``; defaults to
+                ``{"query": "text"}``.
             state: ``{value: {"merge": "last"}}`` for each value several nodes
-                may write (version 2).
+                may write.
             version: 1 or 2. Defaults to 2 when steps, boxes, conditional
                 edges, a non-text agent, ``inputs``, ``state`` or ``frozen``
                 are used, else 1.
-            boxes: Nodes that run a whole version 2 system (version 2).
-            frozen: Names of nodes no optimizer may change (version 2).
+            boxes: Nodes that run a whole version 2 system.
+            frozen: Names of nodes no optimizer may change.
             health: Thresholds of the health signals; ``None`` keeps the
                 defaults.
 
         Raises:
-            ValueError: If names collide, an edge names an unknown node, the
-                topology is not runnable, an agent binds to an unknown model or
-                tool, two sources offer the same tool name, or a tool-using
-                agent's model cannot call tools. A version 2 system raises once,
-                listing every problem :func:`~xmas.check.check_system` finds.
+            ValueError: If the system is not runnable. A version 2 system
+                raises once, listing every problem
+                :func:`~xmas.check.check_system` finds.
         """
         self.edges = tuple(edge if isinstance(edge, Edge) else Edge(*edge) for edge in edges or ())
         self.frozen = frozenset(frozen)
         self.health = health
-        uses_v2 = (
-            bool(steps)
-            or bool(boxes)
-            or bool(self.frozen)
-            or inputs is not None
-            or state is not None
-            or any(edge.kind is not EdgeKind.PLAIN for edge in self.edges)
-            or any(agent.output_type != "text" for agent in agents)
-        )
-        self.version = version if version is not None else (SPEC_VERSION_2 if uses_v2 else SPEC_VERSION)
-        if self.version not in (SPEC_VERSION, SPEC_VERSION_2):
-            raise ValueError(f"version must be 1 or 2, not {self.version!r}.")
-        if self.version == SPEC_VERSION and uses_v2:
-            raise ValueError("Steps, boxes, inputs, state, frozen, conditional edges and typed writes need version 2.")
-
-        if not agents and (self.version == SPEC_VERSION or not (steps or boxes)):
+        self.version = self._infer_version(version, agents, steps, boxes, inputs, state)
+        if not agents and (self.version == 1 or not (steps or boxes)):
             raise ValueError(
-                "A MAS needs at least one node."
-                if self.version == SPEC_VERSION_2
-                else "A MAS needs at least one agent."
+                "A MAS needs at least one node." if self.version == 2 else "A MAS needs at least one agent."
             )
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must be >= 0.")
         super().__init__(llm=llm)  # type: ignore[arg-type]
 
-        self.agents = {agent.name: agent for agent in agents}
-        if len(self.agents) != len(agents):
-            raise ValueError("Agent names must be unique.")
-        self.steps = {step.name: step for step in steps}
-        self.boxes = {box.name: box for box in boxes}
-        names = [*self.agents, *(step.name for step in steps), *(box.name for box in boxes)]
+        names = [agent.name for agent in agents] + [step.name for step in steps] + [box.name for box in boxes]
         if len(set(names)) != len(names):
             raise ValueError(f"Node names must be unique: {sorted({n for n in names if names.count(n) > 1})}.")
-        self.inputs = (
-            {name: kind if isinstance(kind, ValueType) else parse_type(kind) for name, kind in inputs.items()}
-            if inputs is not None
-            else dict(_QUERY_ONLY)
-        )
-        self.merges = {}
-        for value, entry in (state or {}).items():
-            if dict(entry) != {"merge": MERGE_LAST}:
-                raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
-            self.merges[value] = MERGE_LAST
-        self.info = None
-
-        pairs = [(edge.source, edge.target) for edge in self.edges]
-        if self.version == SPEC_VERSION:
-            self.graph = build_graph([agent.name for agent in agents], pairs)
-            validate_graph(self.graph)
-            # Force the terminal check now. A MAS with two terminal agents is only
-            # broken at the moment it produces an output, and discovering that after
-            # a batch of model calls is an expensive way to learn it.
-            terminal_agent(self.graph)
-
+        self.agents = {agent.name: agent for agent in agents}
+        self.steps = {step.name: step for step in steps}
+        self.boxes = {box.name: box for box in boxes}
         self.llms = dict(llms or {})
-        self.max_steps = max_steps
-        self.max_visits = max_visits
-        self.budget = budget
-        self.default_model = default_model if default_model is not None else getattr(llm, "model_id", None)
-
         for agent in agents:
             if agent.model is not None and agent.model not in self.llms:
                 raise ValueError(
                     f"Agent {agent.name!r} binds to model {agent.model!r}, which is not in llms={sorted(self.llms)}."
                 )
-
-        self.compilation: tuple[str, Any] | None = None
-        self.last_trace: Trace | None = None
-        self.last_traces: tuple[Trace, ...] = ()
-
+        self.max_steps = max_steps
+        self.max_visits = max_visits
+        self.budget = budget
+        self.default_model = default_model if default_model is not None else getattr(llm, "model_id", None)
         self.tools = tuple(tools)
         self.tool_index: ToolIndex | None = None  # built on first use, so tool-free systems never touch their sources
         self.max_tool_rounds = max_tool_rounds
-        if self.version == SPEC_VERSION_2:
-            # The check builds and checks the topology itself, so that a bad edge
-            # is one problem in the list rather than the first and only error.
-            self.info = check_system(self)
-            errors = [(edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.ERROR]
-            self.graph = build_graph(names, pairs, back=self.while_edges, errors=errors)
-            return
-        for agent in agents:  # fail at construction, not mid-run
+        self.compilation: tuple[str, Any] | None = None
+        self.last_trace: Trace | None = None
+        self.last_traces: tuple[Trace, ...] = ()
+        if self.version == 2:
+            self._build_v2(inputs, state)
+        else:
+            self._build_v1()
+
+    def _infer_version(
+        self,
+        version: int | None,
+        agents: list[Agent],
+        steps: Sequence[Step],
+        boxes: Sequence[Box],
+        inputs: Mapping[str, str | ValueType] | None,
+        state: Mapping[str, Mapping[str, str]] | None,
+    ) -> int:
+        """Return the version asked for, else 2 when a version 2 feature is used, else 1."""
+        uses_v2 = (
+            bool(steps or boxes or self.frozen)
+            or inputs is not None
+            or state is not None
+            or any(edge.kind is not EdgeKind.PLAIN for edge in self.edges)
+            or any(agent.output_type != "text" for agent in agents)
+        )
+        inferred = version if version is not None else 2 if uses_v2 else 1
+        if inferred not in (1, 2):
+            raise ValueError(f"version must be 1 or 2, not {inferred!r}.")
+        if inferred == 1 and uses_v2:
+            raise ValueError("Steps, boxes, inputs, state, frozen, conditional edges and typed writes need version 2.")
+        return inferred
+
+    def _build_v1(self) -> None:
+        """Build and check a version 1 topology, and resolve every agent's tools, so it fails now, not mid-run."""
+        self.inputs, self.merges, self.info = dict(_QUERY_ONLY), {}, None
+        self.graph = build_graph(list(self.agents), [(edge.source, edge.target) for edge in self.edges])
+        validate_graph(self.graph)
+        # Two terminal agents only break the run once it produces an output, after a batch of model calls.
+        terminal_agent(self.graph)
+        for agent in self.agents.values():
             if agent.tools:
                 self.resolve_tools(agent)
+
+    def _build_v2(
+        self, inputs: Mapping[str, str | ValueType] | None, state: Mapping[str, Mapping[str, str]] | None
+    ) -> None:
+        """Read the inputs and merges, run :func:`~xmas.check.check_system`, then build the graph."""
+        given = inputs if inputs is not None else _QUERY_ONLY
+        self.inputs = {name: kind if isinstance(kind, ValueType) else parse_type(kind) for name, kind in given.items()}
+        self.merges = {}
+        for value, entry in (state or {}).items():
+            if dict(entry) != {"merge": MERGE_LAST}:
+                raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
+            self.merges[value] = MERGE_LAST
+        self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
+        errors = [(edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.ERROR]
+        pairs = [(edge.source, edge.target) for edge in self.edges]
+        self.graph = build_graph([*self.agents, *self.steps, *self.boxes], pairs, back=self.while_edges, errors=errors)
 
     def _callables(self) -> ToolIndex:
         """Return the callables registry: every tool and tool source, indexed on first use."""
@@ -509,7 +486,7 @@ class MAS(BasePredictor):
         ]
 
         if edges is None:
-            edges = list(self.graph.edges) if self.version == SPEC_VERSION else list(self.edges)
+            edges = list(self.graph.edges) if self.version == 1 else list(self.edges)
         return MAS(
             agents=new_agents,
             edges=edges,
@@ -527,15 +504,11 @@ class MAS(BasePredictor):
     def _v2_kwargs(self) -> dict[str, Any]:
         """Return the keyword arguments that rebuild this system's version 2 fields.
 
-        The one place they are forwarded from: :meth:`copy`, :meth:`from_dict`
-        and every optimizer that constructs a ``MAS(...)`` from an existing one
-        pass ``**mas._v2_kwargs()``, so a field added here reaches all of them.
-
-        Returns:
-            ``steps``, ``inputs``, ``state``, ``version``, ``boxes``, ``frozen``
-            and ``health``.
+        :meth:`copy` and every optimizer that constructs a ``MAS(...)`` from an
+        existing one pass ``**mas._v2_kwargs()``, so a field added here reaches
+        all of them.
         """
-        v2 = self.version == SPEC_VERSION_2
+        v2 = self.version == 2
         return {
             "steps": tuple(self.steps.values()),
             "inputs": dict(self.inputs) if v2 else None,
@@ -546,78 +519,64 @@ class MAS(BasePredictor):
             "health": self.health,
         }
 
-    def to_dict(self) -> MASSpec | MASSpecV2:
-        """Return the plain-data spec for this MAS.
+    def to_dict(self) -> dict[str, Any]:
+        """Return the plain-data spec for this MAS: prompts, topology and model bindings by name.
 
-        A version 2 spec is canonical: sections in :data:`~xmas.spec.V2_KEYS`
+        The LLM objects, tools and budget are runtime state, not spec. A
+        version 2 spec is canonical: sections in :data:`~xmas.spec.V2_KEYS`
         order, empty or default sections left out, edges as
         :func:`~xmas.edges.dump_edges` writes them, prompts in a top-level
         ``prompts`` section, and a ``callables`` entry for every callable a node
         uses.
-
-        Returns:
-            Prompts, topology and model bindings, and nothing else. Models are
-            recorded by name; the LLM objects, tools and budget are runtime
-            state, not spec.
         """
-        if self.version == SPEC_VERSION_2:
-            return self._to_dict_v2()
-        ordered = agent_names(self.graph)
-        return MASSpec(
-            version=SPEC_VERSION,
-            agents=[cast("AgentSpec", self.agents[name].to_dict()) for name in ordered],
-            edges=[[source, target] for source, target in self.graph.edges],
-            default_model=self.default_model,
-        )
+        if self.version == 1:
+            return {
+                "version": 1,
+                "agents": [self.agents[name].to_dict() for name in agent_names(self.graph)],
+                "edges": [[source, target] for source, target in self.graph.edges],
+                "default_model": self.default_model,
+            }
+        sections: dict[str, Any] = {
+            "agents": [_agent_spec(agent) for agent in self.agents.values()],
+            "steps": [step.to_dict() for step in self.steps.values()],
+            "boxes": [box.to_dict() for box in self.boxes.values()],
+            "edges": dump_edges(self.edges),
+            "state": {value: {"merge": rule} for value, rule in self.merges.items()},
+            "frozen": sorted(self.frozen),
+            "health": _health_spec(self.health),
+            "callables": self._callable_specs(),
+            "default_model": self.default_model,
+            "prompts": self.prompts(),
+        }
+        inputs = {} if self.inputs == _QUERY_ONLY else {"inputs": _type_words(self.inputs)}
+        return {
+            "version": 2,
+            **inputs,
+            **{key: value for key, value in sections.items() if value not in (None, [], {})},
+        }
 
-    def _to_dict_v2(self) -> MASSpecV2:
-        """Return the canonical version 2 spec."""
-        spec = MASSpecV2(version=SPEC_VERSION_2)
-        if self.inputs != _QUERY_ONLY:
-            spec["inputs"] = {name: str(vtype) for name, vtype in self.inputs.items()}
-        if self.agents:
-            spec["agents"] = [_agent_spec(agent) for agent in self.agents.values()]
-        if self.steps:
-            spec["steps"] = [cast("StepSpec", step.to_dict()) for step in self.steps.values()]
-        if self.boxes:
-            spec["boxes"] = [cast("BoxSpec", box.to_dict()) for box in self.boxes.values()]
-        if self.edges:
-            spec["edges"] = dump_edges(self.edges)
-        if self.merges:
-            spec["state"] = {value: {"merge": rule} for value, rule in self.merges.items()}
-        if self.frozen:
-            spec["frozen"] = sorted(self.frozen)
-        health = _health_spec(self.health)
-        if health:
-            spec["health"] = health
-        callables = self._callable_specs()
-        if callables:
-            spec["callables"] = callables
-        if self.default_model is not None:
-            spec["default_model"] = self.default_model
-        if self.agents:
-            spec["prompts"] = {name: agent.prompt for name, agent in self.agents.items()}
-        return spec
-
-    def _callable_specs(self) -> dict[str, CallableSpec]:
+    def _callable_specs(self) -> dict[str, dict[str, Any]]:
         """Return the ``callables`` section: every callable a node uses, steps' first."""
         index = self._callables()
         used = [step.uses for step in self.steps.values()] + [t for agent in self.agents.values() for t in agent.tools]
-        specs: dict[str, CallableSpec] = {}
+        specs: dict[str, dict[str, Any]] = {}
         for name in dict.fromkeys(used):
             item, source = index[name]
             if item.fn is not None:
                 module = getattr(item.fn, "__module__", "?")
-                entry: CallableSpec = {"kind": "python", "import": f"{module}:{getattr(item.fn, '__qualname__', name)}"}
+                entry: dict[str, Any] = {
+                    "kind": "python",
+                    "import": f"{module}:{getattr(item.fn, '__qualname__', name)}",
+                }
             else:
                 entry = {"kind": "mcp"}
                 url = getattr(source, "url", None)
                 if isinstance(url, str):
                     entry["server"] = url
-            reads, writes = _type_words(item.reads), _type_words(callable_writes(item))
+            reads = _type_words(item.reads)
             if reads:
                 entry["reads"] = reads
-            entry["writes"] = writes
+            entry["writes"] = _type_words(callable_writes(item))
             specs[name] = entry
         return specs
 
@@ -641,21 +600,16 @@ class MAS(BasePredictor):
             tools: Tools and tool sources, resolving the agents' tool names and
                 the steps' callables.
 
-        Returns:
-            The reconstructed MAS.
-
         Raises:
             ValueError: If the spec is malformed, binds to an unsupplied model,
                 or (version 2) its ``callables`` do not match those supplied.
         """
-        if data.get("version", SPEC_VERSION) == SPEC_VERSION_2:
+        if data.get("version") == 2:
             return cls._from_v2(data, llm=llm, llms=llms, tools=tools)
         spec = validate_spec(data)
-        agents = [Agent.from_dict(dict(item)) for item in spec["agents"]]
-        edges = [(source, target) for source, target in spec.get("edges", [])]
         return cls(
-            agents=agents,
-            edges=edges,
+            agents=[Agent.from_dict(dict(item)) for item in spec["agents"]],
+            edges=[(source, target) for source, target in spec.get("edges", [])],
             llm=llm,
             llms=llms,
             default_model=spec.get("default_model"),
@@ -671,33 +625,23 @@ class MAS(BasePredictor):
         tools: Sequence[ToolSource | Tool],
     ) -> MAS:
         """Rebuild a version 2 MAS and check its ``callables`` against those supplied."""
-        spec = validate_spec_v2(data)
+        spec: dict[str, Any] = dict(validate_spec_v2(data))
         prompts = spec.get("prompts", {})
         agents = []
         for item in spec.get("agents", []):
             ((output, output_type),) = item["writes"].items()
             agents.append(
                 Agent(
-                    name=item["name"],
-                    prompt=prompts[item["name"]],
-                    output=output,
-                    inputs=item.get("reads"),
-                    tools=item.get("tools"),
-                    model=item.get("model"),
-                    output_type=output_type,
-                    schema=item.get("schema"),
+                    item["name"],
+                    prompts[item["name"]],
+                    output,
+                    item.get("reads"),
+                    item.get("tools"),
+                    item.get("model"),
+                    output_type,
+                    item.get("schema"),
                 )
             )
-        boxes = [
-            Box(
-                item["name"],
-                cls._from_v2(item["system"], llm=llm, llms=llms, tools=tools),
-                item["reads"],
-                item["writes"],
-            )
-            for item in spec.get("boxes", [])
-        ]
-        health = spec.get("health")
         mas = cls(
             agents=agents,
             edges=parse_edges(spec.get("edges", [])),
@@ -705,18 +649,21 @@ class MAS(BasePredictor):
             llms=llms,
             default_model=spec.get("default_model"),
             tools=tools,
-            steps=[Step.from_dict(item) for item in spec.get("steps", [])],
+            steps=[Step(**item) for item in spec.get("steps", [])],
             inputs=spec.get("inputs"),
-            state=cast("Mapping[str, Mapping[str, str]] | None", spec.get("state")),
-            version=SPEC_VERSION_2,
-            boxes=boxes,
+            state=spec.get("state"),
+            version=2,
+            boxes=[
+                Box(item["name"], cls._from_v2(item["system"], llm, llms, tools), item["reads"], item["writes"])
+                for item in spec.get("boxes", [])
+            ],
             frozen=spec.get("frozen", ()),
-            health=None if health is None else _health_settings(health),
+            health=_health_settings(spec["health"]) if "health" in spec else None,
         )
         mas._check_callables(spec.get("callables", {}))
         return mas
 
-    def _check_callables(self, declared: Mapping[str, CallableSpec]) -> None:
+    def _check_callables(self, declared: Mapping[str, Mapping[str, Any]]) -> None:
         """Check a spec's ``callables`` section against the callables this system resolved.
 
         Raises:
@@ -730,7 +677,7 @@ class MAS(BasePredictor):
                 problems.append(f"callables lists {name!r}, which no node uses")
                 continue
             for key in ("reads", "writes"):
-                want = _type_words(_parsed(cast("Mapping[str, str]", entry.get(key, {}))))
+                want = {value: str(parse_type(word)) for value, word in entry.get(key, {}).items()}
                 got = actual[name].get(key, {})
                 if want != got:
                     problems.append(f"callable {name!r} {key} {want} in the spec, but the one supplied {key} {got}")
@@ -745,13 +692,13 @@ class MAS(BasePredictor):
             path: Destination file.
 
         Raises:
-            ValueError: For a version 2 system, which is saved as a ``.mas``
-                bundle (phase 5); until then, use :meth:`to_dict`.
+            ValueError: For a version 2 system: its file format comes with the
+                ``.mas`` bundle; :meth:`to_dict` gives its spec.
         """
-        if self.version == SPEC_VERSION_2:
+        if self.version == 2:
             raise ValueError(
-                "A version 2 system is saved as a .mas bundle (name.mas/), which arrives in phase 5; "
-                "until then keep its to_dict()."
+                "A version 2 system is not saved as one YAML file: its format comes with the .mas bundle "
+                "(name.mas/); to_dict() gives its spec."
             )
         Path(path).write_text(
             yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=True),
@@ -787,98 +734,83 @@ class MAS(BasePredictor):
         description), typed reads and writes, and whether it is frozen; every
         edge with its condition, the implicit wiring marked ``"implicit":
         True``; ``"merge"`` or ``"join"`` for each node with several incoming
-        edges; and an ``id``,
-        the SHA-256 of the canonical JSON of the rest. Prompts are not part of
-        it, so editing one keeps the id. A version 1 system describes too: its
-        ``<continue>`` back edges are ``"loop"`` edges.
-
-        Returns:
-            ``{"version", "inputs", "nodes", "edges", "joins", "groups", "id"}``,
-            JSON-dumpable.
+        edges; and an ``id``, the SHA-256 of the canonical JSON of the rest.
+        Prompts are not part of it, so editing one keeps the id. A version 1
+        system's ``<continue>`` back edges are ``"loop"`` edges.
         """
-        types = self.info.types if self.info is not None else {}
-
-        def typed(names: Iterable[str]) -> dict[str, str]:
-            return {name: str(types.get(name, TEXT)) for name in names}
-
-        nodes: list[dict[str, Any]] = []
-        for name, node in self.nodes.items():
-            if isinstance(node, Agent):
-                entry: dict[str, Any] = {
-                    "name": name,
-                    "kind": "agent",
-                    "model": node.model if node.model is not None else self.default_model,
-                    "reads": typed(node.inputs),
-                    "writes": {node.output: str(parse_type(node.output_type))},
-                    "tools": list(node.tools),
-                    "frozen": name in self.frozen,
-                }
-                if node.schema is not None:
-                    entry["schema"] = _copy.deepcopy(node.schema)
-            elif isinstance(node, Box):
-                entry = {
-                    "name": name,
-                    "kind": "box",
-                    "reads": typed(node.reads.values()),
-                    "writes": typed(node.writes.values()),
-                    "system": node.system.describe(),
-                }
-            else:
-                reads, writes = step_maps(node, self.resolve_callable(node)[0])
-                entry = {
-                    "name": name,
-                    "kind": "step",
-                    "uses": node.uses,
-                    "reads": typed(reads.values()),
-                    "writes": typed(writes.values()),
-                }
-            if name in self.frozen and "frozen" not in entry:
-                entry["frozen"] = True
-            nodes.append(entry)
-
         declared = {(edge.source, edge.target): edge for edge in self.edges}
-        loops = back_edges(self.graph) if self.version == SPEC_VERSION else set()
-        # Wiring from START first, then the declared edges in their order, then wiring to END.
+        loops = back_edges(self.graph) if self.info is None else set()
         wiring = [pair for pair in self.graph.edges if pair not in declared]
+        # Wiring from START first, then the declared edges in their order, then wiring to END.
         ordered = sorted([*declared, *wiring], key=lambda pair: (pair[0] != START) + (pair[1] == END))
-        edges: list[dict[str, Any]] = []
-        for source, target in ordered:
-            item: dict[str, Any] = {"from": source, "to": target, "kind": EdgeKind.PLAIN.value}
-            if (source, target) in loops:
-                when = f"{runtime.CONTINUE_MARKER} in output"
-                item.update(kind="loop", when=when, max_visits=self.max_visits)
-            elif (source, target) in declared:
-                spec = declared[(source, target)]
-                item["kind"] = spec.kind.value
-                fields = {"when": spec.when, "max_visits": spec.max_visits, "switch": spec.switch, "case": spec.case}
-                item.update({key: value for key, value in fields.items() if value is not None})
-                if spec.errors:
-                    item["errors"] = list(spec.errors)
-            if self.info is not None:
-                implicit = (source, target) not in declared
-            else:
-                implicit = (source == START and self.graph.in_degree(target) == 1) or (
-                    target == END and self.graph.out_degree(source) == 1
-                )
-            if implicit:
-                item["implicit"] = True
-            edges.append(item)
-
         if self.info is not None:
             joins = {name: join.kind for name, join in self.info.joins.items()}
         else:
             joins = dict.fromkeys(sorted(join_nodes(self.graph)), "join")
         description: dict[str, Any] = {
             "version": self.version,
-            "inputs": {name: str(vtype) for name, vtype in self.inputs.items()},
-            "nodes": nodes,
-            "edges": edges,
+            "inputs": _type_words(self.inputs),
+            "nodes": [self._describe_node(name, node) for name, node in self.nodes.items()],
+            "edges": [self._describe_edge(pair, declared.get(pair), pair in loops) for pair in ordered],
             "joins": joins,
             "groups": [],
         }
         canonical = json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         description["id"] = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return description
+
+    def _describe_node(self, name: str, node: Agent | Step | Box) -> dict[str, Any]:
+        """Return one node of :meth:`describe`."""
+        types = self.info.types if self.info is not None else {}
+
+        def typed(names: Iterable[str]) -> dict[str, str]:
+            return {name: str(types.get(name, TEXT)) for name in names}
+
+        if isinstance(node, Agent):
+            entry: dict[str, Any] = {
+                "name": name,
+                "kind": "agent",
+                "model": node.model if node.model is not None else self.default_model,
+                "reads": typed(node.inputs),
+                "writes": {node.output: str(parse_type(node.output_type))},
+                "tools": list(node.tools),
+                "frozen": name in self.frozen,
+            }
+            if node.schema is not None:
+                entry["schema"] = _copy.deepcopy(node.schema)
+            return entry
+        if isinstance(node, Box):
+            entry = {"name": name, "kind": "box", "reads": typed(node.reads.values())}
+            entry.update(writes=typed(node.writes.values()), system=node.system.describe())
+        else:
+            reads, writes = step_maps(node, self.resolve_callable(node)[0])
+            entry = {"name": name, "kind": "step", "uses": node.uses, "reads": typed(reads.values())}
+            entry["writes"] = typed(writes.values())
+        if name in self.frozen:
+            entry["frozen"] = True
+        return entry
+
+    def _describe_edge(self, pair: tuple[str, str], edge: Edge | None, loop: bool) -> dict[str, Any]:
+        """Return one edge of :meth:`describe`: ``edge`` when declared, ``loop`` for a version 1 back edge."""
+        source, target = pair
+        item: dict[str, Any] = {"from": source, "to": target, "kind": EdgeKind.PLAIN.value}
+        if loop:
+            item.update(kind="loop", when=f"{runtime.CONTINUE_MARKER} in output", max_visits=self.max_visits)
+        elif edge is not None:
+            item["kind"] = edge.kind.value
+            fields = {"when": edge.when, "max_visits": edge.max_visits, "switch": edge.switch, "case": edge.case}
+            item.update({key: value for key, value in fields.items() if value is not None})
+            if edge.errors:
+                item["errors"] = list(edge.errors)
+        if self.info is not None:
+            implicit = edge is None
+        else:
+            implicit = (source == START and self.graph.in_degree(target) == 1) or (
+                target == END and self.graph.out_degree(source) == 1
+            )
+        if implicit:
+            item["implicit"] = True
+        return item
 
     @property
     def structure(self) -> str:
@@ -900,7 +832,7 @@ class MAS(BasePredictor):
             for agent in sorted(self.agents.values(), key=lambda a: a.name)
         ]
         lines += [f"{source} -> {target}" for source, target in sorted(self.graph.edges)]
-        if self.version == SPEC_VERSION:
+        if self.info is None:
             return "\n".join(lines)
         lines += [
             f"step {step.name} uses={step.uses} reads={_canonical(step.reads)} writes={_canonical(step.writes)}"
@@ -942,12 +874,12 @@ class MAS(BasePredictor):
         return f"MAS(agents={agent_names(self.graph)!r}, edges={edges}, {ending})"
 
 
-def _agent_spec(agent: Agent) -> AgentSpecV2:
+def _agent_spec(agent: Agent) -> dict[str, Any]:
     """Return one agent's version 2 entry, defaults left out; its prompt goes to ``prompts``."""
-    data = AgentSpecV2(name=agent.name)
+    data: dict[str, Any] = {"name": agent.name}
     if agent.model is not None:
         data["model"] = agent.model
-    if agent.inputs != [DEFAULT_INPUT]:
+    if agent.inputs != ["query"]:
         data["reads"] = list(agent.inputs)
     data["writes"] = {agent.output: str(parse_type(agent.output_type))}
     if agent.tools:
@@ -957,32 +889,22 @@ def _agent_spec(agent: Agent) -> AgentSpecV2:
     return data
 
 
-def _health_spec(settings: HealthSettings | None) -> HealthSpec:
+def _health_spec(settings: HealthSettings | None) -> dict[str, Any]:
     """Return the health settings that differ from the defaults, as a spec writes them."""
-    spec = HealthSpec()
     if settings is None:
-        return spec
+        return {}
     default = HealthSettings()
-    if settings.length_factor != default.length_factor:
-        spec["length_factor"] = settings.length_factor
-    if settings.min_samples != default.min_samples:
-        spec["min_samples"] = settings.min_samples
-    if settings.leak:
-        spec["leak"] = list(settings.leak)
-    return spec
+    return {
+        name: list(value) if isinstance(value, tuple) else value
+        for name in ("length_factor", "min_samples", "leak")
+        if (value := getattr(settings, name)) != getattr(default, name)
+    }
 
 
-def _health_settings(spec: HealthSpec) -> HealthSettings:
+def _health_settings(spec: Mapping[str, Any]) -> HealthSettings:
     """Read a spec's ``health`` section."""
-    data: dict[str, Any] = dict(spec)
-    if "leak" in data:
-        data["leak"] = tuple(data["leak"])
+    data: dict[str, Any] = {name: tuple(value) if name == "leak" else value for name, value in spec.items()}
     return HealthSettings(**data)
-
-
-def _parsed(words: Mapping[str, str]) -> dict[str, ValueType]:
-    """Read ``{name: type word}``."""
-    return {name: parse_type(word) for name, word in words.items()}
 
 
 def _type_words(types: Mapping[str, ValueType]) -> dict[str, str]:
