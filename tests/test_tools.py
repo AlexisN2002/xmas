@@ -547,7 +547,7 @@ def test_a_local_tool_repeat_compares_after_validation() -> None:
 
 
 def test_dedupe_is_off_by_default() -> None:
-    """A tool call need not be idempotent: version 1 runs every call, as on main."""
+    """A tool call need not be idempotent: version 1 runs every call."""
     assert xmas.tools.DEDUPE_TOOL_CALLS is False
     source = FakeToolSource(properties=RUN_PYTHON_SCHEMA)
     call = '{"code": "x", "timeout_s": 20}'
