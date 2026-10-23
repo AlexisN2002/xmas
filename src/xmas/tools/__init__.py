@@ -12,13 +12,10 @@ calls, each result goes back as a ``role=tool`` message, and after
 ``max_tool_rounds`` such turns one last turn with the tools withheld forces a
 text answer. Every call is kept as a :class:`~xmas.trace.ToolCall` on the
 agent's record. A tool that fails is data (the model sees the error and may try
-again); a source that refuses the caller ends the run. A call identical to one
-that already succeeded in the same loop is not run again: the model gets the
-earlier result back under a short note (see ``DEDUPE_TOOL_CALLS``).
+again); a source that refuses the caller ends the run.
 
 The same registry serves steps (version 2): a :class:`~xmas.nodes.Step` names a
-tool in ``uses`` and :func:`run_step` runs it with values from the graph, so one
-callable can be offered to agents and run as a node, described once. A tool
+tool in ``uses`` and :func:`run_step` runs it with values from the graph. A tool
 reads its parameters (:attr:`Tool.reads`) and writes :attr:`Tool.writes`.
 """
 
@@ -56,14 +53,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.llms.meta import CallMeta, SupportsMeta
 
 DEDUPE_TOOL_CALLS = False
-"""Whether the tool loop answers a repeated successful call from its earlier result (off by default).
+"""Whether the tool loop answers a repeated successful call from its earlier result.
 
-Two calls are the same when they name the same tool and their arguments are
-equal as sorted-key JSON: after the tool's own validation for a tool built by
-:func:`tool`, and after reading numeric strings as numbers for ``integer`` and
-``number`` parameters of a remote tool. Failed calls always run again. Off,
-every call runs, as a tool call need not be idempotent; set it to ``True`` to
-opt in.
+Off, every call runs, as a tool call need not be idempotent. Two calls are the
+same when they name the same tool and their arguments are equal as sorted-key
+JSON, after the tool's own validation (or, for a remote tool, after numeric
+strings are read as numbers). Failed calls always run again.
 """
 
 REPEATED_CALL_NOTE = "[same call as before; result repeated]"
@@ -92,11 +87,9 @@ class Tool:
         fn: The implementation for a local tool, ``None`` for a remote one (called
             through its source).
         writes: What the tool writes when it runs as a step, ``{write name:
-            type}``. Words such as ``"json"`` are read into :class:`~xmas.values.ValueType`
-            at construction, which also fills in one write named like the tool
-            for ``None``: text when ``fn``'s return hint is ``str`` or the tool
-            is remote, json otherwise. A built tool always holds a
-            ``dict[str, ValueType]``.
+            type}``, held as :class:`~xmas.values.ValueType` once built. ``None``
+            is one write named like the tool: text when ``fn``'s return hint is
+            ``str`` or the tool is remote, json otherwise.
     """
 
     name: str
@@ -125,30 +118,17 @@ class Tool:
         return {name: type_of_hint(schema) for name, schema in properties.items()}
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Call ``fn`` directly, so a decorated function stays a function.
-
-        Raises:
-            TypeError: If the tool is remote and has no local implementation.
-        """
+        """Call ``fn`` directly, so a decorated function stays a function; a remote tool raises ``TypeError``."""
         if self.fn is None:
             raise TypeError(f"Tool {self.name!r} is remote; call it through its source.")
         return self.fn(*args, **kwargs)
 
     def validate(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Coerce model-supplied arguments against the schema.
+        """Return model-supplied arguments as keyword arguments for ``fn``, or raise ``XmasError``.
 
         A tool built by :func:`tool` validates (and coerces) with its pydantic
         model. A tool built from a foreign schema only checks required and
         unknown keys.
-
-        Args:
-            arguments: The decoded arguments object.
-
-        Returns:
-            Keyword arguments ready for ``fn(**kwargs)``.
-
-        Raises:
-            XmasError: If the arguments do not match.
         """
         if not isinstance(arguments, dict):
             raise XmasError(f"arguments must be an object, got {type(arguments).__name__}")
@@ -222,14 +202,7 @@ class LocalTools(ToolSource):
     """
 
     def __init__(self, tools: Sequence[Tool]) -> None:
-        """Initialize the source.
-
-        Args:
-            tools: Local tools, each with an ``fn``. Names must be unique.
-
-        Raises:
-            ValueError: If a tool has no ``fn`` or two tools share a name.
-        """
+        """Wrap local tools; ``ValueError`` if one has no ``fn`` or two share a name."""
         self.by_name: dict[str, Tool] = {}
         for item in tools:
             if item.fn is None:
@@ -243,19 +216,12 @@ class LocalTools(ToolSource):
         return list(self.by_name.values())
 
     def call(self, name: str, arguments: dict[str, Any]) -> str:
-        """Validate the arguments, run the function, and stringify its result.
-
-        Args:
-            name: The tool to run.
-            arguments: The decoded arguments object.
-
-        Returns:
-            The result as text.
+        """Validate the arguments, run the function, and return its result as text.
 
         Raises:
             XmasError: If the tool is unknown, the arguments are invalid, or the
-                function raised. ``BudgetExceeded`` and ``Stopped`` raised by the
-                function pass through unwrapped, since they end the run.
+                function raised. ``BudgetExceeded`` and ``Stopped`` pass through
+                unwrapped, since they end the run.
         """
         spec = self.by_name.get(name)
         if spec is None:
@@ -331,18 +297,8 @@ def index_tools(items: Sequence[ToolSource | Tool]) -> ToolIndex:
     """Index every tool offered by a MAS's ``tools=`` list by name.
 
     Bare Tools are grouped into one :class:`LocalTools`. The same object listed
-    twice counts once; two different offers of one name are an error, with no
-    shadowing and no priority order.
-
-    Args:
-        items: Tools and tool sources, mixed.
-
-    Returns:
-        The index.
-
-    Raises:
-        ValueError: If two sources offer the same name.
-        TypeError: If an item is neither a Tool nor a ToolSource.
+    twice counts once; two different offers of one name are a ``ValueError``,
+    with no shadowing and no priority order.
     """
     local: list[Tool] = []
     sources: list[ToolSource] = []
@@ -367,19 +323,7 @@ def index_tools(items: Sequence[ToolSource | Tool]) -> ToolIndex:
 
 
 def select_tools(index: ToolIndex, agent: Agent, llm: BaseLLM | None) -> ToolIndex:
-    """Return the tools one agent may call, checking that its model can call them.
-
-    Args:
-        index: Every tool the MAS offers, from :func:`index_tools`.
-        agent: The agent.
-        llm: The agent's model, or ``None`` when none is bound yet.
-
-    Returns:
-        The agent's tools, keyed by name, in the order the agent lists them.
-
-    Raises:
-        ValueError: If a name is unknown, or the model cannot call tools.
-    """
+    """Return the tools one agent may call, in its order; ``ValueError`` for an unknown name or a tool-less model."""
     unknown = [name for name in agent.tools if name not in index]
     if unknown:
         raise ValueError(f"Agent {agent.name!r} uses unknown tools {unknown}; available: {sorted(index)}.")
@@ -391,29 +335,18 @@ def select_tools(index: ToolIndex, agent: Agent, llm: BaseLLM | None) -> ToolInd
 
 
 def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Run a callable as a step and return what it writes.
+    """Run a callable as a step and return ``{write: value}``, keyed by its own write names.
 
-    The arguments are checked with :meth:`Tool.validate`. A local tool's ``fn``
-    is then called here, not through :meth:`LocalTools.call`, which would turn
-    its result into text; a remote tool runs through ``source.call``, and a json
-    write is the JSON its text holds. One write takes the whole result; several
-    need a mapping with exactly those keys. Every write is checked against its
-    type.
-
-    Args:
-        spec: The callable, as the registry describes it.
-        source: The source that offers it.
-        arguments: ``{parameter: value}``; a parameter left out takes its default.
-
-    Returns:
-        ``{write: value}``, keyed by the callable's own write names.
+    A local tool's ``fn`` is called here, not through :meth:`LocalTools.call`,
+    which would turn its result into text, and what it raises passes unchanged;
+    a remote tool runs through ``source.call``, and a json write is the JSON its
+    text holds. One write takes the whole result; several need a mapping with
+    exactly those keys.
 
     Raises:
         XmasError: If the arguments do not match the parameters, or a remote
             tool failed or was refused (``status`` 401, 403 or 429).
         BadFormat: If the result does not fit the writes; it names the callable.
-        Exception: Whatever a local ``fn`` raised, unchanged, so its kind can
-            be classified.
     """
     writes = cast("dict[str, ValueType]", spec.writes)
     kwargs = spec.validate(arguments)
@@ -449,45 +382,33 @@ _INTEGER = re.compile(r"-?[0-9]+")
 _NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 
 
-def _numeric_type(schema: Any) -> str | None:
-    """Return ``"integer"`` or ``"number"`` when a property schema is plainly numeric (``null`` allowed)."""
-    if not isinstance(schema, dict):
-        return None
-    declared = schema.get("type")
-    listed = [declared] if isinstance(declared, str) else declared if isinstance(declared, list) else []
-    types = {item for item in listed if isinstance(item, str)} - {"null"}
-    return types.pop() if len(types) == 1 and types <= {"integer", "number"} else None
-
-
 def _numbers_from_strings(arguments: dict[str, Any], parameters: dict[str, Any]) -> dict[str, Any]:
-    """Read top-level numeric strings as numbers where the schema says integer or number.
+    """Read top-level numeric strings as numbers where the schema types a property integer or number.
 
-    Conservative: only plain ASCII decimal literals without surrounding space
-    are converted (``"20"``, ``"-1.5"``, the latter for ``number`` only), and a
-    number-typed ``"20"`` becomes ``20``, not ``20.0``.
+    ``null`` may be allowed beside the number. Only plain decimal literals are
+    converted (``"-1.5"`` for ``number`` only), and a number-typed ``"20"``
+    becomes ``20``, not ``20.0``.
     """
     properties = parameters.get("properties")
     if not isinstance(properties, dict):
         return arguments
     out = dict(arguments)
     for key, value in arguments.items():
-        kind = _numeric_type(properties.get(key))
-        if kind is None or not isinstance(value, str):
+        schema = properties.get(key)
+        declared = schema.get("type") if isinstance(schema, dict) else None
+        listed = [declared] if isinstance(declared, str) else declared if isinstance(declared, list) else []
+        types = {item for item in listed if isinstance(item, str)} - {"null"}
+        if not isinstance(value, str) or len(types) != 1 or not types <= {"integer", "number"}:
             continue
         if _INTEGER.fullmatch(value):
             out[key] = int(value)
-        elif kind == "number" and _NUMBER.fullmatch(value):
+        elif types == {"number"} and _NUMBER.fullmatch(value):
             out[key] = float(value)
     return out
 
 
 def _call_key(tools: ToolIndex, request: ToolCallRequest) -> tuple[str, str] | None:
-    """Return what makes a request the same call as another, or ``None`` if it cannot be matched.
-
-    Local tools built by :func:`tool` compare after their own validation;
-    remote tools after :func:`_numbers_from_strings`; other local tools as sent.
-    Requests that would fail (bad JSON, unknown tool, invalid arguments) get no key.
-    """
+    """Return what makes a request the same call as another, or ``None`` for a request that would fail."""
     try:
         arguments = json.loads(request.arguments or "{}")
     except json.JSONDecodeError:
@@ -508,6 +429,44 @@ def _call_key(tools: ToolIndex, request: ToolCallRequest) -> tuple[str, str] | N
         return None
 
 
+def _run_or_repeat(tools: ToolIndex, request: ToolCallRequest, succeeded: dict[tuple[str, str], str]) -> ToolCall:
+    """Run one requested call, or, with ``DEDUPE_TOOL_CALLS``, repeat the result of an equal call that succeeded."""
+    key = _call_key(tools, request) if DEDUPE_TOOL_CALLS else None
+    if key is not None and key in succeeded:
+        return ToolCall(request.name, json.loads(request.arguments or "{}"), f"{REPEATED_CALL_NOTE}\n{succeeded[key]}")
+    call = execute_tool_call(tools, request)
+    if key is not None and not call.failed:
+        succeeded[key] = call.result
+    return call
+
+
+def _turn_usage(
+    count: Callable[[str], float], messages: list[dict[str, Any]], text: str, requests: Sequence[ToolCallRequest]
+) -> TokenUsage:
+    """Estimate one tool turn's tokens with ``count``: every message's content in, the text and call arguments out."""
+    return TokenUsage(
+        input_tokens=sum(int(count(str(item.get("content") or ""))) for item in messages),
+        output_tokens=int(count(text)) + sum(int(count(request.arguments)) for request in requests),
+    )
+
+
+_Answer = tuple[str, list[ToolCallRequest], "CallMeta | None"]
+
+
+def _metered(meter: RunMeter | VisitMeter | None, ask: Callable[[], _Answer]) -> _Answer:
+    """Make one model call under ``meter``: checked before it starts, counted after, an empty answer's attempts too."""
+    if meter is None:
+        return ask()
+    meter.before_call()
+    try:
+        answer = ask()
+    except EmptyResponse as error:  # its attempts were paid: the meter counts them, then the run fails
+        meter.after_call(error.meta)
+        raise
+    meter.after_call(answer[2])
+    return answer
+
+
 def run_tool_loop(
     llm: Any,
     rendered: str,
@@ -520,44 +479,30 @@ def run_tool_loop(
 ) -> tuple[str, tuple[ToolCall, ...], TokenUsage, CallMeta | None]:
     """Answer one rendered prompt, letting the model call tools.
 
-    At most ``max_rounds`` turns may request tools. Calls within a turn run in
-    order. If the model is still asking after that, one more turn with the tools
-    withheld forces a text answer. With ``DEDUPE_TOOL_CALLS``, a call equal to one
-    that already succeeded in this loop is not run again; it is answered, and
-    recorded, with the earlier result under ``REPEATED_CALL_NOTE``.
-
-    With ``check``, the final answer is checked once: when ``check`` names a
-    problem, the answer stays in the conversation and one more turn, tools
-    withheld, asks again with :data:`~xmas.schemas.RETRY_NOTE`. That second
-    answer is returned unchecked; the caller parses it.
-
-    Every model turn is checked against the run's budget before it starts. A
-    model that returns call metadata (see :func:`xmas.llms.meta.supports_meta`)
-    is asked through ``get_tool_response_meta``, and the turns' metadata is
-    combined into one.
-
-    Args:
-        llm: The agent's model; it has a ``get_tool_response(messages, tools)``.
-        rendered: The rendered prompt.
-        tools: The agent's tools.
-        max_rounds: Turns that may request tools.
-        system_prompt: The system message, as a plain agent's call would send.
-        count_tokens: Token counter for the agent's model.
-        meter: The run's meter, or ``None`` outside a metered run.
-        check: Says why an answer is refused, or ``None`` when it is accepted.
+    At most ``max_rounds`` turns may request tools; calls within a turn run in
+    order. If the model is still asking after that, one more turn with the
+    tools withheld forces a text answer. With ``check``, a final answer it
+    names a problem with stays in the conversation, and one more turn, tools
+    withheld, asks again with :data:`~xmas.schemas.RETRY_NOTE`; that answer is
+    returned unchecked. Every turn is checked against ``meter`` before it starts.
 
     Returns:
-        The final text, the calls made, the approximate usage over all turns, and
-        the combined metadata of the turns, or ``None`` when the model gives none.
+        The final text, the calls made, the approximate usage over all turns
+        (``count_tokens``), and the turns' combined metadata, or ``None`` when
+        the model gives none (see :func:`xmas.llms.meta.supports_meta`).
 
     Raises:
-        BudgetExceeded: If the meter refuses a turn (``xmas.errors.BudgetExceeded``).
-        EmptyResponse: If a turn came back empty after its retries; the meter
-            counts the paid attempts first.
+        BudgetExceeded: If the meter refuses a turn.
+        EmptyResponse: If a turn came back empty after its retries.
         XmasError: If a tool source refused the caller (``status`` 401, 403 or 429).
     """
     from xmas.llms.meta import supports_meta  # here, not at the top: xmas.llms imports this module
 
+    ask: Callable[[list[dict[str, Any]], list[Tool]], _Answer] = (
+        cast("SupportsMeta", llm).get_tool_response_meta
+        if supports_meta(llm)
+        else lambda history, offered: (*llm.get_tool_response(history, offered), None)
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": rendered},
@@ -566,29 +511,14 @@ def run_tool_loop(
     calls: list[ToolCall] = []
     succeeded: dict[tuple[str, str], str] = {}
     usage = TokenUsage()
-    meta_llm = cast("SupportsMeta", llm) if supports_meta(llm) else None
     meta: CallMeta | None = None
 
     def turn(offered: list[Tool]) -> tuple[str, list[ToolCallRequest]]:
         nonlocal usage, meta
-        if meter is not None:
-            meter.before_call()
-        sent = sum(int(count_tokens(str(item.get("content") or ""))) for item in messages)
-        turn_meta: CallMeta | None = None
-        try:
-            if meta_llm is None:
-                text, requests = llm.get_tool_response(messages, offered)
-            else:
-                text, requests, turn_meta = meta_llm.get_tool_response_meta(messages, offered)
-                meta = turn_meta if meta is None else meta.combine(turn_meta)
-        except EmptyResponse as error:  # its attempts were paid: the meter counts them, then the run fails
-            if meter is not None:
-                meter.after_call(error.meta)
-            raise
-        if meter is not None:
-            meter.after_call(turn_meta)
-        received = int(count_tokens(text)) + sum(int(count_tokens(r.arguments)) for r in requests)
-        usage = usage + TokenUsage(input_tokens=sent, output_tokens=received)
+        text, requests, turn_meta = _metered(meter, lambda: ask(messages, offered))
+        if turn_meta is not None:
+            meta = turn_meta if meta is None else meta.combine(turn_meta)
+        usage = usage + _turn_usage(count_tokens, messages, text, requests)
         return text, requests
 
     def checked(text: str) -> str:
@@ -608,14 +538,7 @@ def run_tool_loop(
         ]
         messages.append({"role": "assistant", "content": text or None, "tool_calls": wired})
         for request in requests:
-            key = _call_key(tools, request) if DEDUPE_TOOL_CALLS else None
-            if key is not None and key in succeeded:
-                repeated = f"{REPEATED_CALL_NOTE}\n{succeeded[key]}"
-                call = ToolCall(request.name, json.loads(request.arguments or "{}"), repeated)
-            else:
-                call = execute_tool_call(tools, request)
-                if key is not None and not call.failed:
-                    succeeded[key] = call.result
+            call = _run_or_repeat(tools, request, succeeded)
             calls.append(call)
             messages.append({"role": "tool", "tool_call_id": request.id, "content": call.result})
     text, _ = turn([])
