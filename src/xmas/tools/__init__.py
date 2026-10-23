@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, cast, overload
 
 from pydantic import BaseModel, ValidationError
 
-from xmas.errors import BadFormat, BudgetExceeded, EmptyResponse, Stopped, XmasError
+from xmas.errors import BadFormat, BudgetExceeded, Stopped, XmasError
 from xmas.schemas import RETRY_NOTE
 from xmas.tools.schema import (
     arguments_from,
@@ -450,23 +450,6 @@ def _turn_usage(
     )
 
 
-_Answer = tuple[str, list[ToolCallRequest], "CallMeta | None"]
-
-
-def _metered(meter: RunMeter | VisitMeter | None, ask: Callable[[], _Answer]) -> _Answer:
-    """Make one model call under ``meter``: checked before it starts, counted after, an empty answer's attempts too."""
-    if meter is None:
-        return ask()
-    meter.before_call()
-    try:
-        answer = ask()
-    except EmptyResponse as error:  # its attempts were paid: the meter counts them, then the run fails
-        meter.after_call(error.meta)
-        raise
-    meter.after_call(answer[2])
-    return answer
-
-
 def run_tool_loop(
     llm: Any,
     rendered: str,
@@ -474,7 +457,7 @@ def run_tool_loop(
     max_rounds: int,
     system_prompt: str,
     count_tokens: Callable[[str], float],
-    meter: RunMeter | VisitMeter | None = None,
+    meter: RunMeter | VisitMeter,
     check: Callable[[str], str | None] | None = None,
 ) -> tuple[str, tuple[ToolCall, ...], TokenUsage, CallMeta | None]:
     """Answer one rendered prompt, letting the model call tools.
@@ -498,11 +481,6 @@ def run_tool_loop(
     """
     from xmas.llms.meta import supports_meta  # here, not at the top: xmas.llms imports this module
 
-    ask: Callable[[list[dict[str, Any]], list[Tool]], _Answer] = (
-        cast("SupportsMeta", llm).get_tool_response_meta
-        if supports_meta(llm)
-        else lambda history, offered: (*llm.get_tool_response(history, offered), None)
-    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": rendered},
@@ -512,10 +490,17 @@ def run_tool_loop(
     succeeded: dict[tuple[str, str], str] = {}
     usage = TokenUsage()
     meta: CallMeta | None = None
+    with_meta = cast("SupportsMeta", llm) if supports_meta(llm) else None
+
+    def ask(offered: list[Tool]) -> tuple[tuple[str, list[ToolCallRequest]], CallMeta | None]:
+        if with_meta is None:
+            return llm.get_tool_response(messages, offered), None
+        text, requests, call_meta = with_meta.get_tool_response_meta(messages, offered)
+        return (text, requests), call_meta
 
     def turn(offered: list[Tool]) -> tuple[str, list[ToolCallRequest]]:
         nonlocal usage, meta
-        text, requests, turn_meta = _metered(meter, lambda: ask(messages, offered))
+        (text, requests), turn_meta = meter.metered(lambda: ask(offered))
         if turn_meta is not None:
             meta = turn_meta if meta is None else meta.combine(turn_meta)
         usage = usage + _turn_usage(count_tokens, messages, text, requests)
