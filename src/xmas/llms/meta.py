@@ -1,11 +1,8 @@
 """What one model call cost, how it ended, and which model served it.
 
-promptolution's generation keeps only the message text and drops everything else
-the provider sent back. This module holds what xmas keeps instead: provider token
-counts, a reported (or priced) cost, the finish reason, a refusal flag and the
-served model name, gathered into a :class:`CallMeta` that the engine copies onto
-the agent's :class:`~xmas.trace.AgentRecord`.
-
+promptolution keeps only a completion's text; a :class:`CallMeta` keeps the
+provider's token counts, the reported (or priced) cost, the finish reason, a
+refusal flag and the served model, for the agent's :class:`~xmas.trace.AgentRecord`.
 A cost that is not known is ``None``, never ``0``: a budget can only bind on a
 number it can trust.
 """
@@ -48,14 +45,7 @@ class TokenPrice:
     cached_input_per_m: float | None = None
 
     def cost_usd(self, tokens: TokenUsage) -> float:
-        """Return the price of one call's tokens.
-
-        Args:
-            tokens: The provider's counts for the call.
-
-        Returns:
-            The cost in USD.
-        """
+        """Return the price in USD of one call's tokens."""
         cached = tokens.cached_tokens or 0
         # cache reads are part of the input (openai's schema); more of them than input
         # means the provider counted them apart, and the whole input is uncached
@@ -98,12 +88,6 @@ class CallMeta:
         side makes the sum unknown, because a partial sum would understate what
         was paid. How the pair ended (finish reason, refusal, served model) is
         ``other``'s, the later call.
-
-        Args:
-            other: The later call.
-
-        Returns:
-            The combined meta.
         """
         tokens = None if self.tokens is None or other.tokens is None else self.tokens + other.tokens
         cost = None if self.cost_usd is None or other.cost_usd is None else self.cost_usd + other.cost_usd
@@ -119,12 +103,8 @@ class CallMeta:
     def record_fields(self) -> dict[str, Any]:
         """Return the :class:`~xmas.trace.AgentRecord` keywords this meta fills.
 
-        ``latency_s`` is not among them: the engine times the whole agent,
-        tool turns and tool calls included, and sets it itself.
-
-        Returns:
-            ``cost_usd``, ``tokens``, ``finish_reason``, ``error_kind`` and
-            ``served_model``.
+        ``latency_s`` is not among them: the engine times the whole agent, tool
+        turns and tool calls included.
         """
         return {
             "cost_usd": self.cost_usd,
@@ -137,49 +117,24 @@ class CallMeta:
 
 @runtime_checkable
 class SupportsMeta(Protocol):
-    """A model that returns call metadata next to its answers."""
+    """A model that returns call metadata next to its answers, when ``full_response`` is ``True``."""
+
+    full_response: bool
 
     def generate_with_meta(self, prompt: str, system_prompt: str = DEFAULT_SYS_PROMPT) -> tuple[str, CallMeta]:
-        """Answer one prompt.
-
-        Args:
-            prompt: The user message.
-            system_prompt: The system message.
-
-        Returns:
-            The answer text and the call's metadata.
-        """
+        """Return the answer to one prompt and the call's metadata."""
         ...
 
     def get_tool_response_meta(
         self, messages: list[dict[str, Any]], tools: Sequence[Tool]
     ) -> tuple[str, list[ToolCallRequest], CallMeta]:
-        """Run one chat turn that may request tools.
-
-        Args:
-            messages: OpenAI-shaped history.
-            tools: Tools on offer. Empty forces a text answer.
-
-        Returns:
-            The message text, the requested calls, and the turn's metadata.
-        """
+        """Return one tool turn's text, requested calls and metadata; no ``tools`` forces a text answer."""
         ...
 
 
 def supports_meta(llm: object) -> bool:
-    """Whether the engine should take ``llm``'s metadata path.
-
-    Having the methods is not enough: the model must also have opted in with
-    ``full_response`` set to ``True``. A subclass that hooks the old call path
-    keeps it, so its own accounting is never bypassed.
-
-    Args:
-        llm: Any model.
-
-    Returns:
-        ``True`` when the model has both meta methods and ``full_response is True``.
-    """
-    return isinstance(llm, SupportsMeta) and getattr(llm, "full_response", False) is True
+    """Whether the engine takes ``llm``'s metadata path: it has the methods and ``full_response`` is ``True``."""
+    return isinstance(llm, SupportsMeta) and llm.full_response is True
 
 
 def meta_from_completion(completion: ChatCompletion, latency_s: float, price: TokenPrice | None) -> CallMeta:
@@ -189,14 +144,6 @@ def meta_from_completion(completion: ChatCompletion, latency_s: float, price: To
     it, a top-level ``cost`` field some proxies add, the tokens priced at
     ``price``. Otherwise it is ``None``. Only non-negative numbers count as a
     reported cost.
-
-    Args:
-        completion: The provider's response.
-        latency_s: Wall seconds the call took.
-        price: The model's price, or ``None``.
-
-    Returns:
-        The call's metadata.
     """
     usage = completion.usage
     tokens = _tokens(usage) if usage is not None else None
