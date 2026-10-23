@@ -1,82 +1,24 @@
 """Version 2 operators in the engine: when, else, while, switch, merges, joins and ``on error``.
 
-The models are scripted doubles. Until the phase 2b check (package B2) accepts
-conditional edges and loops, :func:`system` builds the systems around the
-base's ``check_system`` and supplies the joins the engine compiles; every use is
-marked "B2: real MAS(...)" and switches to the plain constructor at integration.
+The models are scripted doubles.
 """
 
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator, Sequence
-from typing import Any, NamedTuple
-from unittest import mock
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
 
 from xmas import MAS, Agent, Budget, ErrorKind
-from xmas import mas as mas_module
-from xmas.check import SystemInfo, callable_writes, step_maps
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BudgetExceeded
-from xmas.graph import END, build_graph
 from xmas.nodes import Step
 from xmas.tools import tool
-from xmas.values import ValueType, parse_type
 
 from .conftest import MockLLM
 from .test_v2_values import MetaLLM
-
-# ------------------------------------------------------------------- building
-
-
-class Join(NamedTuple):
-    """B2: graph.Join, as ``classify_joins`` gives it."""
-
-    kind: str
-    groups: tuple[tuple[str, ...], ...]
-
-
-def system(
-    agents: list[Agent],
-    edges: Sequence[tuple[str, str] | Edge],
-    *,
-    joins: dict[str, Join] | None = None,
-    boxes: Sequence[Any] = (),
-    **kwargs: Any,
-) -> MAS:
-    """B2: real MAS(...). Build a phase 2b system the base check still refuses.
-
-    The base check is replaced by one that only types the values, and the joins
-    are the ones given; the topology wires start and end on the forward edges
-    (``while`` edges left out), as phase 2b's check does.
-    """
-    declared = [edge if isinstance(edge, Edge) else Edge(*edge) for edge in edges]
-
-    def check(mas: MAS) -> SystemInfo:
-        types: dict[str, ValueType] = dict(mas.inputs)
-        for agent in mas.agents.values():
-            types[agent.output] = parse_type(agent.output_type)
-        for step in mas.steps.values():
-            item, _ = mas.resolve_callable(step)
-            for inner, outer in step_maps(step, item)[1].items():
-                types[outer] = callable_writes(item)[inner]
-        for box in boxes:
-            inner_types = box.system.info.types
-            types.update({outer: inner_types[inner] for inner, outer in box.writes.items()})
-        return SystemInfo(types, {}, dict(joins or {}))  # type: ignore[arg-type]
-
-    names = [agent.name for agent in agents]
-    names += [step.name for step in kwargs.get("steps", ())] + [box.name for box in boxes]
-    graph = build_graph(names, [(e.source, e.target) for e in declared if e.kind is not EdgeKind.WHILE])
-    graph.add_edges_from((e.source, e.target) for e in declared if e.kind is EdgeKind.WHILE)
-    with (
-        mock.patch.object(mas_module, "check_system", check),
-        mock.patch.object(mas_module, "build_graph", lambda *_: graph),
-    ):
-        built = MAS(agents, declared, **kwargs)
-    setattr(built, "boxes", {box.name: box for box in boxes})  # noqa: B010 (B2 adds the attribute)
-    return built
-
 
 # ----------------------------------------------------------------- callables
 
@@ -122,7 +64,7 @@ def worked_example(verdicts: Iterator[str], **kwargs: Any) -> MAS:
         output_type="json",
         schema=VERDICT,
     )
-    return system(  # B2: real MAS(...)
+    return MAS(
         [writer, judge],
         [
             ("writer", "count"),
@@ -131,7 +73,6 @@ def worked_example(verdicts: Iterator[str], **kwargs: Any) -> MAS:
             Edge("judge", "publish", EdgeKind.SWITCH, switch="verdict.action"),
             Edge("judge", "apology", EdgeKind.ELSE),
         ],
-        joins={END: Join("merge", (("apology", "publish"),))},
         steps=[
             Step("count", "count_words"),
             Step("publish", "publish_text", {"text": "draft"}),
@@ -188,13 +129,13 @@ def test_when_else_while_switch() -> None:
     llm = MockLLM(lambda p: "12" if p.startswith("Score") else f"done: {p}")
     scorer = Agent("scorer", "Score {query}", output="score", output_type="json")
     high, low = Agent("high", "High {score}", output="note", inputs=["score"]), Agent("low", "Low", output="note")
-    mas = system(  # B2: real MAS(...)
-        [scorer, high, low],
+    mas = MAS(
+        [scorer, high, low, Agent("other", "Other", output="note")],
         [
             Edge("scorer", "high", EdgeKind.WHEN, when="score > 10"),
             Edge("scorer", "low", EdgeKind.WHEN, when="score > 5"),
+            Edge("scorer", "other", EdgeKind.ELSE),
         ],
-        joins={END: Join("merge", (("high", "low"),))},
         state={"note": {"merge": "last"}},
         llm=llm,
     )
@@ -226,7 +167,7 @@ def test_merges_and_joins() -> None:
         agent("m", "M: {draft}", "note", ["draft"]),
         agent("fin", "Fin: {three} {note}", "final", ["three", "note"]),
     ]
-    mas = system(  # B2: real MAS(...)
+    mas = MAS(
         agents,
         [
             ("s1", "s2"),
@@ -239,8 +180,6 @@ def test_merges_and_joins() -> None:
             Edge("m", "w", EdgeKind.WHILE, when="true", max_visits=3),
             Edge("m", "fin", EdgeKind.ELSE),
         ],
-        # B2: classify_joins gives these
-        joins={"m": Join("merge", (("a", "c"),)), "fin": Join("join", (("s3",), ("m",)))},
         steps=[Step("c", "check")],
         llm=MockLLM(answer),
         tools=[check],
@@ -279,7 +218,7 @@ def test_on_error_routes_by_kind() -> None:
         return f"note on {query}"
 
     joiner = Agent("j", "Join {page} and {extra}", output="answer", inputs=["page", "extra"])
-    mas = system(  # B2: real MAS(...)
+    mas = MAS(
         [joiner],
         [
             ("fetch", "j"),
@@ -287,8 +226,6 @@ def test_on_error_routes_by_kind() -> None:
             ("fb", "j"),
             ("side", "j"),
         ],
-        # B2: classify_joins gives this; fetch's ok route and fb are alternatives
-        joins={"j": Join("join", (("fb", "fetch"), ("side",)))},
         steps=[Step("fetch", "fetch"), Step("fb", "fallback"), Step("side", "side")],
         state={"page": {"merge": "last"}},
         llm=MockLLM(lambda p: p.upper()),
@@ -323,9 +260,7 @@ def test_on_error_routes_by_kind() -> None:
     judge = Agent("judge", "Judge {query}", output="verdict", output_type="json", schema=VERDICT)
     sorry = Agent("sorry", "Sorry about {query}", output="verdict_text")
     llm = MetaLLM(["not json", "still not json", "We are sorry."])
-    mas = system(  # B2: real MAS(...)
-        [judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=llm
-    )
+    mas = MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=llm)
     trace = mas.run("cats")
     assert trace.error is None and trace.output == "We are sorry."
     (failed,) = trace["judge"]
@@ -334,9 +269,12 @@ def test_on_error_routes_by_kind() -> None:
     assert trace.health is not None
     assert [f.signal for f in trace.health.flags] == ["bad_format", "error_routed"]
 
-    # a budget refusal is never routed, not even by `any`; B2: MAS(...) refuses `on error: [budget]`
+    # a budget refusal is never routed, not even by `any`, and no edge may name it
+    for kind in ("budget", "stopped"):
+        with pytest.raises(ValueError, match=kind):
+            MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=(kind,))], llm=llm)
     llm = MetaLLM(["unused"])
-    mas = system(  # B2: real MAS(...)
+    mas = MAS(
         [judge, sorry],
         [Edge("judge", "sorry", EdgeKind.ERROR, errors=("any",))],
         llm=llm,

@@ -16,7 +16,6 @@ import pandas as pd
 import pytest
 
 from xmas import MAS, Agent, Budget, Edge, MASTask, Step
-from xmas.check import SystemInfo, check_system
 from xmas.edges import EdgeKind
 from xmas.graph import END, START, back_edges
 from xmas.optimization.evolution import EvolutionaryTopologyOptimizer
@@ -331,7 +330,7 @@ def _answer(prompt: str) -> str:
 
 
 def _judged(*, branches: bool = False) -> MAS:
-    """Build planner -> writer -> count -> judge, with a step, a json judge and every runtime field set.
+    """Build planner -> writer -> count -> judge, with a step, a frozen json judge and every runtime field set.
 
     With ``branches``, the judge decides between ``publish`` and ``apology``,
     which both feed ``final``.
@@ -369,26 +368,8 @@ def _judged(*, branches: bool = False) -> MAS:
         budget=Budget(max_calls=50),
         inputs={"query": "text"},
         state=state,
+        frozen=("judge",),
     )
-
-
-def _freeze_judge(mas: MAS, monkeypatch: pytest.MonkeyPatch) -> None:
-    """B2: real MAS(..., frozen=("judge",)) in `_judged` instead."""
-    monkeypatch.setattr(mas, "frozen", frozenset({"judge"}), raising=False)
-
-
-def _accept_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """B2: drop; the 2b check_system accepts conditional edges (2a's refuses them)."""
-
-    def check(mas: MAS) -> SystemInfo:
-        declared = mas.edges
-        mas.edges = tuple(Edge(edge.source, edge.target) for edge in declared)
-        try:
-            return check_system(mas)
-        finally:
-            mas.edges = declared
-
-    monkeypatch.setattr("xmas.mas.check_system", check)
 
 
 def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,7 +380,6 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
     # writes the draft) is dropped rather than raised.
     budget = TopologyBudget(min_agents=2, max_agents=7, max_edges=12)
     mas = _judged()
-    _freeze_judge(mas, monkeypatch)
     candidates = updater(seed=2, budget=budget).propose(mas, {}, n=6)
 
     assert candidates
@@ -413,9 +393,7 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
         assert candidate.run("cats").error is None
 
     # Conditional edges and their endpoints stay exactly as they were, in order.
-    _accept_conditions(monkeypatch)
     branched = _judged(branches=True)
-    _freeze_judge(branched, monkeypatch)
     conditions = [edge for edge in branched.edges if edge.kind is not EdgeKind.PLAIN]
     proposer = updater(seed=4, budget=budget)
     candidates = proposer.propose(branched, {}, n=6) + proposer.recombine(branched, branched, n=2)
@@ -432,6 +410,6 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
     prompts = PromptUpdater(object, None)  # type: ignore[arg-type]
     assert prompts.target_agent(mas, {}) == "planner"
     assert prompts.target_agent(mas, {"judge": [-1.0], "writer": [0.5], "planner": [0.2]}) == "planner"
-    monkeypatch.setattr(mas, "frozen", frozenset(mas.agents), raising=False)
+    monkeypatch.setattr(mas, "frozen", frozenset(mas.agents))
     with pytest.raises(ValueError, match="frozen"):
         prompts.target_agent(mas, {})

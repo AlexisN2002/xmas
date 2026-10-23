@@ -1,35 +1,19 @@
 """Version 2 boxes in the engine: a whole inner system runs as one node, on the outer run's meter.
 
-The models are scripted doubles. Systems with a box are built with
-:func:`tests.test_v2_operators.system` until package B2 ships ``Box`` and
-``MAS(boxes=...)``; every such use is marked "B2: real MAS(...)".
+The models are scripted doubles.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
-from xmas import MAS, Agent, Budget, ErrorKind, TokenUsage
+from xmas import MAS, Agent, Box, Budget, ErrorKind, TokenUsage
 from xmas.edges import Edge, EdgeKind
-from xmas.graph import END
 from xmas.llms.meta import CallMeta
 
-from .test_v2_operators import Join, system
 from .test_v2_values import MetaLLM
-
-
-@dataclass(frozen=True)
-class Box:
-    """B2: nodes.Box."""
-
-    name: str
-    system: MAS
-    reads: Mapping[str, str]
-    writes: Mapping[str, str]
 
 
 class FlakyLLM(MetaLLM):
@@ -49,7 +33,7 @@ def build(answers: list[str], **kwargs: Any) -> tuple[MAS, Box]:
     cutter = Agent("cutter", "Cut this to half its length: {page}", output="short", inputs=["page"])
     inner = MAS([cutter], inputs={"page": "text"}, llm=llm)
     box = Box("shorten", inner, reads={"page": "draft"}, writes={"short": "draft"})
-    outer = system(  # B2: real MAS(...)
+    outer = MAS(
         [
             Agent("writer", "Write about {query}", output="draft"),
             Agent("poster", "Post {draft}", output="post", inputs=["draft"]),
@@ -60,7 +44,6 @@ def build(answers: list[str], **kwargs: Any) -> tuple[MAS, Box]:
             ("shorten", "poster"),
             Edge("shorten", "apology", EdgeKind.ERROR, errors=("timeout",)),
         ],
-        joins={END: Join("merge", (("apology", "poster"),))},
         boxes=[box],
         state={"draft": {"merge": "last"}, "post": {"merge": "last"}},
         llm=llm,
@@ -99,12 +82,11 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
 
     # a box inside a box: the path names both
     again, _ = build(["A long draft about cats.", "Cats.", "Posted.", "Echoed."])
-    wrapper = system(  # B2: real MAS(...)
+    wrapper = MAS(
         [Agent("echo", "Echo {post}", output="echoed", inputs=["post"])],
         [("all", "echo")],
         boxes=[Box("all", again, reads={"query": "query"}, writes={"post": "post"})],
         llm=again.llm,
-        version=2,
     )
     nested = wrapper.run("cats")
     assert nested.error is None and nested.output == "Echoed."

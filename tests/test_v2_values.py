@@ -265,7 +265,9 @@ def test_answer_form_retries_once_then_bad_format(case: str) -> None:
         assert error.node == "judge"
         assert error.problems == (PROSE, "fits: Input should be a valid boolean, unable to interpret input")
         assert error.meta is not None and error.meta.cost_usd == pytest.approx(0.02)
-        assert meter.calls == 2 and meter.cost_usd == pytest.approx(0.02) and meter.records == []
+        assert meter.calls == 2 and meter.cost_usd == pytest.approx(0.02)
+        assert [(r.agent, r.error_kind) for r in meter.records] == [("judge", ErrorKind.BAD_FORMAT)]
+        assert meter.records[0].cost_usd == pytest.approx(0.02)
         trace = judge_mas(MetaLLM(["Sure.", "Sure."])).run("this")
         assert trace.error_kind == ErrorKind.BAD_FORMAT
         assert trace.error is not None and "after the retry" in trace.error
