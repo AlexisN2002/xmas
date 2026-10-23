@@ -282,9 +282,9 @@ class Join:
         groups: The sources of the incoming edges, grouped; the edges of one
             group are alternatives. A merge has one group.
         relays: For a join, one entry per group: ``None`` when the group is one
-            edge taken on every pass of its source, so the barrier waits for
-            that source, else the name of the no-op relay node
-            (``__in__:<node>:<k>``) the group's edges enter and the barrier
+            plain edge from a node without error edges, so the barrier waits
+            for that node, else the name of the no-op relay node
+            (``__in__.<node>.<k>``) the group's edges enter and the barrier
             waits for. Empty for a merge.
     """
 
@@ -434,9 +434,12 @@ class RouteGraph:
             if problem:
                 refusals[name] = problem
                 continue
+            # One plain edge from a node is waited on at the node; a route (a
+            # decision's, or the success route of a node with error edges), the
+            # start or several alternatives get a relay.
             relays = tuple(
-                None if len(group) == 1 and _every_pass(group[0]) else f"__in__:{name}:{index}"
-                for index, group in enumerate(groups)
+                None if len(group) == 1 and group[0] != START and isinstance(group[0], str) else f"__in__.{name}.{k}"
+                for k, group in enumerate(groups)
             )
             joins[name] = Join("join", named, relays)
         return joins, refusals

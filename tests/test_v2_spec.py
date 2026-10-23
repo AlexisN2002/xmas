@@ -539,8 +539,8 @@ def test_join_shapes_classify_as_quoted(shape: str) -> None:
     relays = {name: join.relays for name, join in joins.items() if join.kind == "join"}
     assert relays == {
         "3 parallel diamond": {"j": (None, None)},
-        "4 on-error fallback into a join": {"j": ("__in__:j:0", None)},  # p1's ok route or fb
-        "6 loop exit joins a parallel chain": {"fin": ("__in__:fin:0", None)},  # m's else route
+        "4 on-error fallback into a join": {"j": ("__in__.j.0", None)},  # p1's ok route or fb
+        "6 loop exit joins a parallel chain": {"fin": ("__in__.fin.0", None)},  # m's else route
         "7 parallel join with an inner diamond": {"j": (None, None)},
     }.get(shape, {})
 

@@ -39,10 +39,10 @@ from xmas.budget import RunMeter
 from xmas.check import step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
 from xmas.errors import BadFormat, EmptyResponse, ErrorKind, classify
-from xmas.graph import END, START, back_edges, join_nodes, terminal_agent
+from xmas.graph import END, Join, back_edges, join_nodes, terminal_agent
 from xmas.health import Health, summarize
 from xmas.llms.meta import SupportsMeta, supports_meta
-from xmas.nodes import Step
+from xmas.nodes import Box, Step
 from xmas.predicates import Context, Predicate, parse_predicate
 from xmas.prompts import safe_format
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
@@ -536,7 +536,7 @@ def _raw(outputs: dict[str, str], writes: dict[str, Any]) -> str:
     return next(iter(outputs.values())) if len(outputs) == 1 else render_value(writes, JSON)
 
 
-def _box_body(box: Any, types: dict[str, ValueType]) -> _NodeBody:
+def _box_body(box: Box, types: dict[str, ValueType]) -> _NodeBody:
     """Build what a box does in one visit: run its inner system from the mapped values.
 
     The inner system runs on the outer run's meter, which adopts it, so its
@@ -544,8 +544,7 @@ def _box_body(box: Any, types: dict[str, ValueType]) -> _NodeBody:
     the box's own error edges route by the inner error's kind.
 
     Args:
-        box: The box, with ``name``, ``system``, ``reads`` ({inner input: outer
-            value}) and ``writes`` ({inner value: outer value}).
+        box: The box.
         types: The type of every outer value.
 
     Returns:
@@ -712,47 +711,35 @@ def _relay(state: MASState) -> dict[str, Any]:  # noqa: ARG001 (a node's signatu
 
 
 def _add_joins(
-    builder: StateGraph[MASState, Any, MASState, MASState],
-    joins: Mapping[str, Any],
-    decisions: Mapping[str, _Decision],
-    out: Mapping[str, list[Edge]],
+    builder: StateGraph[MASState, Any, MASState, MASState], joins: Mapping[str, Join]
 ) -> tuple[set[tuple[str, str]], dict[tuple[str, str], str]]:
     """Add one barrier per join: it waits for each of the join's groups once per pass.
 
-    A group that is one plain edge from a real node without error edges waits
-    on that node itself. Any other group (several alternatives, a conditional
-    edge, the start, or the success route of a node with error edges) gets a
-    relay node ``__in__.<join>.<k>`` its sources route to (LangGraph reserves
-    ``:`` in node names). A merge needs nothing: its edges stay plain, and it
-    runs on whichever arrives.
+    A group without a relay (one plain edge from a node without error edges)
+    is waited on at its node. Any other group gets the no-op relay node
+    :func:`~xmas.graph.classify_joins` named (``__in__.<join>.<k>``: LangGraph
+    reserves ``:`` in node names) that its sources route to. A merge needs
+    nothing: its edges stay plain, and it runs on whichever arrives.
 
     Args:
         builder: The graph being built.
-        joins: ``mas.info.joins``: a ``Join`` (``kind``, ``groups``) per node,
-            or the predecessors of a phase 2a barrier, each a group of one.
-        decisions: The nodes with a decision.
-        out: Each node's out-edges.
+        joins: ``mas.info.joins``.
 
     Returns:
         The (source, join) pairs the barrier waits on directly, and the relay
         each other (source, join) pair goes to.
     """
-    kinds = {(edge.source, edge.target): edge.kind for edges in out.values() for edge in edges}
     direct: set[tuple[str, str]] = set()
     relays: dict[tuple[str, str], str] = {}
     for node, join in joins.items():
-        if getattr(join, "kind", "join") != "join":
+        if join.kind != "join":
             continue
-        groups = getattr(join, "groups", None) or tuple((source,) for source in join)
         starts = []
-        for index, group in enumerate(groups):
-            source = group[0]
-            plain = len(group) == 1 and source != START and kinds.get((source, node)) is EdgeKind.PLAIN
-            if plain and (source not in decisions or not decisions[source].errors):
-                direct.add((source, node))
-                starts.append(source)
+        for group, relay in zip(join.groups, join.relays, strict=True):
+            if relay is None:
+                direct.add((group[0], node))
+                starts.append(group[0])
                 continue
-            relay = f"__in__.{node}.{index}"
             builder.add_node(relay, _relay)
             relays.update(((member, node), relay) for member in group)
             starts.append(relay)
@@ -795,12 +782,12 @@ def _compile_v2(mas: MAS) -> CompiledGraph:
         bodies[agent.name] = _agent_body(mas, agent, llm, counters[id(llm)], types)
     for step in mas.steps.values():
         bodies[step.name] = _step_body(mas, step, types)
-    for box in getattr(mas, "boxes", {}).values():
+    for box in mas.boxes.values():
         bodies[box.name] = _box_body(box, types)
     for name, body in bodies.items():
         builder.add_node(name, _wrap(mas, name, body, decisions.get(name)))  # type: ignore[arg-type]
 
-    direct, relays = _add_joins(builder, info.joins, decisions, out)
+    direct, relays = _add_joins(builder, info.joins)
     for source, edges in out.items():
         targets = {
             edge.target: relays.get((source, edge.target), edge.target)
@@ -919,7 +906,7 @@ def compile_mas(mas: MAS) -> CompiledGraph:
 def _health(mas: MAS, records: tuple[AgentRecord, ...], meter: RunMeter | None) -> Health:
     """Summarize a run's health with the system's settings and its ``while`` edges."""
     loops = [(edge.source, edge.target) for edge in mas.edges if edge.kind is EdgeKind.WHILE]
-    return summarize(records, meter=meter, settings=getattr(mas, "health", None), while_edges=loops)
+    return summarize(records, meter=meter, settings=mas.health, while_edges=loops)
 
 
 def _to_trace(mas: MAS, query: str, result: dict[str, Any], meter: RunMeter | None = None) -> Trace:
