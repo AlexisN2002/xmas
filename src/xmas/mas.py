@@ -256,10 +256,10 @@ class MAS(BasePredictor):
         self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
         self.graph = self.info.graph
 
-    def _checked(self) -> SystemInfo:
-        """Return what the check learned, which only a version 2 system has."""
+    def _checked(self, refusal: str = "A version 1 system is not checked.") -> SystemInfo:
+        """Return what the check learned, which only a version 2 system has; ``refusal`` is the ValueError's text."""
         if self.info is None:
-            raise ValueError("A version 1 system has no check_system result.")
+            raise ValueError(refusal)
         return self.info
 
     def _callables(self) -> ToolIndex:

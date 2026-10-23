@@ -90,14 +90,13 @@ class Box:
         if not self.name:
             raise ValueError("A box needs a name.")
         where = f"Box {self.name!r}"
-        if self.system.info is None:
-            raise ValueError(f"{where}: the system in a box must be version 2.")
+        info = self.system._checked(f"{where}: the system in a box must be version 2.")
         reads = _names_map(where, "reads", self.reads)
         writes = _names_map(where, "writes", self.writes)
         inputs = sorted(self.system.inputs)
         if sorted(reads) != inputs:
             raise ValueError(f"{where}: reads must map exactly the inner inputs {inputs}, got {sorted(reads)}.")
-        written = sorted(self.system.info.writers)
+        written = sorted(info.writers)
         if not writes or not set(writes) <= set(written):
             raise ValueError(f"{where}: writes must map inner writes, some of {written}, got {sorted(writes)}.")
         object.__setattr__(self, "reads", reads)
