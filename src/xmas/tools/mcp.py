@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -143,7 +143,15 @@ class MCPTools:
     because a tool call need not be idempotent.
     """
 
-    def __init__(self, url: str, key: str | None = None, *, timeout_s: float = 900.0, max_concurrent: int = 4) -> None:
+    def __init__(
+        self,
+        url: str,
+        key: str | None = None,
+        *,
+        timeout_s: float = 900.0,
+        max_concurrent: int = 4,
+        writes: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> None:
         """Initialize the source. Nothing connects until the first use.
 
         Args:
@@ -154,6 +162,8 @@ class MCPTools:
             max_concurrent: Calls in flight at once. Matches the server's per-key
                 default, so a batched run queues here instead of collecting
                 ``too_many_concurrent`` refusals.
+            writes: What a tool writes when it runs as a step, by tool name, as
+                ``{tool: {write: type}}``; a tool not listed writes ``{tool: text}``.
 
         Raises:
             ValueError: If no key is given or set in the environment.
@@ -166,6 +176,7 @@ class MCPTools:
         self.url = url
         self.timeout_s = timeout_s
         self.max_concurrent = max_concurrent
+        self.writes = {name: dict(item) for name, item in (writes or {}).items()}
         self._key = key
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -327,7 +338,7 @@ class MCPTools:
                     logger.warning("MCPTools: skipping tool %r, whose name OpenAI would refuse", item.name)
                     continue
                 schema = dict(item.input_schema or {"type": "object", "properties": {}})
-                found.append(Tool(item.name, item.description or "", schema))
+                found.append(Tool(item.name, item.description or "", schema, writes=self.writes.get(item.name)))
             cursor = page.next_cursor
             if not cursor:
                 return found

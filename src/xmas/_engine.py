@@ -9,6 +9,12 @@ Each run gets its own :class:`~xmas.budget.RunMeter`, handed to the nodes in the
 run config under :data:`_RUN_KEY`. Nodes read it back to check the budget before
 each call and to keep every finished agent's record, so a failed run still
 returns what it did.
+
+A version 2 system (``mas.version == 2``) compiles by its own rules, and every
+version 1 path stays as it was: values are typed (text or json) and render by
+:func:`~xmas.values.render_value`; steps run callables; a json agent answers in
+its answer form, with one retry; and a node fed by several edges is a barrier
+join that runs once, after all of them, where version 1 defers.
 """
 
 from __future__ import annotations
@@ -22,22 +28,28 @@ from typing import TYPE_CHECKING, Annotated, Any, Protocol, TypedDict, cast
 from langgraph.config import get_config
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph
+from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from promptolution.utils.token_counter import get_token_counter
 
 from xmas import tools as _tools
 from xmas.agent import Agent
 from xmas.budget import RunMeter
-from xmas.errors import EmptyResponse, ErrorKind, classify
+from xmas.errors import BadFormat, EmptyResponse, ErrorKind, classify
 from xmas.graph import END, back_edges, join_nodes, terminal_agent
 from xmas.llms.meta import SupportsMeta, supports_meta
 from xmas.prompts import safe_format
-from xmas.trace import AgentRecord, TokenUsage, Trace
+from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
+from xmas.trace import AgentRecord, Rejected, TokenUsage, ToolCall, Trace
+from xmas.values import JSON, TEXT, ValueType, parse_type, render_value
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Iterable
+
     from promptolution.llms.base_llm import BaseLLM
 
     from xmas.llms.meta import CallMeta
     from xmas.mas import MAS
+    from xmas.nodes import Step
 
 
 CONTINUE_MARKER = "<continue>"
@@ -78,8 +90,8 @@ def _merge_counts(current: dict[str, int], incoming: dict[str, int]) -> dict[str
     return merged
 
 
-def _merge_values(current: dict[str, str], incoming: dict[str, str]) -> dict[str, str]:
-    """Merge one agent's outputs into the shared value map.
+def _merge_values(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Merge one node's writes into the shared value map.
 
     Agents writing concurrently each contribute their own key, so a plain merge
     is well defined. Keeping every variable in one reduced channel, rather than
@@ -100,7 +112,9 @@ class MASState(TypedDict, total=False):
     """The state a run threads through the graph.
 
     Attributes:
-        values: Every state variable, including ``query``, keyed by name.
+        values: Every state variable, including ``query``, keyed by name: a
+            ``str`` for text, plain JSON data for json (version 2). Version 1
+            writes only ``str``.
         prompts: The prompt set for this run, keyed by agent name. Prompts travel
             in the state rather than being baked into the compiled graph, so one
             compilation serves every candidate an optimizer proposes.
@@ -108,7 +122,7 @@ class MASState(TypedDict, total=False):
         visits: How often each agent has run, which is what bounds a retry loop.
     """
 
-    values: Annotated[dict[str, str], _merge_values]
+    values: Annotated[dict[str, Any], _merge_values]
     prompts: dict[str, str]
     records: Annotated[list[AgentRecord], operator.add]
     visits: Annotated[dict[str, int], _merge_counts]
@@ -134,7 +148,10 @@ class CompiledGraph(Protocol):
 
 
 _Body = Callable[[MASState, RunMeter | None], AgentRecord]
-"""What an agent does in one visit: read the state, call its model, return its record."""
+"""What a version 1 agent does in one visit: read the state, call its model, return its record."""
+
+_NodeBody = Callable[[MASState, RunMeter | None], tuple[AgentRecord, dict[str, Any]]]
+"""What a node does in one visit: its record, and the values it writes."""
 
 
 def _current_meter(mas: MAS) -> RunMeter | None:
@@ -176,6 +193,27 @@ def _generate(llm: BaseLLM, rendered: str) -> tuple[str, CallMeta | None]:
     return llm.get_response([rendered])[0], None
 
 
+def _call(llm: BaseLLM, rendered: str, meter: RunMeter | None) -> tuple[str, CallMeta | None]:
+    """Make one metered model call: check the budget, call, count what it cost.
+
+    Raises:
+        BudgetExceeded: If the meter refuses the call.
+        EmptyResponse: If the answer was empty; the meter counts its paid
+            attempts first.
+    """
+    if meter is not None:
+        meter.before_call()
+    try:
+        response, meta = _generate(llm, rendered)
+    except EmptyResponse as error:  # its attempts were paid: the meter counts them, then the run fails
+        if meter is not None:
+            meter.after_call(error.meta)
+        raise
+    if meter is not None:
+        meter.after_call(meta)
+    return response, meta
+
+
 def _plain_body(agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float]) -> _Body:
     """Build what a plain agent does in one visit: render, check the budget, call, record.
 
@@ -195,16 +233,7 @@ def _plain_body(agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float]
         values = state.get("values") or {}
         inputs = {name: str(values.get(name) or "") for name in agent.inputs}
         rendered = safe_format(template, inputs)
-        if meter is not None:
-            meter.before_call()
-        try:
-            response, meta = _generate(llm, rendered)
-        except EmptyResponse as error:  # its attempts were paid: the meter counts them, then the run fails
-            if meter is not None:
-                meter.after_call(error.meta)
-            raise
-        if meter is not None:
-            meter.after_call(meta)
+        response, meta = _call(llm, rendered, meter)
 
         return AgentRecord(
             agent=agent.name,
@@ -225,19 +254,19 @@ def _plain_body(agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float]
     return body
 
 
-def _wrap(mas: MAS, agent: Agent, body: _Body) -> Callable[[MASState], dict[str, Any]]:
-    """Turn an agent's body into the node LangGraph runs.
+def _wrap(mas: MAS, name: str, body: _NodeBody) -> Callable[[MASState], dict[str, Any]]:
+    """Turn a node's body into the node LangGraph runs.
 
     The node times the body, sets ``latency_s`` on its record, keeps the record
-    on the run's meter, and writes the agent's output into the state.
+    on the run's meter, and writes the body's values into the state.
 
     Args:
         mas: The system, whose run meter the node reads.
-        agent: The agent.
-        body: What the agent does in one visit.
+        name: The node's name.
+        body: What the node does in one visit.
 
     Returns:
-        A function mapping the incoming state to this agent's state updates.
+        A function mapping the incoming state to this node's state updates.
     """
 
     def node(state: MASState) -> dict[str, Any]:
@@ -245,11 +274,11 @@ def _wrap(mas: MAS, agent: Agent, body: _Body) -> Callable[[MASState], dict[str,
         if meter is not None:
             meter.start()  # the run's wall clock starts with its first agent, not with the batch
         started = time.perf_counter()
-        record = body(state, meter)
+        record, writes = body(state, meter)
         record = dataclasses.replace(record, latency_s=time.perf_counter() - started)
         if meter is not None:
             meter.keep(record)
-        return {"values": {agent.output: record.raw_response}, "records": [record], "visits": {agent.name: 1}}
+        return {"values": writes, "records": [record], "visits": {name: 1}}
 
     return node
 
@@ -268,7 +297,272 @@ def _make_node(mas: MAS, agent: Agent, count_tokens: Callable[[str], float]) -> 
     llm: BaseLLM = mas.resolve_llm(agent)
     # an agent with tools runs the tool loop; every other agent makes one call
     body = _tools.tool_body(mas, agent, llm, count_tokens) if agent.tools else _plain_body(agent, llm, count_tokens)
-    return _wrap(mas, agent, body)
+
+    def visit(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
+        record = body(state, meter)
+        return record, {agent.output: record.raw_response}
+
+    return _wrap(mas, agent.name, visit)
+
+
+# ------------------------------------------------------------------ version 2
+
+
+def _is_v2(mas: MAS) -> bool:
+    """Whether ``mas`` is a version 2 system."""
+    return getattr(mas, "version", 1) == 2
+
+
+def _steps(mas: MAS) -> Iterable[Step]:
+    """Return the system's steps, held as a sequence or by name."""
+    steps = getattr(mas, "steps", ())
+    return steps.values() if isinstance(steps, dict) else steps
+
+
+def _types(mas: MAS) -> dict[str, ValueType]:
+    """Return the type of every value, from ``mas.info.types``, words read as types."""
+    types = getattr(getattr(mas, "info", None), "types", None) or {}
+    return {name: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for name, vtype in types.items()}
+
+
+def _usage(count_tokens: Callable[[str], float], sent: str, received: str) -> TokenUsage:
+    """Estimate one call's usage."""
+    return TokenUsage(input_tokens=int(count_tokens(sent)), output_tokens=int(count_tokens(received)))
+
+
+def _combine(first: CallMeta | None, second: CallMeta | None) -> CallMeta | None:
+    """Combine two calls' metadata; a model that gives none gives none for either."""
+    return second if first is None else first if second is None else first.combine(second)
+
+
+def _answer_plain(
+    node: str,
+    llm: BaseLLM,
+    rendered: str,
+    form: AnswerForm,
+    count_tokens: Callable[[str], float],
+    meter: RunMeter | None,
+) -> tuple[str, Any, tuple[Rejected, ...], TokenUsage, CallMeta | None]:
+    """Ask for an answer in its form, once more with :data:`~xmas.schemas.RETRY_NOTE` if it does not fit.
+
+    Returns:
+        The accepted text, its value, the rejected answer (if any), and usage
+        and metadata summed over both calls.
+
+    Raises:
+        BadFormat: If the retry does not fit either; it carries both problems
+            and both calls' metadata. The meter has counted both calls.
+    """
+    response, meta = _call(llm, rendered, meter)
+    usage = _usage(count_tokens, rendered, response)
+    try:
+        return response, form.parse(response), (), usage, meta
+    except FormError as first:
+        retry = f"{rendered}\n\n{RETRY_NOTE.format(problem=first.problem)}"
+        again, again_meta = _call(llm, retry, meter)
+        usage, meta = usage + _usage(count_tokens, retry, again), _combine(meta, again_meta)
+        try:
+            value = form.parse(again)
+        except FormError as second:
+            raise BadFormat(node, (first.problem, second.problem), meta) from second
+        return again, value, (Rejected(response, first.problem),), usage, meta
+
+
+def _agent_body(
+    mas: MAS, agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float], types: dict[str, ValueType]
+) -> _NodeBody:
+    """Build what a version 2 agent does in one visit.
+
+    Inputs render by their types. A json agent's prompt ends with its form's
+    format block, and its answer is parsed into the value it writes: a plain
+    agent retries in a second call (:func:`_answer_plain`), an agent with tools
+    in one more turn of its conversation, tools withheld.
+
+    Args:
+        mas: The system, which resolves the agent's tools.
+        agent: The agent.
+        llm: Its model.
+        count_tokens: Token counter for the model.
+        types: The type of every value.
+
+    Returns:
+        The agent's body, for :func:`_wrap`.
+    """
+    form = compile_form(agent.schema) if parse_type(agent.output_type) == JSON else None
+    tools = mas.resolve_tools(agent) if agent.tools else None
+    if tools is not None and not isinstance(llm, _tools.SupportsToolCalls):  # resolve_tools checked it; this narrows
+        raise ValueError(f"Agent {agent.name!r} uses tools, but its model cannot call them.")
+
+    def body(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
+        template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
+        values = state.get("values") or {}
+        inputs = {name: render_value(values.get(name), types.get(name, TEXT)) for name in agent.inputs}
+        rendered = safe_format(template, inputs)
+        if form is not None:
+            rendered = f"{rendered}\n\n{form.format_block()}"
+
+        calls: tuple[ToolCall, ...] = ()
+        rejected: tuple[Rejected, ...] = ()
+        if tools is not None:
+            refused: list[Rejected] = []
+
+            def check(text: str) -> str | None:
+                try:
+                    cast("AnswerForm", form).parse(text)
+                except FormError as error:
+                    refused.append(Rejected(text, error.problem))
+                    return error.problem
+                return None
+
+            response, calls, usage, meta = _tools.run_tool_loop(
+                cast("_tools.SupportsToolCalls", llm),
+                rendered,
+                tools,
+                mas.max_tool_rounds,
+                DEFAULT_SYS_PROMPT,
+                count_tokens,
+                meter=meter,
+                check=None if form is None else check,
+            )
+            value: Any = response
+            rejected = tuple(refused)
+            if form is not None:
+                try:
+                    value = form.parse(response)
+                except FormError as error:
+                    raise BadFormat(agent.name, (*(r.error for r in refused), error.problem), meta) from error
+        elif form is not None:
+            response, value, rejected, usage, meta = _answer_plain(agent.name, llm, rendered, form, count_tokens, meter)
+        else:
+            response, meta = _call(llm, rendered, meter)
+            value, usage = response, _usage(count_tokens, rendered, response)
+
+        record = AgentRecord(
+            agent=agent.name,
+            step=-1,
+            prompt=template,
+            rendered_prompt=rendered,
+            inputs=inputs,
+            outputs={agent.output: render_value(value, TEXT if form is None else JSON)},
+            tool_calls=calls,
+            usage=usage,
+            model=agent.model,
+            raw_response=response,
+            rejected=rejected,
+            **(meta.record_fields() if meta is not None else {}),
+        )
+        return record, {agent.output: value}
+
+    return body
+
+
+def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
+    """Build what a step does in one visit: read its parameters, run its callable, write.
+
+    The meter's wall and cost limits are checked first; a step makes no model
+    call, so it counts none. A parameter whose value is not in the state is
+    left out and takes its default.
+
+    Args:
+        mas: The system, whose registry resolves the step's callable.
+        step: The step.
+        types: The type of every value, for the record's inputs.
+
+    Returns:
+        The step's body, for :func:`_wrap`.
+    """
+    spec, source = cast("Any", mas).resolve_callable(step)
+    write_types: dict[str, ValueType] = spec.writes
+
+    def body(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
+        if meter is not None:
+            meter.check_boundary()
+        values = state.get("values") or {}
+        arguments: dict[str, Any] = {}
+        inputs: dict[str, str] = {}
+        for parameter in spec.reads:
+            name = step.reads.get(parameter, parameter)
+            inputs[name] = render_value(values.get(name), types.get(name, TEXT))
+            if name in values:
+                arguments[parameter] = values[name]
+        try:
+            produced = _tools.run_step(spec, source, arguments)
+        except BadFormat as error:
+            raise BadFormat(step.name, error.problems, error.meta) from error
+        writes = {step.writes.get(write, write): value for write, value in produced.items()}
+        outputs = {
+            step.writes.get(write, write): render_value(value, write_types[write]) for write, value in produced.items()
+        }
+        record = AgentRecord(
+            agent=step.name,
+            step=-1,
+            prompt="",
+            rendered_prompt="",
+            inputs=inputs,
+            outputs=outputs,
+            raw_response=next(iter(outputs.values())) if len(outputs) == 1 else render_value(writes, JSON),
+            kind="step",
+        )
+        return record, writes
+
+    return body
+
+
+def _compile_v2(mas: MAS) -> CompiledGraph:
+    """Compile a version 2 system: agents and steps, and a barrier join wherever several edges arrive.
+
+    A barrier (``add_edge([...], node)``) runs its node once, after every
+    source has run; nothing is deferred. Phase 2a has no conditional edges, so
+    every edge in ``mas.graph`` is plain and every node fed by several is a join.
+    """
+    builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(MASState)
+    types = _types(mas)
+    counters: dict[int, Callable[[str], float]] = {}
+    for agent in mas.agents.values():
+        llm = mas.resolve_llm(agent)
+        if id(llm) not in counters:
+            counters[id(llm)] = get_token_counter(llm)
+        body = _agent_body(mas, agent, llm, counters[id(llm)], types)
+        builder.add_node(agent.name, _wrap(mas, agent.name, body))  # type: ignore[call-overload]
+    for step in _steps(mas):
+        builder.add_node(step.name, _wrap(mas, step.name, _step_body(mas, step, types)))  # type: ignore[call-overload]
+
+    for target in mas.graph.nodes:
+        sources = sorted(mas.graph.predecessors(target))
+        if len(sources) > 1:
+            builder.add_edge(sources, target)
+        elif sources:
+            builder.add_edge(sources[0], target)
+    return builder.compile()
+
+
+def _v2_output(mas: MAS, records: list[AgentRecord]) -> str:
+    """Return the rendered write of the terminal node that ran last, or ``""`` if none ran.
+
+    A terminal with several writes gives them as one JSON object.
+    """
+    terminals = set(mas.graph.predecessors(END))
+    ran = [record for record in records if record.agent in terminals]
+    if not ran:
+        return ""
+    outputs = ran[-1].outputs
+    return next(iter(outputs.values())) if len(outputs) == 1 else ran[-1].raw_response
+
+
+def _check_query_input(mas: MAS) -> None:
+    """Refuse to run a version 2 system on a query when its inputs are not exactly ``{query: text}``.
+
+    Raises:
+        ValueError: If they are not.
+    """
+    if not _is_v2(mas):
+        return
+    inputs = {name: str(vtype) for name, vtype in (getattr(mas, "inputs", None) or {"query": TEXT}).items()}
+    if inputs != {"query": str(TEXT)}:
+        raise ValueError(
+            f"This system's inputs are {inputs}, not {{'query': 'text'}}, so it does not run on a query: "
+            "it runs as a box, or with run_state in phase 3."
+        )
 
 
 def _make_router(
@@ -319,9 +613,13 @@ def compile_mas(mas: MAS) -> CompiledGraph:
     Args:
         mas: The system to compile.
 
+    A version 2 system compiles by :func:`_compile_v2` instead.
+
     Returns:
         The compiled graph.
     """
+    if _is_v2(mas):
+        return _compile_v2(mas)
     builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(MASState)
     joins = join_nodes(mas.graph)
     back = back_edges(mas.graph)
@@ -355,11 +653,16 @@ def compile_mas(mas: MAS) -> CompiledGraph:
     return builder.compile()
 
 
-def _to_trace(mas: MAS, query: str, result: dict[str, Any]) -> Trace:
-    """Assemble a trace from a finished run's state."""
+def _to_trace(mas: MAS, query: str, result: dict[str, Any], meter: RunMeter | None = None) -> Trace:  # noqa: ARG001 (meter: for phase 2b's health)
+    """Assemble a trace from a finished run's state.
+
+    A version 2 trace's output is the rendered write of the terminal that ran.
+    """
     records: list[AgentRecord] = list(result.get("records") or [])
     numbered = tuple(dataclasses.replace(record, step=index) for index, record in enumerate(records))
-    values: dict[str, str] = result.get("values") or {}
+    if _is_v2(mas):
+        return Trace(query=query, output=_v2_output(mas, records), records=numbered)
+    values: dict[str, Any] = result.get("values") or {}
     output_var = mas.agents[terminal_agent(mas.graph)].output
     return Trace(query=query, output=str(values.get(output_var) or ""), records=numbered)
 
@@ -421,13 +724,17 @@ def run_one(mas: MAS, query: str, prompts: dict[str, str]) -> Trace:
         ``Trace.error_kind`` rather than raised, so one bad rollout does not lose
         a whole batch, and the trace keeps the records of the agents that
         finished.
+
+    Raises:
+        ValueError: If a version 2 system's inputs are not exactly ``{query: text}``.
     """
+    _check_query_input(mas)
     meter = RunMeter(mas.budget, owner=mas)
     try:
         result: dict[str, Any] = mas.compiled.invoke(_initial_state(query, prompts), config=_run_config(mas, meter))
     except Exception as error:  # a failed rollout is data, not a crash
         return _failed_trace(mas, query, error, meter)
-    return _to_trace(mas, query, result)
+    return _to_trace(mas, query, result, meter)
 
 
 def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> list[Trace]:
@@ -443,7 +750,11 @@ def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> lis
 
     Returns:
         One trace per input, in the order given.
+
+    Raises:
+        ValueError: If a version 2 system's inputs are not exactly ``{query: text}``.
     """
+    _check_query_input(mas)
     if not queries:
         return []
 
@@ -452,6 +763,8 @@ def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> lis
     configs = [_run_config(mas, meter) for meter in meters]
     results: list[Any] = mas.compiled.batch(states, config=configs, return_exceptions=True)
     return [
-        _failed_trace(mas, query, result, meter) if isinstance(result, BaseException) else _to_trace(mas, query, result)
+        _failed_trace(mas, query, result, meter)
+        if isinstance(result, BaseException)
+        else _to_trace(mas, query, result, meter)
         for query, result, meter in zip(queries, results, meters, strict=True)
     ]
