@@ -37,7 +37,7 @@ from xmas.agent import Agent
 from xmas.budget import RunMeter, VisitMeter
 from xmas.check import step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
-from xmas.errors import BadFormat, EmptyResponse, ErrorKind, classify
+from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, classify
 from xmas.graph import END, Join, back_edges, join_nodes, terminal_agent
 from xmas.health import Health, summarize
 from xmas.llms.meta import SupportsMeta, supports_meta
@@ -128,31 +128,18 @@ class CompiledGraph(Protocol):
         ...
 
 
-_NodeBody = Callable[[MASState, VisitMeter | None], tuple[AgentRecord, dict[str, Any]]]
+_NodeBody = Callable[[MASState, VisitMeter], tuple[AgentRecord, dict[str, Any]]]
 """What a node does in one visit, on its share of the run's meter: its record, and the values it writes."""
 
 
-def _current_meter(mas: MAS) -> RunMeter | None:
-    """Return the meter of the run in progress, if it belongs to ``mas``.
+def _current_meter(mas: MAS) -> RunMeter:
+    """Return the run's meter.
 
-    A graph invoked inside a node without its own config inherits the outer
-    run's, so the owner check keeps a nested run of another MAS off this meter.
-
-    Args:
-        mas: The system whose node asks.
-
-    Returns:
-        The meter, or ``None`` outside a run, for a foreign object, or when the
-        meter belongs to another MAS.
+    A graph invoked without a run config, or inheriting another system's (a
+    nested run inside a node), counts on a meter of its own.
     """
-    try:
-        config = get_config()
-    except RuntimeError:  # outside a run
-        return None
-    meter = (config.get("configurable") or {}).get(_RUN_KEY)
-    if not isinstance(meter, RunMeter) or not meter.owns(mas):
-        return None
-    return meter
+    meter = get_config().get("configurable", {}).get(_RUN_KEY)
+    return meter if isinstance(meter, RunMeter) and meter.owns(mas) else RunMeter(mas.budget, owner=mas)
 
 
 def _generate(llm: BaseLLM, rendered: str) -> tuple[str, CallMeta | None]:
@@ -171,35 +158,20 @@ def _generate(llm: BaseLLM, rendered: str) -> tuple[str, CallMeta | None]:
     return llm.get_response([rendered])[0], None
 
 
-def _call(
-    llm: BaseLLM, rendered: str, meter: VisitMeter | None, *, batch_error: bool = False
-) -> tuple[str, CallMeta | None]:
-    """Make one metered model call: check the budget, call, count what it cost.
+def _call(llm: BaseLLM, rendered: str, meter: VisitMeter, *, batch_error: bool = False) -> tuple[str, CallMeta | None]:
+    """Make one metered model call.
 
     With ``batch_error`` (a version 1 agent) a failed call raises as
-    promptolution's batch call does, so ``Trace.error`` reads ``"RuntimeError:
-    LLM batch failed: ..."`` as it did before call metadata, whichever path the
-    model takes; :func:`~xmas.errors.classify` reads the kind from the cause.
-
-    Raises:
-        BudgetExceeded: If the meter refuses the call.
-        EmptyResponse: If the answer was empty; the meter counts its paid
-            attempts first.
-        RuntimeError: With ``batch_error``, from whatever the call raised.
+    promptolution's batch call does, ``RuntimeError: LLM batch failed: ...``,
+    whichever path the model takes; :func:`~xmas.errors.classify` reads the
+    kind from the cause.
     """
-    if meter is not None:
-        meter.before_call()
     try:
-        response, meta = _generate(llm, rendered)
+        return meter.metered(lambda: _generate(llm, rendered))
     except Exception as error:
-        if isinstance(error, EmptyResponse) and meter is not None:  # its attempts were paid: count them
-            meter.after_call(error.meta)
-        if not batch_error or not supports_meta(llm):  # promptolution's get_response wrapped it already
-            raise
+        if not batch_error or not supports_meta(llm) or isinstance(error, BudgetExceeded):
+            raise  # promptolution's get_response wrapped it already, or the meter refused the call
         raise RuntimeError(f"LLM batch failed: {error}") from error
-    if meter is not None:
-        meter.after_call(meta)
-    return response, meta
 
 
 def _wrap(
@@ -231,15 +203,14 @@ def _wrap(
 
     def node(state: MASState) -> dict[str, Any]:
         meter = _current_meter(mas)
-        if meter is not None:
-            meter.start()  # the run's wall clock starts with its first agent, not with the batch
+        meter.start()  # the run's wall clock starts with its first agent, not with the batch
         started = time.perf_counter()
-        visit = None if meter is None else VisitMeter(meter)
+        visit = VisitMeter(meter)
         route: list[str] | None = None
         try:
             record, writes = body(state, visit)
             if decision is not None:
-                route, capped = decision.route(_context(mas, name, state, record, writes, meter))
+                route, capped = decision.route(_context(mas, name, state, writes, meter))
                 record = dataclasses.replace(record, route=tuple(route), capped=capped)
         except Exception as error:
             kind = _kind_of(error)
@@ -247,14 +218,12 @@ def _wrap(
                 raise
             target = None if decision is None else decision.on_error(kind)
             record = _failed_record(mas, name, error, kind, time.perf_counter() - started, target, visit)
-            if meter is not None:
-                meter.keep(record, mas)
+            meter.keep(record, mas)
             if target is None:
                 raise
             return {"records": [record], "visits": {name: 1}, "routes": {name: [target]}}
         record = dataclasses.replace(record, latency_s=time.perf_counter() - started)
-        if meter is not None:
-            meter.keep(record, mas)
+        meter.keep(record, mas)
         update: dict[str, Any] = {"values": writes, "records": [record], "visits": {name: 1}}
         if route is not None:
             update["routes"] = {name: route}
@@ -283,7 +252,7 @@ def agent_node(
     """
     tools = mas.resolve_tools(agent) if agent.tools else {}
 
-    def visit(state: MASState, meter: VisitMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
+    def visit(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
         values = state.get("values") or {}
         inputs = {name: str(values.get(name) or "") for name in agent.inputs}
@@ -333,7 +302,7 @@ def _answer_plain(
     rendered: str,
     form: AnswerForm,
     count_tokens: Callable[[str], float],
-    meter: VisitMeter | None,
+    meter: VisitMeter,
 ) -> tuple[str, Any, tuple[Rejected, ...], TokenUsage, CallMeta | None]:
     """Ask for an answer in its form, once more with :data:`~xmas.schemas.RETRY_NOTE` if it does not fit.
 
@@ -383,7 +352,7 @@ def _agent_body(
     form = compile_form(agent.schema) if parse_type(agent.output_type) == JSON else None
     tools = mas.resolve_tools(agent) if agent.tools else None
 
-    def body(state: MASState, meter: VisitMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
+    def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
         values = state.get("values") or {}
         inputs = {name: render_value(values.get(name), types[name], present=name in values) for name in agent.inputs}
@@ -464,9 +433,8 @@ def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
     spec, source = mas.resolve_callable(step)
     read_map, write_map = step_maps(step, spec)
 
-    def body(state: MASState, meter: VisitMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
-        if meter is not None:
-            meter.check_boundary()
+    def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
+        meter.check_boundary()
         values = state.get("values") or {}
         arguments: dict[str, Any] = {}
         inputs: dict[str, str] = {}
@@ -518,9 +486,8 @@ def _box_body(box: Box, types: dict[str, ValueType]) -> _NodeBody:
     """
     inner: MAS = box.system
 
-    def body(state: MASState, visit: VisitMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
-        # outside a run the inner system counts on its own meter
-        run = RunMeter(inner.budget, owner=inner) if visit is None else visit.run
+    def body(state: MASState, visit: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
+        run = visit.run
         run.check_boundary()
         run.adopt(inner)
         values = state.get("values") or {}
@@ -529,8 +496,7 @@ def _box_body(box: Box, types: dict[str, ValueType]) -> _NodeBody:
         try:
             trace, produced = _run_values(inner, given, inner.prompts(), run)
         except Exception as error:
-            if visit is not None:
-                visit.inner = _failed_trace(inner, render_value(given, JSON), error, run, kept)
+            visit.inner = _failed_trace(inner, render_value(given, JSON), error, run, kept)
             raise
         writes = {outside: produced.get(inside) for inside, outside in box.writes.items()}
         outputs = {
@@ -628,16 +594,10 @@ class _Decision:
         return None
 
 
-def _context(
-    mas: MAS, name: str, state: MASState, record: AgentRecord, writes: dict[str, Any], meter: RunMeter | None
-) -> Context:
+def _context(mas: MAS, name: str, state: MASState, writes: dict[str, Any], meter: RunMeter) -> Context:
     """Return what a node's predicates see: its fresh writes, its visit counted, the spend so far."""
     visits = dict(state.get("visits") or {})
     visits[name] = visits.get(name, 0) + 1
-    if meter is not None:
-        cost: float | None = meter.cost_usd
-    else:
-        cost = sum(r.cost_usd for r in [*(state.get("records") or []), record] if r.cost_usd is not None)
 
     def call(function: str, args: tuple[Any, ...]) -> bool:
         spec, source = mas.resolve_callable(Step(function, function))
@@ -648,8 +608,8 @@ def _context(
         values={**(state.get("values") or {}), **writes},
         visits=visits,
         node=name,
-        cost_usd=cost,
-        elapsed_s=None if meter is None else meter.elapsed_s,
+        cost_usd=meter.cost_usd,
+        elapsed_s=meter.elapsed_s,
         call=call,
     )
 
@@ -661,7 +621,7 @@ def _failed_record(
     kind: ErrorKind,
     latency_s: float,
     target: str | None,
-    visit: VisitMeter | None,
+    visit: VisitMeter,
 ) -> AgentRecord:
     """Return the record of a version 2 visit that failed: no outputs, the route taken, and what it paid.
 
@@ -670,8 +630,8 @@ def _failed_record(
     its inner trace, which the record holds.
     """
     node = mas.nodes[name]
-    inner = None if visit is None else visit.inner
-    meta: CallMeta | None = getattr(error, "meta", None) if visit is None else visit.meta
+    inner = visit.inner
+    meta = visit.meta
     paid: dict[str, Any] = meta.record_fields() if meta is not None else {}
     if isinstance(node, Step):
         paid["cost_usd"] = 0.0
@@ -893,30 +853,16 @@ def compile_mas(mas: MAS) -> CompiledGraph:
     return builder.compile()
 
 
-def _health(mas: MAS, records: tuple[AgentRecord, ...], meter: RunMeter | None) -> Health:
-    """Summarize a run's health with the system's settings, its ``while`` edges and its value names."""
-    loops = [(edge.source, edge.target) for edge in mas.edges if edge.kind is EdgeKind.WHILE]
+def _health(mas: MAS, records: tuple[AgentRecord, ...], meter: RunMeter) -> Health:
+    """Summarize a run's health; the budget entry is the meter owner's alone."""
     values = mas.info.types if mas.info is not None else {"query", *(a.output for a in mas.agents.values())}
-    return summarize(records, meter=meter, settings=mas.health, while_edges=loops, values=values)
+    own = meter if mas is meter.owner else None
+    return summarize(records, meter=own, settings=mas.health, while_edges=mas.while_edges, values=values)
 
 
-def trace_from_state(mas: MAS, query: str, result: Any, meter: RunMeter | None = None) -> Trace:
-    """Assemble a trace from a finished run's state, or from the error that ended it, its health summarized.
-
-    A version 2 trace's output is the rendered write of the terminal that ran.
-    A failed run's trace is :func:`_failed_trace`'s, from the records the meter
-    kept. Without a meter the health has no budget entry, and a failed run has
-    no records.
-    """
+def trace_from_state(mas: MAS, query: str, result: Any, meter: RunMeter) -> Trace:
+    """Assemble a trace from a finished run's state, or from the error that ended it."""
     if isinstance(result, BaseException):
-        if meter is None:
-            return Trace(
-                query=query,
-                output="",
-                records=(),
-                error=f"{type(result).__name__}: {result}",
-                error_kind=_kind_of(result),
-            )
         return _failed_trace(mas, query, result, meter)
     records: list[AgentRecord] = list(result.get("records") or [])
     numbered = tuple(dataclasses.replace(record, step=index) for index, record in enumerate(records))
@@ -964,7 +910,7 @@ def _failed_trace(mas: MAS, query: str, error: BaseException, meter: RunMeter, s
         records=numbered,
         error=f"{type(error).__name__}: {error}",
         error_kind=_kind_of(error),
-        health=_health(mas, numbered, meter if mas is meter.owner else None),  # the budget is the owner's
+        health=_health(mas, numbered, meter),
     )
 
 
@@ -994,7 +940,7 @@ def _run_values(
     """
     state = MASState(values=dict(values), prompts=dict(prompts), records=[], visits={})
     result: dict[str, Any] = mas.compiled.invoke(state, config=_run_config(mas, meter))
-    return trace_from_state(mas, render_value(values, JSON), result), dict(result.get("values") or {})
+    return trace_from_state(mas, render_value(values, JSON), result, meter), dict(result.get("values") or {})
 
 
 def _run_config(mas: MAS, meter: RunMeter) -> dict[str, Any]:

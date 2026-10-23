@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
-from xmas.errors import BudgetExceeded
+from xmas.errors import BudgetExceeded, EmptyResponse
 from xmas.trace import AgentRecord, Trace
 
 if TYPE_CHECKING:
@@ -49,7 +50,29 @@ class Budget:
                 raise ValueError(f"Budget.{name} must be >= 0, got {value!r}")
 
 
-class RunMeter:
+class _Counts(Protocol):
+    def before_call(self) -> None: ...
+    def after_call(self, meta: CallMeta | None) -> None: ...
+
+
+class _Metering:
+    def metered[T](self: _Counts, call: Callable[[], tuple[T, CallMeta | None]]) -> tuple[T, CallMeta | None]:
+        """Make one model call on this meter: refused at a limit, counted when it ends.
+
+        ``call`` returns its result and the call's metadata. An empty answer
+        raises, but its paid attempts are counted first.
+        """
+        self.before_call()
+        try:
+            result, meta = call()
+        except EmptyResponse as error:
+            self.after_call(error.meta)
+            raise
+        self.after_call(meta)
+        return result, meta
+
+
+class RunMeter(_Metering):
     """What one run has used so far, checked against its budget before each call.
 
     The counters and the record list are shared by the run's parallel branches,
@@ -186,7 +209,7 @@ class RunMeter:
             self.records_of(self.owner if system is None else system).append(record)
 
 
-class VisitMeter:
+class VisitMeter(_Metering):
     """One node visit's share of a run's meter.
 
     Every call counts on the run's meter as before; the visit also keeps the
