@@ -11,6 +11,7 @@ from __future__ import annotations
 from xmas.mas import MAS
 from xmas.optimization.attribution import Attributor
 from xmas.optimization.base import MASOptimizer
+from xmas.optimization.updaters import movable_agents
 from xmas.tasks.base import MASTask
 
 PREFIXES: tuple[str, ...] = (
@@ -91,10 +92,14 @@ class PrefixSearchOptimizer(MASOptimizer):
 
         Returns:
             The least-credited agent when credit is available, otherwise the next
-            agent in round-robin order, which keeps the sweep deterministic.
+            agent in round-robin order, which keeps the sweep deterministic. A
+            frozen agent is never chosen.
+
+        Raises:
+            ValueError: If every agent is frozen.
         """
-        names = list(self.mas.agents)
-        scored = {name: values for name, values in self.credit.items() if name in self.mas.agents and values}
+        names = movable_agents(self.mas)
+        scored = {name: values for name, values in self.credit.items() if name in names and values}
         if scored:
             return min(scored, key=lambda name: sum(scored[name]) / len(scored[name]))
         return names[self._round % len(names)]

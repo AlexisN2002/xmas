@@ -15,7 +15,7 @@ from xmas.mas import MAS
 from xmas.optimization.attribution import UNKNOWN, Attributor
 from xmas.optimization.base import MASOptimizer
 from xmas.optimization.broker import Board, ProxyTask, Request, rounds
-from xmas.optimization.updaters import AgentPromptView
+from xmas.optimization.updaters import AgentPromptView, movable_agents
 from xmas.prompts import encode_prompts
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -91,21 +91,26 @@ class CantanteOptimizer(MASOptimizer):
     def propose(self) -> list[MAS]:
         """Run one round of every agent's optimizer and return what they settled on.
 
+        A frozen agent gets no optimizer and keeps its prompt.
+
         Returns:
             The incumbent and the system built from each agent's best prompt. Both
             are returned so that the base class measures the proposal against the
             incumbent on the real task, rather than trusting attributed credit to
             have been right.
+
+        Raises:
+            ValueError: If every agent is frozen.
         """
         board = Board()
         optimizers: dict[str, BaseOptimizer] = {}
-        for name, agent in self.mas.agents.items():
+        for name in movable_agents(self.mas):
             proxy = ProxyTask(name, self.task, board)
             board.register(proxy)
             optimizers[name] = self.optimizer_cls(
                 predictor=AgentPromptView(self.mas, name),
                 task=proxy,
-                initial_prompts=self.initial_prompts.get(name) or [agent.prompt],
+                initial_prompts=self.initial_prompts.get(name) or [self.mas.agents[name].prompt],
                 **self.optimizer_kwargs,
             )
 
@@ -118,7 +123,7 @@ class CantanteOptimizer(MASOptimizer):
                 board.cancel_all()
 
         best = {name: str(optimizer.prompts[0]) for name, optimizer in optimizers.items() if optimizer.prompts}
-        if not best or best == self.mas.prompts():
+        if not best or all(prompt == self.mas.agents[name].prompt for name, prompt in best.items()):
             return [self.mas]
         return [self.mas, self.mas.copy(prompts=best)]
 
@@ -221,7 +226,7 @@ class CantanteOptimizer(MASOptimizer):
             Per-set, per-datapoint credit for each agent.
         """
         width = len(rewards[0]) if rewards else 0
-        names = sorted(self.mas.agents)
+        names = sorted(movable_agents(self.mas))
         grid = {name: [[UNKNOWN] * width for _ in sets] for name in names}
 
         positions = sorted(traces)

@@ -15,7 +15,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from xmas import MAS, Agent, MASTask
+from xmas import MAS, Agent, Budget, Edge, MASTask, Step
+from xmas.check import SystemInfo, check_system
+from xmas.edges import EdgeKind
 from xmas.graph import END, START, back_edges
 from xmas.optimization.evolution import EvolutionaryTopologyOptimizer
 from xmas.optimization.graph_updater import GraphUpdater
@@ -31,6 +33,8 @@ from xmas.optimization.topology import (
     terminals,
     within_budget,
 )
+from xmas.optimization.updaters import PromptUpdater
+from xmas.tools import tool
 
 from .conftest import MockLLM
 
@@ -310,3 +314,124 @@ def test_the_population_keeps_the_best_candidates_as_future_parents() -> None:
     assert len(optimizer.population) == 2
     for member in optimizer.population:
         assert nx.is_directed_acyclic_graph(member.graph)
+
+
+# ----------------------------------------------------------------- version 2
+
+
+@tool(writes={"counts": "json"})
+def count_words(draft: str) -> dict[str, int]:
+    """Count the words of a draft."""
+    return {"words": len(draft.split())}
+
+
+def _answer(prompt: str) -> str:
+    """Script the models: the judge answers JSON, everyone else a draft."""
+    return '{"fits": true}' if prompt.startswith("Judge") else "A short draft."
+
+
+def _judged(*, branches: bool = False) -> MAS:
+    """Build planner -> writer -> count -> judge, with a step, a json judge and every runtime field set.
+
+    With ``branches``, the judge decides between ``publish`` and ``apology``,
+    which both feed ``final``.
+    """
+    agents = [
+        Agent("judge", "Judge {draft}: {counts}", output="verdict", inputs=["draft", "counts"], output_type="json"),
+        Agent("planner", "Plan an answer to {query}", output="plan"),
+        Agent("writer", "Write about {query} along {plan}", output="draft", inputs=["query", "plan"], model="strong"),
+    ]
+    edges: list[tuple[str, str] | Edge] = [("planner", "writer"), ("writer", "count"), ("count", "judge")]
+    state = {"draft": {"merge": "last"}}
+    if branches:
+        agents += [
+            Agent("publish", "Publish {draft}", output="published", inputs=["draft"]),
+            Agent("apology", "Apologise for {query}", output="published"),
+            Agent("final", "Finish with {published}", output="answer", inputs=["published"]),
+        ]
+        edges += [
+            Edge("judge", "publish", EdgeKind.WHEN, when="verdict.fits"),
+            Edge("judge", "apology", EdgeKind.ELSE),
+            ("publish", "final"),
+            ("apology", "final"),
+        ]
+        state["published"] = {"merge": "last"}
+    return MAS(
+        agents=agents,
+        edges=edges,
+        steps=[Step("count", uses="count_words")],
+        llm=MockLLM(_answer),
+        llms={"strong": MockLLM(_answer)},
+        max_steps=17,
+        default_model="base-model",
+        tools=[count_words],
+        max_tool_rounds=2,
+        budget=Budget(max_calls=50),
+        inputs={"query": "text"},
+        state=state,
+    )
+
+
+def _freeze_judge(mas: MAS, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B2: real MAS(..., frozen=("judge",)) in `_judged` instead."""
+    monkeypatch.setattr(mas, "frozen", frozenset({"judge"}), raising=False)
+
+
+def _accept_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B2: drop; the 2b check_system accepts conditional edges (2a's refuses them)."""
+
+    def check(mas: MAS) -> SystemInfo:
+        declared = mas.edges
+        mas.edges = tuple(Edge(edge.source, edge.target) for edge in declared)
+        try:
+            return check_system(mas)
+        finally:
+            mas.edges = declared
+
+    monkeypatch.setattr("xmas.mas.check_system", check)
+
+
+def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Phase 1's worst review defect was a field dropped where an optimizer
+    # rebuilt a system; in version 2 the same rebuild also turned every step
+    # into an agent. Steps stay steps, every field reaches the candidate, and a
+    # candidate the check refuses (say the writer was removed, so nothing
+    # writes the draft) is dropped rather than raised.
+    budget = TopologyBudget(min_agents=2, max_agents=7, max_edges=12)
+    mas = _judged()
+    _freeze_judge(mas, monkeypatch)
+    candidates = updater(seed=2, budget=budget).propose(mas, {}, n=6)
+
+    assert candidates
+    for candidate in candidates:
+        assert candidate.steps == mas.steps and isinstance(candidate.steps["count"], Step)
+        assert "count" not in candidate.agents
+        assert candidate.agents["judge"] == mas.agents["judge"]
+        assert candidate._v2_kwargs() == mas._v2_kwargs()
+        runtime = ("llm", "llms", "max_steps", "default_model", "tools", "max_tool_rounds", "budget")
+        assert [getattr(candidate, name) for name in runtime] == [getattr(mas, name) for name in runtime]
+        assert candidate.run("cats").error is None
+
+    # Conditional edges and their endpoints stay exactly as they were, in order.
+    _accept_conditions(monkeypatch)
+    branched = _judged(branches=True)
+    _freeze_judge(branched, monkeypatch)
+    conditions = [edge for edge in branched.edges if edge.kind is not EdgeKind.PLAIN]
+    proposer = updater(seed=4, budget=budget)
+    candidates = proposer.propose(branched, {}, n=6) + proposer.recombine(branched, branched, n=2)
+
+    assert candidates
+    for candidate in candidates:
+        assert [edge for edge in candidate.edges if edge.kind is not EdgeKind.PLAIN] == conditions
+        for name in ("judge", "publish", "apology"):
+            assert candidate.agents[name] == branched.agents[name]
+        assert {("count", "judge"), ("publish", "final"), ("apology", "final")} <= set(proposer.edges_of(candidate))
+        assert candidate.steps == branched.steps
+
+    # A prompt optimizer never picks the frozen judge, not even when it earned least.
+    prompts = PromptUpdater(object, None)  # type: ignore[arg-type]
+    assert prompts.target_agent(mas, {}) == "planner"
+    assert prompts.target_agent(mas, {"judge": [-1.0], "writer": [0.5], "planner": [0.2]}) == "planner"
+    monkeypatch.setattr(mas, "frozen", frozenset(mas.agents), raising=False)
+    with pytest.raises(ValueError, match="frozen"):
+        prompts.target_agent(mas, {})
