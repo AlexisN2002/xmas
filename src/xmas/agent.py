@@ -8,8 +8,7 @@ from typing import Any
 from xmas.schemas import compile_form
 from xmas.values import JSON, parse_type
 
-DEFAULT_INPUT = "query"
-"""Variable an agent reads when ``inputs`` is not given."""
+DEFAULT_INPUT = "query"  # mas.py still imports the name
 
 
 class Agent:
@@ -31,9 +30,9 @@ class Agent:
             against its model registry. ``None`` uses the MAS default. Stored as
             a name rather than an object so that a MAS serializes to plain data.
         output_type: The type of the value the agent writes, ``"text"`` or
-            ``"json"`` (version 2).
+            ``"json"``.
         schema: The answer form a json answer must match, in the dialect of
-            :mod:`xmas.schemas`, or ``None`` for any JSON (version 2).
+            :mod:`xmas.schemas`, or ``None`` for any JSON.
     """
 
     name: str
@@ -56,28 +55,12 @@ class Agent:
         output_type: str = "text",
         schema: dict[str, Any] | None = None,
     ) -> None:
-        """Initialize an agent.
-
-        Args:
-            name: Unique identifier within the MAS.
-            prompt: Prompt template for this agent.
-            output: Name of the state variable this agent writes.
-            inputs: State variables this agent reads. Defaults to ``["query"]``.
-            tools: Names of tools this agent may call.
-            model: Model name to bind this agent to, or ``None`` for the default.
-            output_type: The type of the value the agent writes.
-            schema: The answer form of a json answer, or ``None`` for any JSON.
-
-        Raises:
-            ValueError: If ``name`` or ``output`` is empty, ``inputs`` is empty,
-                ``output_type`` is not a type, or ``schema`` is given for an
-                agent that does not answer in json or breaks the form dialect.
-        """
+        """Initialize an agent; the fields are described on the class."""
         if not name:
             raise ValueError("An agent needs a name.")
         if not output:
             raise ValueError(f"Agent {name!r} needs an output variable.")
-        resolved_inputs = list(inputs) if inputs is not None else [DEFAULT_INPUT]
+        resolved_inputs = list(inputs) if inputs is not None else ["query"]
         if not resolved_inputs:
             raise ValueError(f"Agent {name!r} needs at least one input variable.")
         try:
@@ -99,12 +82,10 @@ class Agent:
         self.schema = schema
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the plain-data form of this agent.
+        """Return the plain-data form, which round-trips exactly through :meth:`from_dict`.
 
-        Returns:
-            A JSON- and YAML-safe mapping. Round-trips exactly through
-            :meth:`from_dict`. ``output_type`` and ``schema`` appear only when
-            set, so a version 1 agent's dict keeps its six keys.
+        ``output_type`` and ``schema`` appear only when set, so a version 1
+        agent's dict keeps its six keys.
         """
         data: dict[str, Any] = {
             "name": self.name,
@@ -122,18 +103,7 @@ class Agent:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Agent:
-        """Rebuild an agent from :meth:`to_dict` output.
-
-        Args:
-            data: Mapping produced by :meth:`to_dict`.
-
-        Returns:
-            The reconstructed agent.
-
-        Raises:
-            ValueError: If a required key is missing, an unknown key is present,
-                or a value has the wrong type.
-        """
+        """Rebuild an agent from :meth:`to_dict` output, refusing unknown or missing keys and wrong types."""
         unknown = set(data) - {"name", "prompt", "inputs", "output", "tools", "model", "output_type", "schema"}
         if unknown:
             raise ValueError(f"Unknown agent keys: {sorted(unknown)}.")
@@ -167,14 +137,7 @@ class Agent:
         )
 
     def copy(self, **overrides: Any) -> Agent:
-        """Return a copy with the given attributes replaced.
-
-        Args:
-            **overrides: Any constructor argument, by name.
-
-        Returns:
-            A new agent; this one is left unchanged.
-        """
+        """Return a copy with the given constructor arguments replaced; this agent is left unchanged."""
         fields: dict[str, Any] = {
             "name": self.name,
             "prompt": self.prompt,
