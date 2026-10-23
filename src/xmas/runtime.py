@@ -615,7 +615,7 @@ def _wire_v2(
         if source not in deciding:
             for target in targets.values():
                 builder.add_edge(source, target)
-        elif targets:
+        else:
             builder.add_conditional_edges(source, _router(source, targets), sorted(set(targets.values())))
 
 
