@@ -96,6 +96,23 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class Rejected:
+    """An answer refused by the node's answer form before its retry.
+
+    Attributes:
+        raw_response: The refused answer as the model gave it.
+        error: Why it was refused, the problem the retry note carried.
+    """
+
+    raw_response: str
+    error: str
+
+    def to_dict(self) -> dict[str, str]:
+        """Return the plain-data form."""
+        return {"raw_response": self.raw_response, "error": self.error}
+
+
+@dataclass(frozen=True)
 class AgentRecord:
     """Everything one agent did during one run of the graph.
 
@@ -121,6 +138,10 @@ class AgentRecord:
         finish_reason: Why the model stopped, as the provider said.
         error_kind: The kind of a cut or refused answer that still produced text.
         served_model: The model the provider says served the call.
+        kind: What kind of node ran: ``"agent"``, or ``"step"`` for a step.
+        rejected: Answers refused by the agent's answer form before the one it
+            kept in ``raw_response``, in order.
+        error: Why the visit failed, when it failed and the run went on.
     """
 
     agent: str
@@ -139,9 +160,16 @@ class AgentRecord:
     finish_reason: str | None = None
     error_kind: ErrorKind | None = None
     served_model: str | None = None
+    kind: str = "agent"
+    rejected: tuple[Rejected, ...] = ()
+    error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the plain-data form: the ten v1 keys, then each newer field that is set."""
+        """Return the plain-data form: the ten v1 keys, then each newer field that is set.
+
+        ``kind`` is set when it is not ``"agent"`` and ``rejected`` when it is not
+        empty.
+        """
         data: dict[str, Any] = {
             "agent": self.agent,
             "step": self.step,
@@ -161,6 +189,9 @@ class AgentRecord:
             "finish_reason": self.finish_reason,
             "error_kind": None if self.error_kind is None else self.error_kind.value,
             "served_model": self.served_model,
+            "kind": None if self.kind == "agent" else self.kind,
+            "rejected": [rejected.to_dict() for rejected in self.rejected] or None,
+            "error": self.error,
         }
         data.update((key, value) for key, value in newer.items() if value is not None)
         return data

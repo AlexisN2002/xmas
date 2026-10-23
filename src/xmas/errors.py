@@ -143,6 +143,33 @@ class EmptyResponse(XmasError):  # noqa: N818 (public name fixed by the phase-1 
         return type(self), (str(self), self.kind, self.meta)
 
 
+class BadFormat(XmasError):  # noqa: N818 (public name fixed by the phase-2 contract)
+    """A node's output did not have its declared form.
+
+    An agent with an answer form raises it when its answer and its one retry
+    both fail the form; a step raises it when a write has the wrong type.
+
+    Attributes:
+        node: The node whose output was refused.
+        problems: One line per refused attempt, first attempt first.
+        meta: The combined metadata of the paid attempts behind the error, so a
+            run's meter can count what they cost, or ``None`` when not known.
+    """
+
+    kind = ErrorKind.BAD_FORMAT
+
+    def __init__(self, node: str, problems: tuple[str, ...], meta: CallMeta | None = None) -> None:
+        """Build the message that names the node and every problem."""
+        super().__init__(f"Bad format from {node!r}: " + "; after the retry: ".join(problems))
+        self.node = node
+        self.problems = tuple(problems)
+        self.meta = meta
+
+    def __reduce__(self) -> tuple[type[BadFormat], tuple[str, tuple[str, ...], CallMeta | None]]:
+        """Pickle by the constructor's arguments, not by the message."""
+        return type(self), (self.node, self.problems, self.meta)
+
+
 MONEY_WORDS = re.compile(
     r"key limit exceeded|requires more credits|insufficient credits|insufficient_quota"
     r"|exceeded your current quota|payment required|in_flight_budget_exhausted",

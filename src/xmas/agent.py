@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
+
+from xmas.schemas import compile_form
+from xmas.values import JSON, parse_type
 
 DEFAULT_INPUT = "query"
 """Variable an agent reads when ``inputs`` is not given."""
@@ -26,6 +30,10 @@ class Agent:
         model: Name of the model to bind this agent to, resolved by the MAS
             against its model registry. ``None`` uses the MAS default. Stored as
             a name rather than an object so that a MAS serializes to plain data.
+        output_type: The type of the value the agent writes, ``"text"`` or
+            ``"json"`` (version 2).
+        schema: The answer form a json answer must match, in the dialect of
+            :mod:`xmas.schemas`, or ``None`` for any JSON (version 2).
     """
 
     name: str
@@ -34,6 +42,8 @@ class Agent:
     output: str
     tools: list[str]
     model: str | None
+    output_type: str
+    schema: dict[str, Any] | None
 
     def __init__(
         self,
@@ -43,6 +53,8 @@ class Agent:
         inputs: list[str] | None = None,
         tools: list[str] | None = None,
         model: str | None = None,
+        output_type: str = "text",
+        schema: dict[str, Any] | None = None,
     ) -> None:
         """Initialize an agent.
 
@@ -53,9 +65,13 @@ class Agent:
             inputs: State variables this agent reads. Defaults to ``["query"]``.
             tools: Names of tools this agent may call.
             model: Model name to bind this agent to, or ``None`` for the default.
+            output_type: The type of the value the agent writes.
+            schema: The answer form of a json answer, or ``None`` for any JSON.
 
         Raises:
-            ValueError: If ``name`` or ``output`` is empty, or ``inputs`` is empty.
+            ValueError: If ``name`` or ``output`` is empty, ``inputs`` is empty,
+                ``output_type`` is not a type, or ``schema`` is given for an
+                agent that does not answer in json or breaks the form dialect.
         """
         if not name:
             raise ValueError("An agent needs a name.")
@@ -64,6 +80,14 @@ class Agent:
         resolved_inputs = list(inputs) if inputs is not None else [DEFAULT_INPUT]
         if not resolved_inputs:
             raise ValueError(f"Agent {name!r} needs at least one input variable.")
+        try:
+            answers_json = parse_type(output_type) == JSON
+            if schema is not None:
+                compile_form(schema)
+        except ValueError as exc:
+            raise ValueError(f"Agent {name!r}: {exc}") from exc
+        if schema is not None and not answers_json:
+            raise ValueError(f"Agent {name!r}: a schema needs output_type 'json', not {output_type!r}.")
 
         self.name = name
         self.prompt = prompt
@@ -71,15 +95,18 @@ class Agent:
         self.output = output
         self.tools = list(tools) if tools is not None else []
         self.model = model
+        self.output_type = output_type
+        self.schema = schema
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form of this agent.
 
         Returns:
             A JSON- and YAML-safe mapping. Round-trips exactly through
-            :meth:`from_dict`.
+            :meth:`from_dict`. ``output_type`` and ``schema`` appear only when
+            set, so a version 1 agent's dict keeps its six keys.
         """
-        return {
+        data: dict[str, Any] = {
             "name": self.name,
             "prompt": self.prompt,
             "inputs": list(self.inputs),
@@ -87,6 +114,11 @@ class Agent:
             "tools": list(self.tools),
             "model": self.model,
         }
+        if self.output_type != "text":
+            data["output_type"] = self.output_type
+        if self.schema is not None:
+            data["schema"] = copy.deepcopy(self.schema)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Agent:
@@ -101,7 +133,7 @@ class Agent:
         Raises:
             ValueError: If a required key is missing or an unknown key is present.
         """
-        unknown = set(data) - {"name", "prompt", "inputs", "output", "tools", "model"}
+        unknown = set(data) - {"name", "prompt", "inputs", "output", "tools", "model", "output_type", "schema"}
         if unknown:
             raise ValueError(f"Unknown agent keys: {sorted(unknown)}.")
         missing = {"name", "prompt", "output"} - set(data)
@@ -114,6 +146,8 @@ class Agent:
             inputs=data.get("inputs"),
             tools=data.get("tools"),
             model=data.get("model"),
+            output_type=data.get("output_type", "text"),
+            schema=data.get("schema"),
         )
 
     def copy(self, **overrides: Any) -> Agent:
@@ -132,6 +166,8 @@ class Agent:
             "inputs": list(self.inputs),
             "tools": list(self.tools),
             "model": self.model,
+            "output_type": self.output_type,
+            "schema": copy.deepcopy(self.schema),
         }
         unknown = set(overrides) - set(fields)
         if unknown:
