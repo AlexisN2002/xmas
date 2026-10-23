@@ -34,19 +34,20 @@ from promptolution.utils.token_counter import get_token_counter
 from xmas import tools as _tools
 from xmas.agent import Agent
 from xmas.budget import RunMeter
+from xmas.check import step_maps
 from xmas.errors import BadFormat, EmptyResponse, ErrorKind, classify
 from xmas.graph import END, back_edges, join_nodes, terminal_agent
 from xmas.llms.meta import SupportsMeta, supports_meta
 from xmas.prompts import safe_format
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
+from xmas.spec import SPEC_VERSION_2
 from xmas.trace import AgentRecord, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, parse_type, render_value
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Iterable
-
     from promptolution.llms.base_llm import BaseLLM
 
+    from xmas.check import SystemInfo
     from xmas.llms.meta import CallMeta
     from xmas.mas import MAS
     from xmas.nodes import Step
@@ -308,23 +309,6 @@ def _make_node(mas: MAS, agent: Agent, count_tokens: Callable[[str], float]) -> 
 # ------------------------------------------------------------------ version 2
 
 
-def _is_v2(mas: MAS) -> bool:
-    """Whether ``mas`` is a version 2 system."""
-    return getattr(mas, "version", 1) == 2
-
-
-def _steps(mas: MAS) -> Iterable[Step]:
-    """Return the system's steps, held as a sequence or by name."""
-    steps = getattr(mas, "steps", ())
-    return steps.values() if isinstance(steps, dict) else steps
-
-
-def _types(mas: MAS) -> dict[str, ValueType]:
-    """Return the type of every value, from ``mas.info.types``, words read as types."""
-    types = getattr(getattr(mas, "info", None), "types", None) or {}
-    return {name: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for name, vtype in types.items()}
-
-
 def _usage(count_tokens: Callable[[str], float], sent: str, received: str) -> TokenUsage:
     """Estimate one call's usage."""
     return TokenUsage(input_tokens=int(count_tokens(sent)), output_tokens=int(count_tokens(received)))
@@ -396,7 +380,7 @@ def _agent_body(
     def body(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
         template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
         values = state.get("values") or {}
-        inputs = {name: render_value(values.get(name), types.get(name, TEXT)) for name in agent.inputs}
+        inputs = {name: render_value(values.get(name), types[name]) for name in agent.inputs}
         rendered = safe_format(template, inputs)
         if form is not None:
             rendered = f"{rendered}\n\n{form.format_block()}"
@@ -471,8 +455,8 @@ def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
     Returns:
         The step's body, for :func:`_wrap`.
     """
-    spec, source = cast("Any", mas).resolve_callable(step)
-    write_types: dict[str, ValueType] = spec.writes
+    spec, source = mas.resolve_callable(step)
+    read_map, write_map = step_maps(step, spec)
 
     def body(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
         if meter is not None:
@@ -480,19 +464,16 @@ def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
         values = state.get("values") or {}
         arguments: dict[str, Any] = {}
         inputs: dict[str, str] = {}
-        for parameter in spec.reads:
-            name = step.reads.get(parameter, parameter)
-            inputs[name] = render_value(values.get(name), types.get(name, TEXT))
+        for parameter, name in read_map.items():
+            inputs[name] = render_value(values.get(name), types[name])
             if name in values:
                 arguments[parameter] = values[name]
         try:
             produced = _tools.run_step(spec, source, arguments)
         except BadFormat as error:
             raise BadFormat(step.name, error.problems, error.meta) from error
-        writes = {step.writes.get(write, write): value for write, value in produced.items()}
-        outputs = {
-            step.writes.get(write, write): render_value(value, write_types[write]) for write, value in produced.items()
-        }
+        writes = {write_map[write]: value for write, value in produced.items()}
+        outputs = {name: render_value(value, types[name]) for name, value in writes.items()}
         record = AgentRecord(
             agent=step.name,
             step=-1,
@@ -513,10 +494,12 @@ def _compile_v2(mas: MAS) -> CompiledGraph:
 
     A barrier (``add_edge([...], node)``) runs its node once, after every
     source has run; nothing is deferred. Phase 2a has no conditional edges, so
-    every edge in ``mas.graph`` is plain and every node fed by several is a join.
+    every edge in ``mas.graph`` is plain and each join in ``mas.info.joins``
+    waits for its predecessors, each a group of one.
     """
     builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(MASState)
-    types = _types(mas)
+    info = cast("SystemInfo", mas.info)  # check_system set it when the system was built
+    types = info.types
     counters: dict[int, Callable[[str], float]] = {}
     for agent in mas.agents.values():
         llm = mas.resolve_llm(agent)
@@ -524,15 +507,15 @@ def _compile_v2(mas: MAS) -> CompiledGraph:
             counters[id(llm)] = get_token_counter(llm)
         body = _agent_body(mas, agent, llm, counters[id(llm)], types)
         builder.add_node(agent.name, _wrap(mas, agent.name, body))  # type: ignore[call-overload]
-    for step in _steps(mas):
+    for step in mas.steps.values():
         builder.add_node(step.name, _wrap(mas, step.name, _step_body(mas, step, types)))  # type: ignore[call-overload]
 
     for target in mas.graph.nodes:
-        sources = sorted(mas.graph.predecessors(target))
-        if len(sources) > 1:
-            builder.add_edge(sources, target)
-        elif sources:
-            builder.add_edge(sources[0], target)
+        if target in info.joins:
+            builder.add_edge(list(info.joins[target]), target)
+        else:
+            for source in mas.graph.predecessors(target):
+                builder.add_edge(source, target)
     return builder.compile()
 
 
@@ -547,22 +530,6 @@ def _v2_output(mas: MAS, records: list[AgentRecord]) -> str:
         return ""
     outputs = ran[-1].outputs
     return next(iter(outputs.values())) if len(outputs) == 1 else ran[-1].raw_response
-
-
-def _check_query_input(mas: MAS) -> None:
-    """Refuse to run a version 2 system on a query when its inputs are not exactly ``{query: text}``.
-
-    Raises:
-        ValueError: If they are not.
-    """
-    if not _is_v2(mas):
-        return
-    inputs = {name: str(vtype) for name, vtype in (getattr(mas, "inputs", None) or {"query": TEXT}).items()}
-    if inputs != {"query": str(TEXT)}:
-        raise ValueError(
-            f"This system's inputs are {inputs}, not {{'query': 'text'}}, so it does not run on a query: "
-            "it runs as a box, or with run_state in phase 3."
-        )
 
 
 def _make_router(
@@ -618,7 +585,7 @@ def compile_mas(mas: MAS) -> CompiledGraph:
     Returns:
         The compiled graph.
     """
-    if _is_v2(mas):
+    if mas.version == SPEC_VERSION_2:
         return _compile_v2(mas)
     builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(MASState)
     joins = join_nodes(mas.graph)
@@ -660,7 +627,7 @@ def _to_trace(mas: MAS, query: str, result: dict[str, Any], meter: RunMeter | No
     """
     records: list[AgentRecord] = list(result.get("records") or [])
     numbered = tuple(dataclasses.replace(record, step=index) for index, record in enumerate(records))
-    if _is_v2(mas):
+    if mas.version == SPEC_VERSION_2:
         return Trace(query=query, output=_v2_output(mas, records), records=numbered)
     values: dict[str, Any] = result.get("values") or {}
     output_var = mas.agents[terminal_agent(mas.graph)].output
@@ -724,11 +691,7 @@ def run_one(mas: MAS, query: str, prompts: dict[str, str]) -> Trace:
         ``Trace.error_kind`` rather than raised, so one bad rollout does not lose
         a whole batch, and the trace keeps the records of the agents that
         finished.
-
-    Raises:
-        ValueError: If a version 2 system's inputs are not exactly ``{query: text}``.
     """
-    _check_query_input(mas)
     meter = RunMeter(mas.budget, owner=mas)
     try:
         result: dict[str, Any] = mas.compiled.invoke(_initial_state(query, prompts), config=_run_config(mas, meter))
@@ -750,11 +713,7 @@ def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> lis
 
     Returns:
         One trace per input, in the order given.
-
-    Raises:
-        ValueError: If a version 2 system's inputs are not exactly ``{query: text}``.
     """
-    _check_query_input(mas)
     if not queries:
         return []
 

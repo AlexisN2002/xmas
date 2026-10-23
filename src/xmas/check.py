@@ -15,19 +15,16 @@ for all of them.
 
 from __future__ import annotations
 
-import typing
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, cast
 
 from xmas.agent import Agent
 from xmas.edges import EdgeKind
 from xmas.graph import END, SENTINELS, START, ancestors, build_graph, loop_problems, validate_graph
 from xmas.prompts import extract_placeholders
-from xmas.values import AVAILABLE, RESERVED, TEXT, ValueType, parse_type, type_of_hint
+from xmas.values import AVAILABLE, RESERVED, ValueType, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Mapping
-
     from xmas.mas import MAS
     from xmas.nodes import Step
     from xmas.tools import Tool
@@ -53,52 +50,9 @@ class SystemInfo:
     joins: dict[str, tuple[str, ...]]
 
 
-def _types(mapping: Mapping[str, Any]) -> dict[str, ValueType]:
-    """Read ``{name: type}`` where a type is a :class:`ValueType` or a type word."""
-    return {name: kind if isinstance(kind, ValueType) else parse_type(kind) for name, kind in mapping.items()}
-
-
-def callable_reads(item: Tool) -> dict[str, ValueType]:
-    """Return a callable's parameters with their types.
-
-    ``Tool.reads`` when the tool declares it, else from ``Tool.parameters``: a
-    ``string`` parameter is text, any other is json.
-
-    Args:
-        item: The tool.
-
-    Returns:
-        ``{parameter: type}``, in signature order.
-    """
-    declared = getattr(item, "reads", None)
-    if declared is not None:
-        return _types(declared)
-    return {name: type_of_hint(schema) for name, schema in item.parameters.get("properties", {}).items()}
-
-
 def callable_writes(item: Tool) -> dict[str, ValueType]:
-    """Return what a callable writes, with the types.
-
-    ``Tool.writes`` when the tool declares it, else one write named after the
-    tool: text when a local function's return hint is ``str`` or the tool is
-    remote, json otherwise.
-
-    Args:
-        item: The tool.
-
-    Returns:
-        ``{write: type}``.
-    """
-    declared = getattr(item, "writes", None)
-    if declared is not None:
-        return _types(declared)
-    if item.fn is None:
-        return {item.name: TEXT}
-    try:
-        hint = typing.get_type_hints(item.fn).get("return")
-    except Exception:  # an unresolvable hint says nothing about the type
-        hint = None
-    return {item.name: type_of_hint(hint)}
+    """Return what a callable writes, ``{write: type}``, as :class:`~xmas.tools.Tool` typed it when built."""
+    return cast("dict[str, ValueType]", item.writes)
 
 
 def step_maps(step: Step, item: Tool) -> tuple[dict[str, str], dict[str, str]]:
@@ -114,7 +68,7 @@ def step_maps(step: Step, item: Tool) -> tuple[dict[str, str], dict[str, str]]:
     Returns:
         ``(reads, writes)``.
     """
-    reads = {name: step.reads.get(name, name) for name in callable_reads(item)}
+    reads = {name: step.reads.get(name, name) for name in item.reads}
     writes = {name: step.writes.get(name, name) for name in callable_writes(item)}
     return reads, writes
 
@@ -185,7 +139,7 @@ def check_system(mas: MAS) -> SystemInfo:
             continue
         try:
             item, _source = mas.resolve_callable(node)
-            parameters, produced = callable_reads(item), callable_writes(item)
+            parameters, produced = item.reads, callable_writes(item)
         except ValueError as exc:
             problems.append(str(exc))
             reads[name], writes[name] = {}, {}

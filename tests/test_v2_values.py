@@ -1,22 +1,17 @@
 """Version 2 in the engine: typed values, steps, one callable registry, answer forms with one retry.
 
 No network but the in-process MCP server of one case: the models are scripted
-doubles. Until package A2 lands, ``MAS`` cannot take ``steps=``, so every system
-here is built by :class:`V2MAS`, which sets the attributes the engine reads.
-After integration each ``V2MAS(...)`` becomes ``MAS(...)`` with the same
-arguments (marked "A2:").
+doubles.
 """
 
 from __future__ import annotations
 
-import itertools
 import json
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -24,56 +19,16 @@ from xmas import MAS, Agent, Budget, ErrorKind, TokenUsage, ToolCall
 from xmas import _engine as engine
 from xmas.budget import RunMeter
 from xmas.errors import BadFormat
-from xmas.graph import build_graph, validate_graph
 from xmas.llms.meta import CallMeta
 from xmas.nodes import Step
 from xmas.schemas import RETRY_NOTE
-from xmas.tools import Tool, ToolSource, index_tools, tool
+from xmas.tools import Tool, index_tools, tool
 from xmas.trace import Rejected
-from xmas.values import JSON, TEXT, ValueType, parse_type
+from xmas.values import JSON, TEXT
 
 from .test_tools import ToolMockLLM, Turn, req
 
 # --------------------------------------------------------------------- doubles
-
-
-class V2MAS(MAS):
-    """A version 2 system as A2's ``MAS(..., steps=..., inputs=...)`` builds it (A2: replace with ``MAS``).
-
-    The base constructor gets the agents as a chain, a valid version 1 graph;
-    then the graph is rebuilt over agents and steps from ``edges``, and the
-    attributes the engine reads are set: ``version``, ``steps``, ``inputs``,
-    ``info.types`` and ``resolve_callable``.
-    """
-
-    def __init__(
-        self,
-        agents: list[Agent],
-        edges: list[tuple[str, str]],
-        *,
-        steps: Sequence[Step] = (),
-        inputs: dict[str, ValueType] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Build the system; ``kwargs`` go to ``MAS``."""
-        names = [agent.name for agent in agents]
-        super().__init__(agents, edges=list(itertools.pairwise(names)), **kwargs)
-        self.graph = build_graph([*names, *(step.name for step in steps)], edges)
-        validate_graph(self.graph)
-        self.version = 2
-        self.steps = tuple(steps)
-        self.inputs = dict(inputs or {"query": TEXT})
-        types: dict[str, ValueType] = dict(self.inputs)
-        types.update({agent.output: parse_type(agent.output_type) for agent in agents})
-        for step in self.steps:
-            spec, _ = self.resolve_callable(step)
-            writes = cast("Mapping[str, ValueType]", spec.writes)
-            types.update({step.writes.get(write, write): vtype for write, vtype in writes.items()})
-        self.info = SimpleNamespace(types=types)
-
-    def resolve_callable(self, step: Step) -> tuple[Tool, ToolSource]:
-        """Look the step's callable up in the one registry, as A2's ``MAS.resolve_callable`` does."""
-        return index_tools(self.tools)[step.uses]
 
 
 META = CallMeta(latency_s=0.5, tokens=TokenUsage(10, 2), cost_usd=0.01)
@@ -138,12 +93,12 @@ def test_a_step_runs_between_agents_with_typed_values() -> None:
     def answer(prompt: str) -> str:
         return "```json\n" + json.dumps(PLAN) + "\n```" if prompt.startswith("Plan") else "A note."
 
-    def build(**kwargs: Any) -> tuple[V2MAS, ToolMockLLM]:
+    def build(**kwargs: Any) -> tuple[MAS, ToolMockLLM]:
         llm = ToolMockLLM()
         llm.responder = answer
         planner = Agent("planner", "Plan a note on {query}.", output="plan", output_type="json", schema=FORM)
         writer = Agent("writer", "Write about {plan} using {counts}.", output="note", inputs=["plan", "counts"])
-        mas = V2MAS(  # A2: MAS(...)
+        mas = MAS(
             [planner, writer],
             # writer is fed by planner and by count, at unequal depth: a barrier, so it runs once
             [("planner", "count"), ("count", "writer"), ("planner", "writer")],
@@ -232,7 +187,7 @@ def test_one_callable_is_a_tool_and_a_step(where: str) -> None:
         if where == "mcp":
             steps.append(Step("size", "tally", reads={"text": "loud"}))
             edges.append(("loud", "size"))
-        mas = V2MAS([writer], edges, steps=steps, llm=llm, tools=tools)  # A2: MAS(...)
+        mas = MAS([writer], edges, steps=steps, llm=llm, tools=tools)
         assert list(index_tools(mas.tools)) == (["shout"] if where == "local" else ["shout", "tally"])
         return mas.run("Tom")
 
@@ -269,7 +224,7 @@ JUDGE_PROMPT = (
 PROSE = "<root>: Invalid JSON: expected value at line 1 column 1"
 
 
-def judge_mas(llm: MetaLLM, tools: list[Any] | None = None) -> V2MAS:
+def judge_mas(llm: MetaLLM, tools: list[Any] | None = None) -> MAS:
     judge = Agent(
         "judge",
         "Judge {query}.",
@@ -278,7 +233,7 @@ def judge_mas(llm: MetaLLM, tools: list[Any] | None = None) -> V2MAS:
         schema=VERDICT,
         tools=["shout"] if tools else None,
     )
-    return V2MAS([judge], [], llm=llm, tools=tools or [])  # A2: MAS(...)
+    return MAS([judge], [], llm=llm, tools=tools or [])
 
 
 @pytest.mark.parametrize("case", ["plain ok after retry", "plain bad twice", "tool agent's extra turn"])

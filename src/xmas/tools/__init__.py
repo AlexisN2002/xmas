@@ -215,6 +215,17 @@ def _schema(model: type[BaseModel], fn: Callable[..., Any]) -> dict[str, Any]:
 # ----------------------------------------------------------------------- Tool
 
 
+def _return_type(fn: Callable[..., Any] | None) -> ValueType:
+    """Return the type a callable's single write has: text for a ``str`` return hint or a remote tool, else json."""
+    if fn is None:
+        return TEXT
+    try:
+        hint = typing.get_type_hints(fn, include_extras=True).get("return")
+    except Exception:  # an unresolvable hint, or no hints at all, says nothing about the type
+        hint = None
+    return type_of_hint(hint)
+
+
 @dataclass(frozen=True)
 class Tool:
     """A function an agent may call, described once.
@@ -227,8 +238,10 @@ class Tool:
             through its source).
         writes: What the tool writes when it runs as a step, ``{write name:
             type}``. Words such as ``"json"`` are read into :class:`~xmas.values.ValueType`
-            at construction, which also fills in ``{name: text}`` for ``None``,
-            so a built tool always holds a ``dict[str, ValueType]``.
+            at construction, which also fills in one write named like the tool
+            for ``None``: text when ``fn``'s return hint is ``str`` or the tool
+            is remote, json otherwise. A built tool always holds a
+            ``dict[str, ValueType]``.
     """
 
     name: str
@@ -242,7 +255,7 @@ class Tool:
         """Reject names the OpenAI ``tools`` payload would refuse, and read the write types."""
         if not TOOL_NAME.match(self.name):
             raise ValueError(f"Tool name {self.name!r} must match {TOOL_NAME.pattern}.")
-        writes = {self.name: TEXT} if self.writes is None else self.writes
+        writes = {self.name: _return_type(self.fn)} if self.writes is None else self.writes
         if not writes:
             raise ValueError(f"Tool {self.name!r} needs at least one write.")
         typed = {key: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for key, vtype in writes.items()}
@@ -353,9 +366,7 @@ def tool(
         if not tool_name or not isinstance(tool_name, str):
             raise ValueError(f"cannot derive a tool name for {func!r}; pass name=")
         model = _build_model(func, descriptions)
-        returns = typing.get_type_hints(func, include_extras=True).get("return")
-        produced = {tool_name: type_of_hint(returns)} if writes is None else writes
-        return Tool(tool_name, summary, _schema(model, func), fn=func, _model=model, writes=produced)
+        return Tool(tool_name, summary, _schema(model, func), fn=func, _model=model, writes=writes)
 
     return describe if fn is None else describe(fn)
 
