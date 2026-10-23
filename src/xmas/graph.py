@@ -42,21 +42,9 @@ def build_graph(
     from :data:`START`. An edge in ``errors`` (a version 2 ``on error`` edge)
     is taken only when a visit fails, so a node whose out-edges are all error
     edges is wired to :data:`END` as well: a visit that succeeds ends there.
-
-    Args:
-        agents: Node names, agents and steps alike, which become the
-            non-sentinel nodes.
-        edges: Directed ``(source, target)`` pairs between agent names. Sentinels
-            may be named explicitly to override the implicit wiring.
-        back: Those of ``edges`` that close a loop.
-        errors: Those of ``edges`` that only a failed visit takes.
-
-    Returns:
-        The topology, including both sentinels.
-
-    Raises:
-        ValueError: If an edge names an unknown agent, or an agent name collides
-            with a sentinel.
+    ``agents`` holds every node name, steps included; an edge may name a
+    sentinel to override the implicit wiring. An edge naming an unknown node,
+    or a node named like a sentinel, raises ValueError.
     """
     reserved = [name for name in agents if name in SENTINELS]
     if reserved:
@@ -93,12 +81,7 @@ def validate_graph(graph: nx.DiGraph[str]) -> None:
     sentinel, every agent reachable from :data:`START`, and every agent reaching
     :data:`END`. An unreachable agent is an error rather than a warning, because
     silently never running is the failure mode hardest to notice in a result.
-
-    Args:
-        graph: The topology to check.
-
-    Raises:
-        ValueError: If the topology is not runnable, naming the offending nodes.
+    The ValueError names the offending nodes.
     """
     for sentinel in (START, END):
         if sentinel not in graph:
@@ -123,15 +106,7 @@ def validate_graph(graph: nx.DiGraph[str]) -> None:
 
 
 def agent_names(graph: nx.DiGraph[str]) -> list[str]:
-    """Return the non-sentinel nodes, in deterministic order.
-
-    Args:
-        graph: The topology.
-
-    Returns:
-        Agent names, topologically sorted where the graph is acyclic and sorted
-        by name otherwise, so serialization is stable.
-    """
+    """Return the non-sentinel nodes, topologically sorted when acyclic and by name otherwise."""
     agents = set(graph.nodes).difference(SENTINELS)
     if nx.is_directed_acyclic_graph(graph):
         return [node for node in nx.topological_sort(graph) if node in agents]
@@ -152,12 +127,6 @@ def back_edges(graph: nx.DiGraph[str]) -> set[tuple[str, str]]:
     owns the loop. Depth-first from :data:`START` with successors taken in sorted
     order picks the edge that runs against the flow, so in ``a -> b -> c`` with
     ``c -> b``, it is ``c -> b`` that becomes the retry and ``c`` that decides.
-
-    Args:
-        graph: The topology.
-
-    Returns:
-        The cycle-closing edges. Empty for a directed acyclic graph.
     """
     found: set[tuple[str, str]] = set()
     finished: set[str] = set()
@@ -446,15 +415,7 @@ def ancestors(graph: nx.DiGraph[str], node: str) -> set[str]:
 
 
 def forward_predecessors(graph: nx.DiGraph[str], node: str) -> set[str]:
-    """Return a node's predecessors excluding those that reach it by a back edge.
-
-    Args:
-        graph: The topology.
-        node: The node to inspect.
-
-    Returns:
-        Predecessors on acyclic paths only.
-    """
+    """Return a node's predecessors excluding those that reach it by a back edge."""
     back = back_edges(graph)
     return {source for source in graph.predecessors(node) if (source, node) not in back}
 
@@ -472,12 +433,6 @@ def join_nodes(graph: nx.DiGraph[str]) -> set[str]:
     fed both from upstream and from the agent that decided to loop, but those two
     never arrive in the same pass, and deferring on the second would hold the node
     until an input that only exists if it runs first.
-
-    Args:
-        graph: The topology.
-
-    Returns:
-        Names of agents with more than one distinct forward predecessor.
     """
     back = back_edges(graph)
     return {
@@ -488,17 +443,7 @@ def join_nodes(graph: nx.DiGraph[str]) -> set[str]:
 
 
 def terminal_agent(graph: nx.DiGraph[str]) -> str:
-    """Return the single agent feeding :data:`END`.
-
-    Args:
-        graph: The topology.
-
-    Returns:
-        The terminal agent's name, whose output is the MAS output.
-
-    Raises:
-        ValueError: If the topology has zero or several terminal agents.
-    """
+    """Return the single agent feeding :data:`END`, whose output is the MAS output; ValueError for none or several."""
     terminals = sorted(graph.predecessors(END))
     if not terminals:
         raise ValueError(f"No agent feeds {END!r}, so the MAS has no output.")
