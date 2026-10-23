@@ -14,6 +14,28 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.tasks.base import MASTask
 
 
+def movable_agents(mas: MAS) -> list[str]:
+    """Return the agents a prompt optimizer may change, in the system's order.
+
+    A frozen agent (``MAS(frozen=...)``) keeps its prompt, model, reads and
+    writes through every optimizer, so it is never a target.
+
+    Args:
+        mas: The system.
+
+    Returns:
+        Every agent not frozen.
+
+    Raises:
+        ValueError: If every agent is frozen, which leaves nothing to optimize.
+    """
+    frozen: frozenset[str] = getattr(mas, "frozen", frozenset())
+    names = [name for name in mas.agents if name not in frozen]
+    if not names:
+        raise ValueError(f"Every agent is frozen ({sorted(frozen)}); there is no prompt to optimize.")
+    return names
+
+
 @runtime_checkable
 class Updater(Protocol):
     """Proposes new values for one kind of component.
@@ -158,7 +180,7 @@ class PromptUpdater:
         The agent with the least credit is the one whose prompt is holding the
         system back, so it is where a prompt change has the most to gain. With no
         credit available, the first agent in graph order is used, which is
-        deterministic and therefore reproducible.
+        deterministic and therefore reproducible. A frozen agent is never chosen.
 
         Args:
             mas: The current system.
@@ -166,10 +188,14 @@ class PromptUpdater:
 
         Returns:
             The chosen agent's name.
+
+        Raises:
+            ValueError: If every agent is frozen.
         """
-        scored = {name: values for name, values in credit.items() if name in mas.agents and values}
+        names = movable_agents(mas)
+        scored = {name: values for name, values in credit.items() if name in names and values}
         if not scored:
-            return next(iter(mas.agents))
+            return names[0]
         return min(scored, key=lambda name: sum(scored[name]) / len(scored[name]))
 
     def propose(self, mas: MAS, credit: dict[str, list[float]], n: int) -> list[MAS]:

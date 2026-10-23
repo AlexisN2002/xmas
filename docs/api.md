@@ -170,10 +170,9 @@ reads and writes), `default_model` and `prompts` (one per agent). Models
 appear by name only and keys never appear; in the `.mas` bundle (phase 5)
 endpoints and keys come from configuration, never from the bundle.
 
-Refused until phase 2b, with a message saying so: conditional edges (`when`,
-`else`, `while`, `switch`, `on error`) and every cycle, boxes, `frozen`,
-`health`, `to_yaml` on a version 2 system, and the topology updater on one.
-`run(query)` needs the inputs to be exactly `{query: text}`.
+Still refused, with a message saying so: `to_yaml` on a version 2 system (its
+file is the `.mas` bundle, phase 5). `run(query)` needs the inputs to be exactly
+`{query: text}`.
 
 ::: xmas.nodes.Step
 
@@ -204,6 +203,66 @@ Refused until phase 2b, with a message saying so: conditional edges (`when`,
       members:
         - check_system
         - SystemInfo
+
+## Version 2: operators, boxes, health
+
+Edges decide where a run goes next. In a spec, a chain `a -> b` is plain (always
+taken); a one-key mapping gives the operator:
+
+- **`when`.** `judge -> publish: {when: verdict.fits}` is taken when the
+  predicate holds, judged on the node's fresh writes.
+- **`else`.** `judge -> apology: else` is taken when no `when`, `while` or
+  `switch` edge of the same node is.
+- **`while`.** `judge -> writer: {when: not verdict.fits, max_visits: 3}` loops
+  back until its target ran `max_visits` times; then the record is `capped` and
+  the next edge decides.
+- **`switch`.** `judge -> shorten: {switch: verdict.action}` is taken when the
+  path equals the case (the target's name unless `case:` says otherwise); a
+  value outside the cases takes `else`.
+- **`on error`.** `count -> apology: {on error: [timeout, outage]}` (or `any`)
+  catches the node's failure of those kinds: the visit keeps a failed record and
+  the run goes on. Budget and stop are never caught.
+
+Predicates are a small language, never `eval`: paths (`verdict.fits`),
+literals, `== != < <= > >= in`, `and or not`, `exists(path)`, `len(x)`,
+`visits`, `cost`, `elapsed`, and registered callables that return a bool. The
+check refuses an unknown name before a run.
+
+A **box** (`Box(name, system, reads, writes)`, spec `boxes:`) runs a whole
+version 2 system as one node: `reads` maps its inputs from outer values,
+`writes` its values back out. It spends from the outer budget, and its record
+holds the inner trace (`Trace.walk()` yields every record with its box path).
+
+`frozen: [judge]` (`MAS(frozen=...)`) keeps a node as it is through every
+optimizer: no prompt, model, read, write or edge of it changes, none removes it.
+The topology search also leaves conditional edges and their endpoints alone,
+keeps steps and boxes, and drops a candidate the check refuses.
+
+Every run gets **health** signals in `Trace.health`, for information only:
+`retried`, `bad_format`, `error_routed`, `empty`, `stuck`, `unfilled`, `leak`,
+`long` and `short` per record, how often each `while` edge was taken, and each
+set budget limit's use. A spec tunes them with `health: {length_factor,
+min_samples, leak}`; a healthy run's trace dict has no `health` key.
+
+`MAS.describe()` returns plain data: every node with its kind, model name,
+reads, writes and `frozen`; every edge with its kind and condition; the join of
+each node fed by several edges; an `id` hashed from it. Like the spec and the
+`.mas` bundle, it names models only: endpoints and keys come from configuration.
+
+::: xmas.predicates
+    options:
+      members:
+        - parse_predicate
+        - Predicate
+        - PredicateError
+
+::: xmas.health
+    options:
+      members:
+        - Health
+        - HealthSettings
+        - Flag
+        - summarize
 
 ## Prompts
 
@@ -299,7 +358,8 @@ that an attributor splits back into per-agent credit.
 The other half of the decomposition: the graph is the component, and the same
 loop improves it. Operators work on the agent-level edge set, with the sentinel
 wiring left to `build_graph`, so a candidate is legal exactly when a `MAS` can be
-built from it.
+built from it. On a version 2 system they move only what `Fixed` leaves free,
+and the system's own check decides which candidates are returned.
 
 ::: xmas.optimization.evolution.EvolutionaryTopologyOptimizer
 
@@ -309,6 +369,7 @@ built from it.
     options:
       members:
         - TopologyBudget
+        - Fixed
         - mutate
         - crossover
         - repair

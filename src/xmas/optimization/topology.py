@@ -19,6 +19,13 @@ fed from ``START``, which the seed's single-source rule forbids and which the
 canonical fan-in-to-consensus shape needs. And the single-terminal rule is
 enforced rather than assumed, because a second agent reaching ``END`` makes the
 system's output ambiguous and xmas refuses to build one.
+
+A version 2 system adds what no operator may touch (:class:`Fixed`): frozen
+nodes and the endpoints of conditional edges keep every edge around them, steps
+and boxes are never removed, and the system keeps the nodes it ends in. The
+operators then move plain edges between free nodes only, and whether a
+candidate runs is :func:`~xmas.check.check_system`'s answer, asked when the
+candidate is built.
 """
 
 from __future__ import annotations
@@ -43,12 +50,15 @@ class TopologyBudget:
     seed's ``GraphSamplingConfig``, minus the fields that only its prompt
     pipeline used.
 
+    The node bounds count every node, steps and boxes included, so a system
+    whose code nodes already fill ``max_agents`` cannot grow.
+
     Attributes:
-        min_agents: Fewest agents a candidate may have.
-        max_agents: Most agents a candidate may have.
-        min_edges: Fewest agent-to-agent edges. ``None`` means ``agents - 1``,
+        min_agents: Fewest nodes a candidate may have.
+        max_agents: Most nodes a candidate may have.
+        min_edges: Fewest node-to-node edges. ``None`` means ``nodes - 1``,
             the least a connected chain needs.
-        max_edges: Most agent-to-agent edges.
+        max_edges: Most node-to-node edges.
         max_cycles: How many non-trivial strongly connected components are
             allowed. Zero, the default, searches directed acyclic graphs only,
             which is also the seed's default.
@@ -80,6 +90,37 @@ class TopologyBudget:
     def floor(self, agents: int) -> int:
         """Return the minimum edge count for a given number of agents."""
         return self.min_edges if self.min_edges is not None else max(agents - 1, 0)
+
+
+@dataclass(frozen=True)
+class Fixed:
+    """What a mutation of a version 2 system leaves where it is.
+
+    The edge set a version 2 system hands the operators holds every edge
+    between nodes as a pair, conditional ones included. Passing a ``Fixed``
+    (rather than ``None``) also switches the validity rules to version 2's: the
+    candidate keeps the parent's ends instead of having exactly one, the cycles
+    a ``while`` edge closes are not counted, and runnability is left to the
+    system's own check.
+
+    Attributes:
+        nodes: Frozen nodes and the endpoints of conditional edges. No operator
+            adds, removes or moves an edge touching one, or removes the node.
+        code: Steps and boxes. Their plain edges may move, but they are never
+            removed: only agents are invented and dropped.
+        terminals: The nodes the parent ends in. A candidate ends in the same
+            ones, so what reaches the end of a run stays the parent's.
+        conditional: The conditional edges, as pairs.
+    """
+
+    nodes: frozenset[str] = frozenset()
+    code: frozenset[str] = frozenset()
+    terminals: frozenset[str] = frozenset()
+    conditional: frozenset[tuple[str, str]] = frozenset()
+
+    def holds(self, edge: tuple[str, str]) -> bool:
+        """Whether an edge touches a fixed node, so that no operator may change it."""
+        return edge[0] in self.nodes or edge[1] in self.nodes
 
 
 def agent_edges(graph: nx.DiGraph[str]) -> Edges:
@@ -195,13 +236,14 @@ def is_buildable(names: list[str], edges: Edges, entry: str | None = None) -> bo
     return True
 
 
-def within_budget(names: list[str], edges: Edges, budget: TopologyBudget) -> bool:
+def within_budget(names: list[str], edges: Edges, budget: TopologyBudget, fixed: Fixed | None = None) -> bool:
     """Check a candidate against the budget's numeric bounds only.
 
     Args:
-        names: The candidate's agent names.
-        edges: Its agent-level edge set.
+        names: The candidate's node names.
+        edges: Its node-level edge set.
         budget: The bounds.
+        fixed: What a version 2 parent holds still; ``None`` for version 1.
 
     Returns:
         Whether the candidate is inside the budget.
@@ -210,6 +252,14 @@ def within_budget(names: list[str], edges: Edges, budget: TopologyBudget) -> boo
         return False
     if not budget.floor(len(names)) <= len(edges) <= budget.max_edges:
         return False
+    if fixed is not None:
+        # Version 2 may end in several alternatives (switch branches that join
+        # at the end), so the rule is "the parent's ends", and no fixed or code
+        # node may have gone missing. A loop closed by a `while` edge is the
+        # parent's, not the search's, so only plain cycles count.
+        if not fixed.nodes | fixed.code <= set(names) or set(terminals(names, edges)) != fixed.terminals:
+            return False
+        return cycles(names, [edge for edge in edges if edge not in fixed.conditional]) <= budget.max_cycles
     # Zero terminals is legal: a fully cyclic topology has its exit named by
     # `mas_edges`. Two or more is not, because the system's output would be
     # ambiguous and a MAS refuses to build one.
@@ -218,52 +268,65 @@ def within_budget(names: list[str], edges: Edges, budget: TopologyBudget) -> boo
     return cycles(names, edges) <= budget.max_cycles
 
 
-def is_valid(names: list[str], edges: Edges, budget: TopologyBudget, entry: str | None = None) -> bool:
+def is_valid(
+    names: list[str], edges: Edges, budget: TopologyBudget, entry: str | None = None, fixed: Fixed | None = None
+) -> bool:
     """Check a candidate against both the budget and the core's runnability rules.
 
     The single predicate the sampler, the operators and the search loop all use,
-    so that "legal topology" means one thing across the package.
+    so that "legal topology" means one thing across the package. A version 2
+    candidate is checked against the budget here and by
+    :func:`~xmas.check.check_system` when it is built, which knows its
+    conditional edges, joins and reads.
 
     Args:
-        names: The candidate's agent names.
-        edges: Its agent-level edge set.
+        names: The candidate's node names.
+        edges: Its node-level edge set.
         budget: The bounds.
         entry: Preferred entry agent.
+        fixed: What a version 2 parent holds still; ``None`` for version 1.
 
     Returns:
         Whether the candidate is legal.
     """
-    return within_budget(names, edges, budget) and is_buildable(names, edges, entry)
+    return within_budget(names, edges, budget, fixed) and (fixed is not None or is_buildable(names, edges, entry))
 
 
 # ------------------------------------------------------------------ operators
 
 
-def add_edge(names: list[str], edges: Edges, rng: random.Random) -> Edges:
-    """Add one edge between two agents that do not already have one."""
+def add_edge(names: list[str], edges: Edges, rng: random.Random, fixed: Fixed | None = None) -> Edges:
+    """Add one edge between two nodes that do not already have one, neither of them fixed."""
     present = set(edges)
+    held = fixed.nodes if fixed is not None else frozenset()
     options = [
-        (source, target) for source in names for target in names if source != target and (source, target) not in present
+        (source, target)
+        for source in names
+        for target in names
+        if source != target and (source, target) not in present and source not in held and target not in held
     ]
     if not options:
         return list(edges)
     return sorted([*edges, rng.choice(options)])
 
 
-def remove_edge(names: list[str], edges: Edges, rng: random.Random) -> Edges:  # noqa: ARG001
-    """Remove one edge."""
-    if not edges:
+def remove_edge(names: list[str], edges: Edges, rng: random.Random, fixed: Fixed | None = None) -> Edges:  # noqa: ARG001
+    """Remove one edge that touches no fixed node."""
+    movable = [edge for edge in edges if fixed is None or not fixed.holds(edge)]
+    if not movable:
         return list(edges)
-    dropped = rng.choice(edges)
+    dropped = rng.choice(movable)
     return [edge for edge in edges if edge != dropped]
 
 
-def rewire_edge(names: list[str], edges: Edges, rng: random.Random) -> Edges:
+def rewire_edge(names: list[str], edges: Edges, rng: random.Random, fixed: Fixed | None = None) -> Edges:
     """Move one edge somewhere else, keeping the edge count unchanged."""
-    return add_edge(names, remove_edge(names, edges, rng), rng)
+    return add_edge(names, remove_edge(names, edges, rng, fixed), rng, fixed)
 
 
-def add_agent(names: list[str], edges: Edges, rng: random.Random) -> tuple[list[str], Edges]:
+def add_agent(
+    names: list[str], edges: Edges, rng: random.Random, fixed: Fixed | None = None
+) -> tuple[list[str], Edges]:
     """Insert a new agent upstream of the terminal.
 
     The new agent is wired before the current terminal and, where there is one to
@@ -276,8 +339,18 @@ def add_agent(names: list[str], edges: Edges, rng: random.Random) -> tuple[list[
     drew this operator on a one-agent system used to be discarded and the search
     could not grow past its first node. With no other agent available the new one
     simply has no predecessor, and becomes the entry.
+
+    A version 2 system keeps its ends, so there the new agent goes beside a
+    movable edge ``a -> b`` instead, as ``a -> new -> b``: it reads what ``a``
+    writes, ``b`` gains it as an input, and no terminal or cycle appears.
     """
     name = next_name(names)
+    if fixed is not None:
+        movable = [edge for edge in edges if not fixed.holds(edge)]
+        if not movable:
+            return list(names), list(edges)
+        source, target = rng.choice(movable)
+        return [*names, name], sorted({*edges, (source, name), (name, target)})
     terminal = terminals(names, edges)
     if not terminal:
         return list(names), list(edges)
@@ -289,14 +362,23 @@ def add_agent(names: list[str], edges: Edges, rng: random.Random) -> tuple[list[
     return [*names, name], sorted(grown)
 
 
-def remove_agent(names: list[str], edges: Edges, rng: random.Random) -> tuple[list[str], Edges]:
+def remove_agent(
+    names: list[str], edges: Edges, rng: random.Random, fixed: Fixed | None = None
+) -> tuple[list[str], Edges]:
     """Drop an agent, bridging its predecessors to its successors.
 
     Bridging rather than simply deleting is what keeps the rest of the graph
-    connected, and it is the seed's behaviour.
+    connected, and it is the seed's behaviour. Fixed nodes, steps and boxes are
+    never dropped, nor an agent next to a fixed node, whose edge is fixed too.
     """
     terminal = terminals(names, edges)
     removable = [name for name in names if name not in terminal]
+    if fixed is not None:
+        removable = [
+            name
+            for name in removable
+            if name not in fixed.nodes | fixed.code and not any(fixed.holds(edge) for edge in edges if name in edge)
+        ]
     if len(names) <= 1 or not removable:
         return list(names), list(edges)
 
@@ -327,6 +409,7 @@ def mutate(
     rng: random.Random,
     operations: int = 1,
     entry: str | None = None,
+    fixed: Fixed | None = None,
 ) -> tuple[list[str], Edges]:
     """Apply a sequence of operators, retrying the sequence if it lands outside the budget.
 
@@ -344,6 +427,7 @@ def mutate(
         operations: How many operators to apply in one mutation step.
         entry: The parent's entry agent, preferred for the child when the child's
             entry is inside a cycle and has to be named.
+        fixed: What a version 2 parent holds still; ``None`` for version 1.
 
     Returns:
         The mutated names and edges, or the parent's unchanged.
@@ -351,8 +435,8 @@ def mutate(
     for _ in range(3):
         current_names, current_edges = list(names), list(edges)
         for _ in range(max(1, operations)):
-            current_names, current_edges = _apply_one(current_names, current_edges, budget, rng)
-        if is_valid(current_names, current_edges, budget, entry):
+            current_names, current_edges = _apply_one(current_names, current_edges, budget, rng, fixed)
+        if is_valid(current_names, current_edges, budget, entry, fixed):
             return current_names, current_edges
     return list(names), list(edges)
 
@@ -362,6 +446,7 @@ def _apply_one(
     edges: Edges,
     budget: TopologyBudget,
     rng: random.Random,
+    fixed: Fixed | None = None,
 ) -> tuple[list[str], Edges]:
     """Pick one operator that the budget still has room for, and apply it."""
     edge_ops = []
@@ -379,8 +464,8 @@ def _apply_one(
 
     choice = rng.randrange(len(edge_ops) + len(node_ops))
     if choice < len(edge_ops):
-        return list(names), edge_ops[choice](names, edges, rng)
-    return node_ops[choice - len(edge_ops)](names, edges, rng)
+        return list(names), edge_ops[choice](names, edges, rng, fixed)
+    return node_ops[choice - len(edge_ops)](names, edges, rng, fixed)
 
 
 # ----------------------------------------------------------------- crossover
@@ -405,8 +490,13 @@ def crossover(
     budget: TopologyBudget,
     rng: random.Random,
     entry: str | None = None,
+    fixed: Fixed | None = None,
 ) -> tuple[list[str], Edges]:
     """Recombine two topologies into one that inherits from both.
+
+    A version 2 child keeps the first parent's fixed edges and inherits only
+    movable ones. It is not repaired, because the repair reshapes the graph
+    around one terminal; an attempt outside the rules is retried instead.
 
     Args:
         first: One parent's names and edges.
@@ -414,6 +504,8 @@ def crossover(
         budget: The bounds the child must stay inside.
         rng: Source of randomness.
         entry: Preferred entry agent for the child.
+        fixed: What the first parent, a version 2 system, holds still; ``None``
+            for version 1.
 
     Returns:
         The child's names and edges, falling back to the first parent when no
@@ -425,8 +517,12 @@ def crossover(
         inherited = {
             edge for edge in first[1] if edge[0] in known and edge[1] in known and rng.random() < KEEP_FROM_FIRST
         } | {edge for edge in second[1] if edge[0] in known and edge[1] in known and rng.random() < KEEP_FROM_SECOND}
-        child = repair(names, sorted(inherited), budget, rng)
-        if is_valid(names, child, budget, entry):
+        if fixed is None:
+            child = repair(names, sorted(inherited), budget, rng)
+        else:
+            held = {edge for edge in first[1] if fixed.holds(edge) and edge[0] in known and edge[1] in known}
+            child = sorted(held | {edge for edge in inherited if not fixed.holds(edge)})
+        if is_valid(names, child, budget, entry, fixed):
             return names, child
     return list(first[0]), list(first[1])
 

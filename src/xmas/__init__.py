@@ -15,6 +15,7 @@ from xmas.budget import Budget
 from xmas.edges import Edge
 from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, RunStatus
 from xmas.graph import END, START
+from xmas.health import Health, HealthSettings
 from xmas.llms import APILLM, ScoredSequence
 from xmas.mas import MAS
 from xmas.nodes import Step
@@ -39,6 +40,8 @@ __all__ = [
     "Edge",
     "ErrorKind",
     "GSM8KTask",
+    "Health",
+    "HealthSettings",
     "MASTask",
     "ProbingTask",
     "ReferencePool",
