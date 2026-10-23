@@ -18,7 +18,7 @@ from xmas.graph import END, START
 from xmas.health import Health, HealthSettings
 from xmas.llms import APILLM, ScoredSequence
 from xmas.mas import MAS
-from xmas.nodes import Step
+from xmas.nodes import Box, Step
 from xmas.tasks import GSM8KTask, MASTask, ProbingTask, ReferencePool
 from xmas.trace import AgentRecord, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType
@@ -35,6 +35,7 @@ __all__ = [
     "Agent",
     "AgentRecord",
     "BadFormat",
+    "Box",
     "Budget",
     "BudgetExceeded",
     "Edge",

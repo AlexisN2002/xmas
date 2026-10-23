@@ -151,7 +151,10 @@ version 2 system can do:
   agent answer in JSON. Its prompt ends with format lines no optimizer can
   drop; an answer that does not fit gets exactly one retry, then the run fails
   with `BadFormat` (kind `bad_format`). The record keeps the rejected answer.
-- **Joins.** A node fed by several edges waits for all of them and runs once.
+- **Merges and joins.** A node fed by several edges is a merge when its edges
+  never arrive in one pass (it runs on whichever arrives) or a join when it
+  waits for one edge of every group (it runs once per pass); the check refuses
+  any other node and says which edges clash.
 - **Checked when built.** `check_system` lists every problem at once: a read
   nobody writes before the node runs, two writers of one value (unless
   `state={value: {"merge": "last"}}`), a placeholder that is not a read, a type
@@ -164,9 +167,10 @@ The answer-form dialect, one entry per field:
 an object or a list's objects.
 
 A version 2 spec (`version: 2`) has the keys `inputs`, `agents` (`reads`,
-`writes: {name: type}`, `schema`, `tools`, `model`), `steps`, `edges` (a
-string is a chain, `a -> b -> c`), `state`, `callables` (what each callable
-reads and writes), `default_model` and `prompts` (one per agent). Models
+`writes: {name: type}`, `schema`, `tools`, `model`), `steps`, `boxes`, `edges`
+(a string is a chain, `a -> b -> c`), `state`, `frozen`, `health`, `callables`
+(what each callable reads and writes), `default_model` and `prompts` (one per
+agent). Models
 appear by name only and keys never appear; in the `.mas` bundle (phase 5)
 endpoints and keys come from configuration, never from the bundle.
 
@@ -232,6 +236,8 @@ A **box** (`Box(name, system, reads, writes)`, spec `boxes:`) runs a whole
 version 2 system as one node: `reads` maps its inputs from outer values,
 `writes` its values back out. It spends from the outer budget, and its record
 holds the inner trace (`Trace.walk()` yields every record with its box path).
+
+::: xmas.nodes.Box
 
 `frozen: [judge]` (`MAS(frozen=...)`) keeps a node as it is through every
 optimizer: no prompt, model, read, write or edge of it changes, none removes it.
