@@ -11,9 +11,8 @@ import pytest
 from openai.types.chat import ChatCompletion
 from promptolution.llms import api_llm as _promptolution
 
-from xmas import MAS, Agent, AgentRecord, Budget, TokenUsage, runtime
-from xmas.budget import RunMeter
-from xmas.errors import BudgetExceeded, EmptyResponse, ErrorKind, XmasError
+from xmas import MAS, Agent, AgentRecord, Budget, TokenUsage
+from xmas.errors import EmptyResponse, ErrorKind, XmasError
 from xmas.llms.api_llm import APILLM
 from xmas.llms.meta import TokenPrice, supports_meta
 from xmas.tools import ToolCallRequest
@@ -115,7 +114,7 @@ def test_score_rejects_an_empty_continuation() -> None:
 
 @requires_gateway
 def test_score_against_the_live_gateway() -> None:
-    """Env-gated. Skips when the gateway cannot score, which is true today.
+    """Env-gated. Skips while the gateway cannot score.
 
     Every model in the gateway's registry declares ``echo_score: false``, so
     ``/v1/score`` answers 501. This test is written so that it starts genuinely
@@ -323,16 +322,6 @@ def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch
 
 
 def test_the_paid_attempts_behind_an_empty_answer_reach_the_meter(monkeypatch: pytest.MonkeyPatch) -> None:
-    meters: list[RunMeter] = []
-
-    class KeptMeter(RunMeter):
-        """A run meter the test can read after the run."""
-
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            meters.append(self)
-
-    monkeypatch.setattr(runtime, "RunMeter", KeptMeter)
     paid = {**USAGE, "cost": 0.01}
     no_choice = ChatCompletion.model_validate({**answer("x", usage=paid).model_dump(), "choices": []})
 
@@ -344,22 +333,22 @@ def test_the_paid_attempts_behind_an_empty_answer_reach_the_meter(monkeypatch: p
     assert len(sent) == 6
     assert raised.value.meta.cost_usd == pytest.approx(6 * 0.01)
 
-    # a plain agent and a tool agent: the run fails, and its meter counted what the attempts cost, so a
-    # cost limit of 0.05 refuses the next call only because of them
+    # a plain agent and a tool agent: the run fails, and its meter counted one call that cost what the six
+    # attempts cost, over a cost limit of 0.05 only because of them
     plain = Agent("solver", "Solve {query}", output="answer")
     with_tools = Agent("coder", "Do {query}", output="answer", tools=["add"])
-    # the plain call fails as promptolution's batch call does on main; a tool turn raises its own error
+    # the plain call fails as promptolution's batch call does; a tool turn raises its own error
     for agent, script, form in (
         (plain, [answer(None, usage=paid)] * 6, "RuntimeError: LLM batch failed: "),
         (with_tools, [no_choice] * 6, "EmptyResponse: "),
     ):
         llm, sent = recording_llm(monkeypatch, list(script))
-        trace = MAS([agent], llm=llm, tools=[add], budget=Budget(max_cost_usd=0.05)).run("q")
+        trace = MAS([agent], llm=llm, tools=[add], budget=Budget(max_calls=10, max_cost_usd=0.05)).run("q")
         assert trace.error is not None
         assert trace.error.startswith(f"{form}Empty content from model after 6 attempts")
         assert (len(sent), trace.records) == (6, ())
-        meter = meters[-1]
-        assert (meter.calls, meter.uncosted_calls) == (1, 0)
-        assert meter.cost_usd == pytest.approx(6 * 0.01)
-        with pytest.raises(BudgetExceeded, match=r"^cost_usd 0\.06 >= max 0\.05 before call 2$"):
-            meter.before_call()
+        assert trace.health is not None
+        assert trace.health.budget == {
+            "calls": {"spent": 1, "limit": 10},
+            "cost_usd": {"spent": pytest.approx(6 * 0.01), "limit": 0.05},
+        }
