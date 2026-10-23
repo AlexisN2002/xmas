@@ -9,8 +9,9 @@ the exact degenerate case, so promptolution's optimizers plug in unchanged.
 
 !!! note "Beta"
 
-    Inference, the optimization loop, CANTANTE and topology search are in place; the
-    experiment layer is still to come.
+    Inference, the optimization loop, CANTANTE, topology search, code steps, JSON
+    answers, conditions, loops, budgets and health are in place. The `.mas` folder,
+    values beyond text, people in the graph and the experiment layer are still to come.
 
 ## Where to start
 
