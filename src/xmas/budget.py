@@ -105,19 +105,36 @@ class RunMeter:
                 in that order.
         """
         with self._lock:
-            budget = self.budget
-            if budget is not None:
-                if budget.max_calls is not None and self.calls >= budget.max_calls:
-                    raise BudgetExceeded("calls", self.calls, budget.max_calls, self.calls)
-                elapsed = self.elapsed_s
-                if budget.max_wall_s is not None and elapsed >= budget.max_wall_s:
-                    raise BudgetExceeded("wall_s", elapsed, budget.max_wall_s, self.calls)
-                if budget.max_cost_usd is not None:
-                    if self.uncosted_calls > 0:
-                        raise BudgetExceeded("cost_unknown", self.uncosted_calls, budget.max_cost_usd, self.calls)
-                    if self.cost_usd >= budget.max_cost_usd:
-                        raise BudgetExceeded("cost_usd", self.cost_usd, budget.max_cost_usd, self.calls)
+            self._check(count_calls=True)
             self.calls += 1
+
+    def check_boundary(self) -> None:
+        """Check the wall and cost limits before work that makes no model call, such as a step.
+
+        Nothing is counted: ``max_calls`` limits model calls only.
+
+        Raises:
+            BudgetExceeded: If the run has run for ``max_wall_s``, has a cost
+                limit and a call of unknown cost, or has spent ``max_cost_usd``.
+        """
+        with self._lock:
+            self._check(count_calls=False)
+
+    def _check(self, *, count_calls: bool) -> None:
+        """Raise for the first limit reached, the call limit only when ``count_calls``; the caller holds the lock."""
+        budget = self.budget
+        if budget is None:
+            return
+        if count_calls and budget.max_calls is not None and self.calls >= budget.max_calls:
+            raise BudgetExceeded("calls", self.calls, budget.max_calls, self.calls)
+        elapsed = self.elapsed_s
+        if budget.max_wall_s is not None and elapsed >= budget.max_wall_s:
+            raise BudgetExceeded("wall_s", elapsed, budget.max_wall_s, self.calls)
+        if budget.max_cost_usd is not None:
+            if self.uncosted_calls > 0:
+                raise BudgetExceeded("cost_unknown", self.uncosted_calls, budget.max_cost_usd, self.calls)
+            if self.cost_usd >= budget.max_cost_usd:
+                raise BudgetExceeded("cost_usd", self.cost_usd, budget.max_cost_usd, self.calls)
 
     def after_call(self, meta: CallMeta | None) -> None:
         """Add a finished call's cost, or count it as uncosted when it is unknown.

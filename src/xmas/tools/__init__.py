@@ -15,6 +15,11 @@ agent's record. A tool that fails is data (the model sees the error and may try
 again); a source that refuses the caller ends the run. A call identical to one
 that already succeeded in the same loop is not run again: the model gets the
 earlier result back under a short note (see ``DEDUPE_TOOL_CALLS``).
+
+The same registry serves steps (version 2): a :class:`~xmas.nodes.Step` names a
+tool in ``uses`` and :func:`run_step` runs it with values from the graph, so one
+callable can be offered to agents and run as a node, described once. A tool
+reads its parameters (:attr:`Tool.reads`) and writes :attr:`Tool.writes`.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ import inspect
 import json
 import re
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast, overload, runtime_checkable
 
@@ -32,9 +37,11 @@ import openai
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
-from xmas.errors import MONEY_WORDS, EmptyResponse, ErrorKind
+from xmas.errors import MONEY_WORDS, BadFormat, EmptyResponse, ErrorKind
 from xmas.prompts import safe_format
+from xmas.schemas import RETRY_NOTE
 from xmas.trace import AgentRecord, TokenUsage, ToolCall
+from xmas.values import TEXT, ValueType, check_value, parse_type, type_of_hint
 
 if TYPE_CHECKING:  # pragma: no cover
     from openai.types.chat import ChatCompletion
@@ -56,6 +63,7 @@ __all__ = [
     "ToolCallRequest",
     "ToolError",
     "ToolSource",
+    "run_step",
     "tool",
 ]
 
@@ -217,6 +225,10 @@ class Tool:
         parameters: JSON Schema of the arguments object.
         fn: The implementation for a local tool, ``None`` for a remote one (called
             through its source).
+        writes: What the tool writes when it runs as a step, ``{write name:
+            type}``. Words such as ``"json"`` are read into :class:`~xmas.values.ValueType`
+            at construction, which also fills in ``{name: text}`` for ``None``,
+            so a built tool always holds a ``dict[str, ValueType]``.
     """
 
     name: str
@@ -224,11 +236,23 @@ class Tool:
     parameters: dict[str, Any]
     fn: Callable[..., Any] | None = None
     _model: type[BaseModel] | None = field(default=None, compare=False, repr=False)
+    writes: Mapping[str, ValueType | str] | None = None
 
     def __post_init__(self) -> None:
-        """Reject names the OpenAI ``tools`` payload would refuse."""
+        """Reject names the OpenAI ``tools`` payload would refuse, and read the write types."""
         if not TOOL_NAME.match(self.name):
             raise ValueError(f"Tool name {self.name!r} must match {TOOL_NAME.pattern}.")
+        writes = {self.name: TEXT} if self.writes is None else self.writes
+        if not writes:
+            raise ValueError(f"Tool {self.name!r} needs at least one write.")
+        typed = {key: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for key, vtype in writes.items()}
+        object.__setattr__(self, "writes", typed)
+
+    @property
+    def reads(self) -> dict[str, ValueType]:
+        """The type each parameter reads when the tool runs as a step: text for a ``string``, else json."""
+        properties = self.parameters.get("properties") or {}
+        return {name: type_of_hint(schema) for name, schema in properties.items()}
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Call ``fn`` directly, so a decorated function stays a function.
@@ -286,15 +310,18 @@ class Tool:
 
 
 @overload
-def tool(fn: Callable[..., Any], /) -> Tool: ...
+def tool(fn: Callable[..., Any], /, *, name: str | None = None, writes: Mapping[str, str] | None = None) -> Tool: ...
 @overload
-def tool(*, name: str | None = None) -> Callable[[Callable[..., Any]], Tool]: ...
 def tool(
-    fn: Callable[..., Any] | None = None, /, *, name: str | None = None
+    *, name: str | None = None, writes: Mapping[str, str] | None = None
+) -> Callable[[Callable[..., Any]], Tool]: ...
+def tool(
+    fn: Callable[..., Any] | None = None, /, *, name: str | None = None, writes: Mapping[str, str] | None = None
 ) -> Tool | Callable[[Callable[..., Any]], Tool]:
     """Declare a function as a tool.
 
-    Usable bare (``@tool``) or with a name (``@tool(name="add")``).
+    Usable bare (``@tool``) or with keywords (``@tool(name="add")``,
+    ``@tool(writes={"counts": "json"})``).
 
     Args:
         fn: A function with a type hint on every parameter and a docstring whose
@@ -302,9 +329,13 @@ def tool(
             positional-only parameters are rejected. Google-style ``Args:``
             entries become the parameter descriptions.
         name: Tool name. Defaults to ``fn.__name__``.
+        writes: What the tool writes as a step, ``{write name: type}``. Defaults
+            to one write named like the tool: text when the return hint is
+            ``str``, else json. Several writes need ``fn`` to return a mapping
+            with exactly those keys.
 
     Returns:
-        The :class:`Tool`, or a decorator producing one when only ``name`` is given.
+        The :class:`Tool`, or a decorator producing one when ``fn`` is not given.
 
     Raises:
         ValueError: If the function cannot be described (missing hint or
@@ -322,7 +353,9 @@ def tool(
         if not tool_name or not isinstance(tool_name, str):
             raise ValueError(f"cannot derive a tool name for {func!r}; pass name=")
         model = _build_model(func, descriptions)
-        return Tool(tool_name, summary, _schema(model, func), fn=func, _model=model)
+        returns = typing.get_type_hints(func, include_extras=True).get("return")
+        produced = {tool_name: type_of_hint(returns)} if writes is None else writes
+        return Tool(tool_name, summary, _schema(model, func), fn=func, _model=model, writes=produced)
 
     return describe if fn is None else describe(fn)
 
@@ -477,6 +510,64 @@ def select_tools(index: ToolIndex, agent: Agent, llm: BaseLLM | None) -> ToolInd
             f"Agent {agent.name!r} uses tools, but its model {type(llm).__name__} has no get_tool_response."
         )
     return {name: index[name] for name in agent.tools}
+
+
+# ---------------------------------------------------------------------- steps
+
+
+def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Run a callable as a step and return what it writes.
+
+    The arguments are checked with :meth:`Tool.validate`. A local tool's ``fn``
+    is then called here, not through :meth:`LocalTools.call`, which would turn
+    its result into text; a remote tool runs through ``source.call``, and a json
+    write is the JSON its text holds. One write takes the whole result; several
+    need a mapping with exactly those keys. Every write is checked against its
+    type.
+
+    Args:
+        spec: The callable, as the registry describes it.
+        source: The source that offers it.
+        arguments: ``{parameter: value}``; a parameter left out takes its default.
+
+    Returns:
+        ``{write: value}``, keyed by the callable's own write names.
+
+    Raises:
+        ToolError: If the arguments do not match the parameters, or a remote
+            tool failed.
+        BadFormat: If the result does not fit the writes; it names the callable.
+        Exception: Whatever a local ``fn`` raised, unchanged, so its kind can
+            be classified.
+    """
+    writes = cast("dict[str, ValueType]", spec.writes)
+    kwargs = spec.validate(arguments)
+    if spec.fn is not None:
+        result = spec.fn(**kwargs)
+    else:
+        text = source.call(spec.name, kwargs)
+        if len(writes) == 1 and next(iter(writes.values())) == TEXT:
+            result = text
+        else:
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise BadFormat(spec.name, (f"the result is not JSON: {exc}",)) from exc
+    if len(writes) == 1:
+        produced = {next(iter(writes)): result}
+    elif isinstance(result, Mapping) and set(result) == set(writes):
+        produced = dict(result)
+    else:
+        got = sorted(result) if isinstance(result, Mapping) else type(result).__name__
+        raise BadFormat(spec.name, (f"expected a mapping with keys {sorted(writes)}, got {got}",))
+    problems = [
+        f"{name}: {problem}"
+        for name, value in produced.items()
+        if (problem := check_value(value, writes[name])) is not None
+    ]
+    if problems:
+        raise BadFormat(spec.name, ("; ".join(problems),))
+    return produced
 
 
 # ------------------------------------------------------------------ model side
@@ -662,6 +753,7 @@ def run_tool_loop(
     system_prompt: str,
     count_tokens: Callable[[str], float],
     meter: RunMeter | None = None,
+    check: Callable[[str], str | None] | None = None,
 ) -> tuple[str, tuple[ToolCall, ...], TokenUsage, CallMeta | None]:
     """Answer one rendered prompt, letting the model call tools.
 
@@ -670,6 +762,11 @@ def run_tool_loop(
     withheld forces a text answer. With ``DEDUPE_TOOL_CALLS``, a call equal to one
     that already succeeded in this loop is not run again; it is answered, and
     recorded, with the earlier result under ``REPEATED_CALL_NOTE``.
+
+    With ``check``, the final answer is checked once: when ``check`` names a
+    problem, the answer stays in the conversation and one more turn, tools
+    withheld, asks again with :data:`~xmas.schemas.RETRY_NOTE`. That second
+    answer is returned unchecked; the caller parses it.
 
     Every model turn is checked against the run's budget before it starts. A
     model that returns call metadata (see :func:`xmas.llms.meta.supports_meta`)
@@ -684,6 +781,7 @@ def run_tool_loop(
         system_prompt: The system message, as a plain agent's call would send.
         count_tokens: Token counter for the agent's model.
         meter: The run's meter, or ``None`` outside a metered run.
+        check: Says why an answer is refused, or ``None`` when it is accepted.
 
     Returns:
         The final text, the calls made, the approximate usage over all turns, and
@@ -729,10 +827,18 @@ def run_tool_loop(
         usage = usage + TokenUsage(input_tokens=sent, output_tokens=received)
         return text, requests
 
+    def checked(text: str) -> str:
+        problem = None if check is None else check(text)
+        if problem is None:
+            return text
+        messages.append({"role": "assistant", "content": text})
+        messages.append({"role": "user", "content": RETRY_NOTE.format(problem=problem)})
+        return turn([])[0]
+
     for _ in range(max_rounds):
         text, requests = turn(specs)
         if not requests:
-            return text, tuple(calls), usage, meta
+            return checked(text), tuple(calls), usage, meta
         messages.append({"role": "assistant", "content": text or None, "tool_calls": [_wire(r) for r in requests]})
         for request in requests:
             key = _call_key(tools, request) if DEDUPE_TOOL_CALLS else None
@@ -746,7 +852,7 @@ def run_tool_loop(
             calls.append(call)
             messages.append({"role": "tool", "tool_call_id": request.id, "content": call.result})
     text, _ = turn([])
-    return text, tuple(calls), usage, meta
+    return checked(text), tuple(calls), usage, meta
 
 
 def tool_body(
