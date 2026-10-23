@@ -668,7 +668,6 @@ class MAS(BasePredictor):
             "nodes": [self._describe_node(name, node) for name, node in self.nodes.items()],
             "edges": [self._describe_edge(pair, declared.get(pair), pair in loops) for pair in ordered],
             "joins": joins,
-            "groups": [],
         }
         canonical = json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         description["id"] = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()

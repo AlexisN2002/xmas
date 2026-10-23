@@ -451,8 +451,8 @@ def test_describe_is_plain_data_that_names_every_node_and_edge() -> None:
     mas = load(example())
     described = mas.describe()
     assert json.loads(json.dumps(described)) == described
-    assert set(described) == {"version", "inputs", "nodes", "edges", "joins", "groups", "id"}
-    assert (described["version"], described["inputs"], described["groups"]) == (2, {"query": "text"}, [])
+    assert set(described) == {"version", "inputs", "nodes", "edges", "joins", "id"}
+    assert (described["version"], described["inputs"]) == (2, {"query": "text"})
     assert described["joins"] == {"publish": "merge", "apology": "merge", END: "merge"}
     assert described["id"].startswith("sha256:") and len(described["id"]) == 71
 
