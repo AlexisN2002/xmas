@@ -29,10 +29,9 @@ def movable_agents(mas: MAS) -> list[str]:
     Raises:
         ValueError: If every agent is frozen, which leaves nothing to optimize.
     """
-    frozen: frozenset[str] = getattr(mas, "frozen", frozenset())
-    names = [name for name in mas.agents if name not in frozen]
+    names = [name for name in mas.agents if name not in mas.frozen]
     if not names:
-        raise ValueError(f"Every agent is frozen ({sorted(frozen)}); there is no prompt to optimize.")
+        raise ValueError(f"Every agent is frozen ({sorted(mas.frozen)}); there is no prompt to optimize.")
     return names
 
 

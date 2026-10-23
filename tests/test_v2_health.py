@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from typing import Any
 
 from xmas.budget import Budget, RunMeter
 from xmas.errors import ErrorKind
 from xmas.health import Flag, Health, HealthSettings, summarize
-from xmas.trace import AgentRecord
+from xmas.trace import AgentRecord, Rejected
 
 
 def rec(
@@ -22,17 +21,14 @@ def rec(
     error_kind: ErrorKind | None = None,
     **later: Any,
 ) -> AgentRecord:
-    """Build a record; fields newer than phase 1 (rejected, error, route, capped) are set as attributes."""
+    """Build a record; ``later`` sets the fields phase 2 added (rejected, error, route, capped)."""
     outputs = {} if output is None else {"out": output}
-    record = AgentRecord(agent, step, prompt, prompt, inputs or {}, outputs, error_kind=error_kind)
-    for name, value in later.items():
-        object.__setattr__(record, name, value)
-    return record
+    return AgentRecord(agent, step, prompt, prompt, inputs or {}, outputs, error_kind=error_kind, **later)
 
 
 RECORDS = (
     rec("w", 0, "a" * 9, prompt="Write {query}", inputs={"query": "cats"}),
-    rec("judge", 1, '{"fits": false}', rejected=(SimpleNamespace(error="<root>: Invalid JSON"),), route=("w",)),
+    rec("judge", 1, '{"fits": false}', rejected=(Rejected("Sure.", "<root>: Invalid JSON"),), route=("w",)),
     rec("w", 2, "b" * 9),
     rec("judge", 3, '{"fits": false}', route=("w",)),
     rec("w", 4, "c" * 9),

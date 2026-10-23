@@ -298,14 +298,13 @@ class GraphUpdater:
         Returns:
             Reads per agent, invented ones included, in node order.
         """
-        boxes = getattr(mas, "boxes", {})
         writes: dict[str, set[str]] = {
-            name: {self.output_of(mas, name)} for name in names if name not in mas.steps and name not in boxes
+            name: {self.output_of(mas, name)} for name in names if name not in mas.steps and name not in mas.boxes
         }
         agents = list(writes)
         for name, step in mas.steps.items():
             writes[name] = set(step_maps(step, mas.resolve_callable(step)[0])[1].values())
-        for name, box in boxes.items():
+        for name, box in mas.boxes.items():
             writes[name] = set(box.writes.values())
 
         graph = build_graph(names, [(edge.source, edge.target) for edge in wiring])
@@ -328,7 +327,7 @@ class GraphUpdater:
 
     def names_of(self, mas: MAS) -> list[str]:
         """Return a system's node names: agents, then steps, then boxes."""
-        return [*mas.agents, *mas.steps, *getattr(mas, "boxes", {})]
+        return [*mas.agents, *mas.steps, *mas.boxes]
 
     def edges_of(self, mas: MAS) -> Edges:
         """Return a system's node-level edges as pairs, conditional ones included, without the sentinel wiring."""
@@ -348,10 +347,10 @@ class GraphUpdater:
         if mas.version != SPEC_VERSION_2:
             return None
         conditional = [edge for edge in mas.edges if edge.kind is not EdgeKind.PLAIN]
-        held = set(getattr(mas, "frozen", frozenset())).union(*({edge.source, edge.target} for edge in conditional))
+        held = set(mas.frozen).union(*({edge.source, edge.target} for edge in conditional))
         return Fixed(
             nodes=frozenset(held - SENTINELS),
-            code=frozenset([*mas.steps, *getattr(mas, "boxes", {})]),
+            code=frozenset([*mas.steps, *mas.boxes]),
             terminals=frozenset(terminals(self.names_of(mas), self.edges_of(mas))),
             conditional=frozenset((edge.source, edge.target) for edge in conditional),
         )

@@ -6,10 +6,6 @@ information for the person reading the trace, not a rule. It reads three things:
 - per record, a :class:`Flag` for each signal in :data:`SIGNALS`;
 - per ``while`` edge, how often the loop was taken and whether its cap was hit;
 - per run, each limit the budget sets, with what the run spent of it.
-
-Records are read with ``getattr`` defaults for the fields newer phases add
-(``rejected``, ``error``, ``route``, ``capped``), so hand-built and older records
-summarize too.
 """
 
 from __future__ import annotations
@@ -155,7 +151,7 @@ def _text(record: AgentRecord) -> str:
 
 def _failed(record: AgentRecord) -> bool:
     """Whether the record is of a visit that failed and was routed."""
-    return getattr(record, "error", None) is not None
+    return record.error is not None
 
 
 def _flags(records: Sequence[AgentRecord], settings: HealthSettings) -> tuple[Flag, ...]:
@@ -184,14 +180,13 @@ def _record_signals(
 ) -> list[tuple[str, str]]:
     """Return ``(signal, detail)`` for each signal one record shows."""
     found: list[tuple[str, str]] = []
-    rejected = tuple(getattr(record, "rejected", ()) or ())
-    if rejected:
-        found.append(("retried", f"{len(rejected)} answer(s) rejected: {getattr(rejected[0], 'error', '')}"))
+    if record.rejected:
+        found.append(("retried", f"{len(record.rejected)} answer(s) rejected: {record.rejected[0].error}"))
     if record.error_kind == ErrorKind.BAD_FORMAT:
         found.append(("bad_format", "the answer did not match its form after the retry"))
     if _failed(record):
         kind = "unknown" if record.error_kind is None else record.error_kind.value
-        found.append(("error_routed", f"{kind}: {getattr(record, 'error', '')}"))
+        found.append(("error_routed", f"{kind}: {record.error}"))
         return found
     text = _text(record)
     if not text.strip():
@@ -217,10 +212,7 @@ def _record_signals(
 
 def _route(record: AgentRecord) -> tuple[str, ...]:
     """Return the targets a record's decision routed to; empty when it made none."""
-    route = getattr(record, "route", None)
-    if route is None:
-        return ()
-    return (route,) if isinstance(route, str) else tuple(route)
+    return record.route or ()
 
 
 def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]] | None) -> dict[str, dict[str, Any]]:
@@ -241,7 +233,7 @@ def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]
     for source, target in edges:
         mine = [record for record in records if record.agent == source]
         taken = sum(target in _route(record) for record in mine)
-        cap_hit = any(getattr(record, "capped", False) and target not in _route(record) for record in mine)
+        cap_hit = any(record.capped and target not in _route(record) for record in mine)
         if taken or cap_hit:
             loops[f"{source} -> {target}"] = {"taken": taken, "cap_hit": cap_hit}
     return loops
