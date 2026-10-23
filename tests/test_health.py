@@ -1,4 +1,4 @@
-"""Health signals on hand-built records (plan test 13)."""
+"""Health signals on hand-built records."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def rec(
     error_kind: ErrorKind | None = None,
     **later: Any,
 ) -> AgentRecord:
-    """Build a record; ``later`` sets the fields phase 2 added (rejected, error, route, capped)."""
+    """Build a record; ``later`` sets the other fields (rejected, error, route, capped)."""
     outputs = {} if output is None else {"out": output}
     return AgentRecord(agent, step, prompt, prompt, inputs or {}, outputs, error_kind=error_kind, **later)
 
@@ -45,11 +45,15 @@ RECORDS = (
 )
 
 
-def test_signals() -> None:
+def spent_meter() -> RunMeter:
+    """A meter that counted 4 calls and 0.5 USD against limits of 10 and 1.0."""
     meter = RunMeter(Budget(max_calls=10, max_cost_usd=1.0))
     meter.calls, meter.cost_usd = 4, 0.5
-    health = summarize(RECORDS, budget=None, meter=meter, settings=HealthSettings())
+    return meter
 
+
+def test_every_signal_flags_its_record_with_a_detail() -> None:
+    health = summarize(RECORDS, budget=None, meter=spent_meter(), settings=HealthSettings())
     assert [(flag.signal, flag.node, flag.step) for flag in health.flags] == [
         ("retried", "judge", 1),
         ("stuck", "judge", 3),
@@ -69,6 +73,15 @@ def test_signals() -> None:
     assert by_signal["error_routed"].detail == "bad_format: count: the answer was not JSON"
     assert by_signal["leak"].detail == "the output holds '<|im_end|>'"
 
+    data = health.to_dict()
+    assert list(data) == ["flags", "loops", "budget"]
+    assert data["flags"][0] == {"signal": "retried", "node": "judge", "step": 1, "detail": by_signal["retried"].detail}
+    assert json.loads(json.dumps(data)) == data
+
+
+def test_loops_and_budget_come_from_the_routes_and_the_meter() -> None:
+    meter = spent_meter()
+    health = summarize(RECORDS, budget=None, meter=meter, settings=HealthSettings())
     loops = {"judge -> w": {"taken": 2, "cap_hit": True}}
     assert health.loops == loops  # read from the records' routes
     assert summarize(RECORDS, while_edges=[("judge", "w"), ("w", "judge")]).loops == loops
@@ -77,12 +90,8 @@ def test_signals() -> None:
     assert summarize(RECORDS, budget=Budget(max_wall_s=60), meter=meter).budget["wall_s"]["limit"] == 60
     assert summarize(RECORDS, budget=Budget(max_calls=1)).budget == {}  # no meter, nothing spent to report
 
-    data = health.to_dict()
-    assert list(data) == ["flags", "loops", "budget"]
-    assert data["flags"][0] == {"signal": "retried", "node": "judge", "step": 1, "detail": by_signal["retried"].detail}
-    assert json.loads(json.dumps(data)) == data
 
-    # thresholds: min_samples at its edge, a stricter length factor, an extra leak pattern
+def test_settings_tune_min_samples_length_and_leaks() -> None:
     two = summarize(RECORDS, settings=HealthSettings(min_samples=2))
     assert ("short", "few", 12) in [(flag.signal, flag.node, flag.step) for flag in two.flags]
     wide = summarize(RECORDS, settings=HealthSettings(length_factor=4.5))
@@ -96,11 +105,15 @@ def test_signals() -> None:
         "the output holds 'SECRET'"
     ]
 
-    # an unrouted failure ended the run: no error_routed flag (the trace's error says it)
+
+def test_an_unrouted_failure_is_not_flagged_as_routed() -> None:
+    """It ended the run, and the trace's error says so."""
     unrouted = rec("fetch", 0, None, error_kind=ErrorKind.OUTAGE, error="ConnectionError: the server is down")
     assert summarize([unrouted]).flags == ()
 
-    # unfilled counts only placeholders that name a value of the system; a literal {answer} is prompt text
+
+def test_unfilled_counts_only_placeholders_that_name_a_value() -> None:
+    """A literal ``{answer}`` in a prompt is prompt text unless the system has a value of that name."""
     prompt = 'Reply as {"answer": ...} with {answer} in {query}'
     literal = [rec("solver", 0, "42", prompt=prompt, inputs={"query": "q"})]
     assert summarize(literal, values={"query", "out"}).flags == ()
@@ -108,6 +121,8 @@ def test_signals() -> None:
         ("unfilled", "placeholders without a value: answer")
     ]
 
+
+def test_a_healthy_run_reports_nothing() -> None:
     healthy = summarize([rec("w", 0, "a draft", prompt="Write {query}", inputs={"query": "cats"}), rec("j", 1, "ok")])
     assert healthy == Health()
     assert healthy.to_dict() == {}
