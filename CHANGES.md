@@ -1,5 +1,19 @@
 # Changes in xmas, newest first
 
+## Phase 2a: steps, typed values and answer forms (23 Oct 2026)
+
+What a user of xmas can do now that they could not before:
+
+- Run plain code as a node: `MAS(..., steps=[Step("count", uses="count_words")])` runs a function (or an MCP tool) between agents without a model call. The same function can also be a tool an agent calls.
+- Pass structured data: every value is text or JSON. A JSON value reaches a prompt as one line of JSON, and a function gets the real object, not a string.
+- Ask an agent for JSON with a fixed shape: `Agent(..., output_type="json", schema={"fits": {"type": "bool"}})`. The prompt ends with format lines no optimizer can drop; an answer that does not fit gets exactly one retry, then the run stops with a `bad_format` error. On the recorded ELLIOT answers, 461 of 466 checker answers and all 89 editor answers pass the first time.
+- Find every wiring mistake when the system is built, listed together: a value read before anything writes it, two writers of one value, a placeholder the agent does not read, a JSON value sent where a function wants text, an unknown function.
+- A node fed by several others waits for all of them and runs once.
+
+What changed in the format: a new spec version 2 (`version: 2`) with `inputs`, `steps`, typed `reads` and `writes`, `schema` on agents, a `callables` list and a `prompts` section. Models appear by name only, and keys never appear. Version 1 files load, run and save exactly as before.
+
+What stays the same: every version 1 system, its requests, traces and optimizers. Not yet in 2a (they come in 2b): conditions, loops, boxes, `frozen`, health signals, saving a version 2 system as YAML, and topology search on one.
+
 ## Phase 1: typed errors, budgets and richer records (23 Oct 2026)
 
 What a user of xmas can do now that they could not before:
