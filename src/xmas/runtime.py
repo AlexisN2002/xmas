@@ -24,8 +24,9 @@ from __future__ import annotations
 import dataclasses
 import operator
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Annotated, Any, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
 from langgraph.config import get_config
 from langgraph.errors import GraphRecursionError
@@ -68,23 +69,7 @@ _RUN_ENDS = frozenset({ErrorKind.BUDGET, ErrorKind.STOPPED})
 """Error kinds that end the run itself: never routed, and no failed record, since no node failed."""
 
 
-def _merge_counts(current: dict[str, int], incoming: dict[str, int]) -> dict[str, int]:
-    """Add per-agent visit counts, so a looping agent accumulates its own.
-
-    Args:
-        current: Counts so far.
-        incoming: Counts from the agents that just finished.
-
-    Returns:
-        The summed mapping.
-    """
-    merged = dict(current)
-    for name, count in incoming.items():
-        merged[name] = merged.get(name, 0) + count
-    return merged
-
-
-class MASState(TypedDict, total=False):
+class MASState(TypedDict):
     """The state a run threads through the graph.
 
     Attributes:
@@ -95,37 +80,16 @@ class MASState(TypedDict, total=False):
         prompts: The prompt set for this run, keyed by agent name. Prompts travel
             in the state rather than being baked into the compiled graph, so one
             compilation serves every candidate an optimizer proposes.
-        records: Accumulated per-agent records, in completion order.
-        visits: How often each node has run, which bounds a version 1 retry
-            loop and is what a version 2 ``while`` edge and ``visits(x)`` read.
-        routes: Where each deciding node's latest visit sent the run (version
-            2), keyed by node; absent until a node decides.
+        records: Accumulated per-node records, in completion order; one per
+            visit, so they count the visits.
+        routes: Where each deciding node's latest visit sent the run, keyed by
+            node.
     """
 
     values: Annotated[dict[str, Any], operator.or_]
     prompts: dict[str, str]
     records: Annotated[list[AgentRecord], operator.add]
-    visits: Annotated[dict[str, int], _merge_counts]
     routes: Annotated[dict[str, list[str]], operator.or_]
-
-
-class CompiledGraph(Protocol):
-    """The executable produced by :func:`compile_mas`.
-
-    Declared as a protocol so that nothing outside this module needs to name a
-    langgraph type, including the tests. The parameters are deliberately loose:
-    the point is to keep the dependency behind this wall, and pinning the exact
-    overloaded signature of whatever backend is in use would defeat that by
-    tying the protocol to one backend's spelling.
-    """
-
-    def invoke(self, *args: Any, **kwargs: Any) -> Any:
-        """Run one state to completion and return the final state."""
-        ...
-
-    def batch(self, *args: Any, **kwargs: Any) -> Any:
-        """Run several states, concurrently where possible."""
-        ...
 
 
 _NodeBody = Callable[[MASState, VisitMeter], tuple[AgentRecord, dict[str, Any]]]
@@ -221,10 +185,10 @@ def _wrap(
             meter.keep(record, mas)
             if target is None:
                 raise
-            return {"records": [record], "visits": {name: 1}, "routes": {name: [target]}}
+            return {"records": [record], "routes": {name: [target]}}
         record = dataclasses.replace(record, latency_s=time.perf_counter() - started)
         meter.keep(record, mas)
-        update: dict[str, Any] = {"values": writes, "records": [record], "visits": {name: 1}}
+        update: dict[str, Any] = {"values": writes, "records": [record]}
         if route is not None:
             update["routes"] = {name: route}
         return update
@@ -253,8 +217,8 @@ def agent_node(
     tools = mas.resolve_tools(agent) if agent.tools else {}
 
     def visit(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
-        template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
-        values = state.get("values") or {}
+        template = state["prompts"].get(agent.name, agent.prompt)
+        values = state["values"]
         inputs = {name: str(values.get(name) or "") for name in agent.inputs}
         rendered = safe_format(template, inputs)
         calls: tuple[ToolCall, ...] = ()
@@ -353,8 +317,8 @@ def _agent_body(
     tools = mas.resolve_tools(agent) if agent.tools else None
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
-        template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
-        values = state.get("values") or {}
+        template = state["prompts"].get(agent.name, agent.prompt)
+        values = state["values"]
         inputs = {name: render_value(values.get(name), types[name], present=name in values) for name in agent.inputs}
         rendered = safe_format(template, inputs)
         if form is not None:
@@ -435,7 +399,7 @@ def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         meter.check_boundary()
-        values = state.get("values") or {}
+        values = state["values"]
         arguments: dict[str, Any] = {}
         inputs: dict[str, str] = {}
         for parameter, name in read_map.items():
@@ -490,7 +454,7 @@ def _box_body(box: Box, types: dict[str, ValueType]) -> _NodeBody:
         run = visit.run
         run.check_boundary()
         run.adopt(inner)
-        values = state.get("values") or {}
+        values = state["values"]
         given = {inside: values[outside] for inside, outside in box.reads.items() if outside in values}
         kept = len(run.records_of(inner))
         try:
@@ -596,8 +560,8 @@ class _Decision:
 
 def _context(mas: MAS, name: str, state: MASState, writes: dict[str, Any], meter: RunMeter) -> Context:
     """Return what a node's predicates see: its fresh writes, its visit counted, the spend so far."""
-    visits = dict(state.get("visits") or {})
-    visits[name] = visits.get(name, 0) + 1
+    visits = Counter(record.agent for record in state["records"])
+    visits[name] += 1
 
     def call(function: str, args: tuple[Any, ...]) -> bool:
         spec, source = mas.resolve_callable(Step(function, function))
@@ -605,7 +569,7 @@ def _context(mas: MAS, name: str, state: MASState, writes: dict[str, Any], meter
         return cast("bool", next(iter(produced.values())))
 
     return Context(
-        values={**(state.get("values") or {}), **writes},
+        values={**state["values"], **writes},
         visits=visits,
         node=name,
         cost_usd=meter.cost_usd,
@@ -712,13 +676,13 @@ def _router(name: str, targets: dict[str, str]) -> Callable[[MASState], list[str
     """Build the router of a deciding node: it reads the route its wrapper wrote, mapped to relays."""
 
     def route(state: MASState) -> list[str]:
-        chosen = (state.get("routes") or {}).get(name, [])
+        chosen = state["routes"].get(name, [])
         return [targets[target] for target in chosen if target in targets]
 
     return route
 
 
-def _compile_v2(mas: MAS) -> CompiledGraph:
+def _compile_v2(mas: MAS) -> Any:
     """Compile a version 2 system: agents, steps and boxes, decisions, merges and joins.
 
     A node with conditional or error edges gets a :class:`_Decision`; its
@@ -795,15 +759,14 @@ def cycle_router(
     onward = forward_targets or [END]
 
     def route(state: MASState) -> list[str]:
-        values = state.get("values") or {}
-        visits = (state.get("visits") or {}).get(agent.name, 0)
-        looping = CONTINUE_MARKER in str(values.get(agent.output) or "")
+        visits = sum(1 for record in state["records"] if record.agent == agent.name)
+        looping = CONTINUE_MARKER in str(state["values"].get(agent.output) or "")
         return back_targets if looping and visits < mas.max_visits else onward
 
     return route
 
 
-def compile_mas(mas: MAS) -> CompiledGraph:
+def compile_mas(mas: MAS) -> Any:
     """Compile a MAS topology into an executable graph.
 
     Agents identified by :func:`xmas.graph.join_nodes` are marked deferred, so a
@@ -864,12 +827,12 @@ def trace_from_state(mas: MAS, query: str, result: Any, meter: RunMeter) -> Trac
     """Assemble a trace from a finished run's state, or from the error that ended it."""
     if isinstance(result, BaseException):
         return _failed_trace(mas, query, result, meter)
-    records: list[AgentRecord] = list(result.get("records") or [])
+    records: list[AgentRecord] = result["records"]
     numbered = tuple(dataclasses.replace(record, step=index) for index, record in enumerate(records))
     health = _health(mas, numbered, meter)
     if mas.version == SPEC_VERSION_2:
         return Trace(query=query, output=_v2_output(mas, records), records=numbered, health=health)
-    values: dict[str, Any] = result.get("values") or {}
+    values: dict[str, Any] = result["values"]
     output_var = mas.agents[terminal_agent(mas.graph)].output
     return Trace(query=query, output=str(values.get(output_var) or ""), records=numbered, health=health)
 
@@ -916,7 +879,7 @@ def _failed_trace(mas: MAS, query: str, error: BaseException, meter: RunMeter, s
 
 def _initial_state(query: str, prompts: dict[str, str]) -> MASState:
     """Build the state a run starts from."""
-    return MASState(values={"query": query}, prompts=dict(prompts), records=[], visits={})
+    return MASState(values={"query": query}, prompts=dict(prompts), records=[], routes={})
 
 
 def _run_values(
@@ -938,9 +901,9 @@ def _run_values(
     Raises:
         Exception: Whatever ended the run; nothing is caught.
     """
-    state = MASState(values=dict(values), prompts=dict(prompts), records=[], visits={})
+    state = MASState(values=dict(values), prompts=dict(prompts), records=[], routes={})
     result: dict[str, Any] = mas.compiled.invoke(state, config=_run_config(mas, meter))
-    return trace_from_state(mas, render_value(values, JSON), result, meter), dict(result.get("values") or {})
+    return trace_from_state(mas, render_value(values, JSON), result, meter), dict(result["values"])
 
 
 def _run_config(mas: MAS, meter: RunMeter) -> dict[str, Any]:

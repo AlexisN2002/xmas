@@ -54,8 +54,6 @@ from xmas.values import TEXT, ValueType, parse_type
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
 
-    from xmas.runtime import CompiledGraph
-
 _QUERY_ONLY = {DEFAULT_INPUT: TEXT}
 
 
@@ -264,7 +262,7 @@ class MAS(BasePredictor):
                     f"Agent {agent.name!r} binds to model {agent.model!r}, which is not in llms={sorted(self.llms)}."
                 )
 
-        self.compilation: tuple[str, CompiledGraph] | None = None
+        self.compilation: tuple[str, Any] | None = None
         self.last_trace: Trace | None = None
         self.last_traces: tuple[Trace, ...] = ()
 
@@ -921,7 +919,7 @@ class MAS(BasePredictor):
         return "\n".join(lines)
 
     @property
-    def compiled(self) -> CompiledGraph:
+    def compiled(self) -> Any:
         """The compiled executable graph, rebuilt whenever the structure changes.
 
         The compiled object's type is an implementation detail and never appears
