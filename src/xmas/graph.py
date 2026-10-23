@@ -27,34 +27,6 @@ SENTINELS = (START, END)
 """The node names reserved by xmas; an agent may not use either."""
 
 
-def _reachable(graph: nx.DiGraph[str], source: str, *, forward: bool) -> set[str]:
-    """Return every node reachable from ``source``, following edges either way.
-
-    Written out rather than calling ``nx.descendants``/``nx.ancestors`` because
-    the networkx stubs type those as taking ``Graph[object]``, which a
-    ``DiGraph[str]`` is not. A six-line traversal keeps the public signatures
-    honest about nodes being agent names.
-
-    Args:
-        graph: The topology.
-        source: Node to start from.
-        forward: Follow successors when true, predecessors when false.
-
-    Returns:
-        The reachable nodes, excluding ``source`` itself.
-    """
-    step = graph.successors if forward else graph.predecessors
-    seen: set[str] = set()
-    stack = list(step(source))
-    while stack:
-        node = stack.pop()
-        if node in seen:
-            continue
-        seen.add(node)
-        stack.extend(step(node))
-    return seen
-
-
 def build_graph(
     agents: list[str],
     edges: list[tuple[str, str]],
@@ -227,27 +199,14 @@ def forward_graph(graph: nx.DiGraph[str], back: Collection[tuple[str, str]]) -> 
 
 
 def loop_problems(graph: nx.DiGraph[str], back: Collection[tuple[str, str]] = ()) -> list[str]:
-    """Return one problem per cycle a version 2 topology may not have.
-
-    Version 1 loops on the ``<continue>`` marker of its back edges; version 2
-    loops only through a ``while`` edge. Removing the ``while`` edges must
-    leave a DAG, and each of them must close a cycle.
-
-    Args:
-        graph: The topology.
-        back: Its ``while`` edges as ``(source, target)``.
-
-    Returns:
-        One line per cycle closed by another edge and per ``while`` edge that
-        closes none; empty for a well-formed topology.
-    """
+    """Return a problem for each cycle no ``while`` edge (``back``) closes and each ``while`` edge closing no cycle."""
     forward = forward_graph(graph, back)
     problems = [
         f"{LOOP_REFUSAL}: the edge {source} -> {target} closes a cycle"
         for source, target in sorted(back_edges(forward))
     ]
     for source, target in back:
-        if source != target and source not in _reachable(forward, target, forward=True):
+        if source != target and not nx.has_path(forward, target, source):
             problems.append(f"the while edge {source} -> {target} closes no loop; make it a when edge")
     return problems
 
@@ -265,20 +224,14 @@ _FAIL, _CHOOSE, _OK = "fail", "choose", ""
 class Join:
     """How a version 2 node with several incoming edges runs.
 
-    A ``"merge"`` has incoming edges that never arrive in the same pass: it runs
-    once on whichever arrives. A ``"join"`` has several groups of edges that
-    each arrive on every pass that reaches it: it waits for one edge of every
-    group, once per pass (a barrier).
-
-    Attributes:
-        kind: ``"merge"`` or ``"join"``.
-        groups: The sources of the incoming edges, grouped; the edges of one
-            group are alternatives. A merge has one group.
-        relays: For a join, one entry per group: ``None`` when the group is one
-            plain edge from a node without error edges, so the barrier waits
-            for that node, else the name of the no-op relay node
-            (``__in__.<node>.<k>``) the group's edges enter and the barrier
-            waits for. Empty for a merge.
+    ``groups`` holds the sources of the incoming edges; the edges of one group
+    are alternatives. A ``"merge"`` has one group, whose edges never arrive in
+    the same pass: it runs once on whichever arrives. A ``"join"`` has several
+    groups that each arrive on every pass reaching it: it waits for one edge of
+    every group, once per pass (a barrier). A join has one relay per group:
+    ``None`` when the group is one plain edge from a node without error edges,
+    so the barrier waits for that node, else the no-op node
+    (``__in__.<node>.<k>``) the group's edges enter.
     """
 
     kind: str
@@ -296,13 +249,7 @@ class RouteGraph:
     are the minimal sets of routes under which it runs in one pass; two nodes
     are alternatives when every pair of their sets takes different routes of
     some decision, which is exact because a decision runs at most once a pass.
-
-    Args:
-        nodes: The node names, in a deterministic order.
-        edges: The declared edges.
-
-    Raises:
-        ValueError: If the edges other than ``while`` edges form a cycle.
+    The edges other than ``while`` edges must not form a cycle.
     """
 
     def __init__(self, nodes: Sequence[str], edges: Sequence[Edge]) -> None:
@@ -338,8 +285,6 @@ class RouteGraph:
                 graph.add_edge(ok, END, kind="plain")
             else:
                 graph.add_edge(name, END, kind="plain")
-        if not nx.is_directed_acyclic_graph(graph):
-            raise ValueError(f"{LOOP_REFUSAL}: the edges other than while edges form a cycle")
         self.graph = graph
         self.choices: dict[_Point, set[frozenset[_Point]] | None] = {START: {frozenset()}}
         for point in nx.topological_sort(graph):
@@ -398,12 +343,7 @@ class RouteGraph:
         return bodies
 
     def classify(self) -> tuple[dict[str, Join], dict[str, str]]:
-        """Classify every node with several incoming edges.
-
-        Returns:
-            ``(joins, refusals)``: the merge or join of each such node, and why
-            each node that is neither was refused.
-        """
+        """Return each multi-input node's merge or join, and the refusal of each node that is neither."""
         joins: dict[str, Join] = {}
         refusals: dict[str, str] = {}
         idom: dict[Any, Any] | None = None
@@ -484,20 +424,9 @@ def _clash(first: frozenset[_Point], second: frozenset[_Point]) -> bool:
 
 
 def classify_joins(nodes: Sequence[str], edges: Sequence[Edge]) -> dict[str, Join]:
-    """Classify every version 2 node with several incoming edges as a merge or a join.
+    """Return the :class:`Join` of every node with several incoming edges, in ``nodes`` order and :data:`END` last.
 
-    Args:
-        nodes: The node names, in a deterministic order; the result follows it,
-            :data:`END` last.
-        edges: The declared edges; ``while`` edges are left out of the pass.
-
-    Returns:
-        ``{node: Join}`` for every node with several incoming edges,
-        :data:`END` included.
-
-    Raises:
-        ValueError: If a node is neither a merge nor a join, or the edges other
-            than ``while`` edges form a cycle; the message names every such node.
+    Raises ValueError naming every node that is neither a merge nor a join.
     """
     joins, refusals = RouteGraph(nodes, edges).classify()
     if refusals:
@@ -506,16 +435,14 @@ def classify_joins(nodes: Sequence[str], edges: Sequence[Edge]) -> dict[str, Joi
 
 
 def ancestors(graph: nx.DiGraph[str], node: str) -> set[str]:
-    """Return every node with a path to ``node``, sentinels included.
-
-    Args:
-        graph: The topology.
-        node: The node to inspect.
-
-    Returns:
-        Its ancestors, excluding ``node`` unless it sits on a cycle.
-    """
-    return _reachable(graph, node, forward=False)
+    """Return every node with a path to ``node``, sentinels included; ``node`` itself when it sits on a cycle."""
+    seen: set[str] = set()
+    stack = list(graph.predecessors(node))
+    while stack:
+        if (current := stack.pop()) not in seen:
+            seen.add(current)
+            stack.extend(graph.predecessors(current))
+    return seen
 
 
 def forward_predecessors(graph: nx.DiGraph[str], node: str) -> set[str]:
