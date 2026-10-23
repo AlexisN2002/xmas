@@ -59,9 +59,8 @@ REFUSED = [
 def test_a_predicate_evaluates_and_names_its_roots(text: str, expected: bool, roots: set[str]) -> None:
     predicate = parse_predicate(text)
     assert predicate.evaluate(CTX) is expected
-    assert set(predicate.roots()) == roots
-    assert predicate.functions() == ({"is_long"} if "is_long" in text else set())
-    assert str(predicate) == text
+    assert {path[0] for path in predicate.paths()} == roots
+    assert predicate.calls() == ({("is_long", 1)} if "is_long" in text else set())
 
 
 @pytest.mark.parametrize(("text", "problem"), REFUSED, ids=range(len(REFUSED)))
@@ -70,5 +69,3 @@ def test_a_predicate_is_refused_when_parsed_or_evaluated(text: str, problem: str
     with pytest.raises(PredicateError, match=re.escape(problem)) as raised:
         parse_predicate(text).evaluate(Context(VALUES))
     assert isinstance(raised.value, ValueError)
-    if "position" in problem:
-        assert raised.value.position == int(problem.rsplit(" ", 1)[1])

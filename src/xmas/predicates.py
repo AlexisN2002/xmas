@@ -63,15 +63,13 @@ class PredicateError(ValueError):
 
     A ``ValueError``, like every other refusal of a system's shape, because
     ``check_system`` parses each predicate when the system is built; evaluation
-    raises it only for a call no registered callable answers. ``position`` is
-    the zero-based character position of the problem, or ``None`` when it is
-    not about one place in the text.
+    raises it only for a call no registered callable answers. A problem at one
+    place in the text names its zero-based character position.
     """
 
     def __init__(self, message: str, position: int | None = None) -> None:
-        """Keep the message and the position."""
+        """Add the position, when there is one, to the message."""
         super().__init__(message if position is None else f"{message} at position {position}")
-        self.position = position
 
 
 @dataclass(frozen=True)
@@ -107,17 +105,9 @@ class Predicate:
     text: str
     tree: tuple[Any, ...]
 
-    def roots(self) -> frozenset[str]:
-        """Return the value names the predicate reads: the first name of every path."""
-        return frozenset(path[0] for path in self.paths())
-
     def paths(self) -> frozenset[tuple[str, ...]]:
         """Return every path the predicate reads, as tuples of names."""
         return frozenset(node[1] for node in _walk(self.tree) if node[0] in ("path", "exists"))
-
-    def functions(self) -> frozenset[str]:
-        """Return the registered callables the predicate calls; built-ins are not listed."""
-        return frozenset(node[1] for node in _walk(self.tree) if node[0] == "call")
 
     def calls(self) -> frozenset[tuple[str, int]]:
         """Return each call of a registered callable as ``(name, number of arguments)``."""
@@ -126,10 +116,6 @@ class Predicate:
     def evaluate(self, ctx: Context) -> bool:
         """Return whether the predicate holds in ``ctx``; a call that is not registered or returns no bool raises."""
         return bool(_eval(self.tree, ctx))
-
-    def __str__(self) -> str:
-        """Return the text it was parsed from."""
-        return self.text
 
 
 def parse_predicate(text: str) -> Predicate:

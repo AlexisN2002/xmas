@@ -339,7 +339,7 @@ def _predicate_problems(
                 choices = form.choices(fields) if edge.kind is EdgeKind.SWITCH else None
                 if choices is not None and edge.case not in choices:
                     yield f"{where}: case {edge.case!r} is not one of {list(choices)}, the choices of {root}.{fields}"
-        for function in sorted(predicate.functions() - set(registered)):
+        for function in sorted({name for name, _ in predicate.calls()} - set(registered)):
             yield f"{where} calls {function!r}, which is no registered callable"
         for function, count in sorted(predicate.calls()):
             if function not in registered:
