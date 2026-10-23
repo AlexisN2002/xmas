@@ -16,7 +16,7 @@ from promptolution.predictors.base_predictor import BasePredictor
 from xmas import runtime
 from xmas.agent import Agent
 from xmas.budget import Budget
-from xmas.check import MERGE_LAST, SystemInfo, callable_writes, check_system, step_maps
+from xmas.check import MERGE_LAST, SystemInfo, check_system, step_maps
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
 from xmas.graph import (
     END,
@@ -503,7 +503,7 @@ class MAS(BasePredictor):
             reads = _type_words(item.reads)
             if reads:
                 entry["reads"] = reads
-            entry["writes"] = _type_words(callable_writes(item))
+            entry["writes"] = _type_words(item.writes)
             specs[name] = entry
         return specs
 

@@ -76,7 +76,7 @@ def _return_type(fn: Callable[..., Any] | None) -> ValueType:
     return type_of_hint(hint)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Tool:
     """A function an agent may call, described once.
 
@@ -87,29 +87,39 @@ class Tool:
         fn: The implementation for a local tool, ``None`` for a remote one (called
             through its source).
         writes: What the tool writes when it runs as a step, ``{write name:
-            type}``, held as :class:`~xmas.values.ValueType` once built. ``None``
-            is one write named like the tool: text when ``fn``'s return hint is
-            ``str`` or the tool is remote, json otherwise.
+            type}``. It may be given as type words; ``None`` is one write named
+            like the tool: text when ``fn``'s return hint is ``str`` or the tool
+            is remote, json otherwise.
     """
 
     name: str
     description: str
     parameters: dict[str, Any]
-    fn: Callable[..., Any] | None = None
-    arguments_model: type[BaseModel] | None = field(default=None, compare=False, repr=False)
-    writes: Mapping[str, ValueType | str] | None = None
+    fn: Callable[..., Any] | None
+    arguments_model: type[BaseModel] | None = field(compare=False, repr=False)
+    writes: dict[str, ValueType]
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        parameters: dict[str, Any],
+        fn: Callable[..., Any] | None = None,
+        arguments_model: type[BaseModel] | None = None,
+        writes: Mapping[str, ValueType | str] | None = None,
+    ) -> None:
         """Reject names the OpenAI ``tools`` payload would refuse, and read the write types."""
-        if not valid_tool_name(self.name):
+        if not valid_tool_name(name):
             raise ValueError(
-                f"Tool name {self.name!r} must match the OpenAI rule: letters, digits, _ and -, at most 64 characters."
+                f"Tool name {name!r} must match the OpenAI rule: letters, digits, _ and -, at most 64 characters."
             )
-        writes = {self.name: _return_type(self.fn)} if self.writes is None else self.writes
-        if not writes:
-            raise ValueError(f"Tool {self.name!r} needs at least one write.")
-        typed = {key: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for key, vtype in writes.items()}
-        object.__setattr__(self, "writes", typed)
+        given = {name: _return_type(fn)} if writes is None else writes
+        if not given:
+            raise ValueError(f"Tool {name!r} needs at least one write.")
+        typed = {key: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for key, vtype in given.items()}
+        fields = {"name": name, "description": description, "parameters": parameters, "fn": fn}
+        for key, value in {**fields, "arguments_model": arguments_model, "writes": typed}.items():
+            object.__setattr__(self, key, value)
 
     @property
     def reads(self) -> dict[str, ValueType]:
@@ -348,7 +358,7 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
             tool failed or was refused (``status`` 401, 403 or 429).
         BadFormat: If the result does not fit the writes; it names the callable.
     """
-    writes = cast("dict[str, ValueType]", spec.writes)
+    writes = spec.writes
     kwargs = spec.validate(arguments)
     if spec.fn is not None:
         result = spec.fn(**kwargs)

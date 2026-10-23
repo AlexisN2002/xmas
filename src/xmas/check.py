@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from xmas.agent import Agent
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
@@ -69,11 +69,6 @@ class SystemInfo:
     joins: dict[str, Join]
 
 
-def callable_writes(item: Tool) -> dict[str, ValueType]:
-    """Return what a callable writes, ``{write: type}``, as :class:`~xmas.tools.Tool` typed it when built."""
-    return cast("dict[str, ValueType]", item.writes)
-
-
 def step_maps(step: Step, item: Tool) -> tuple[dict[str, str], dict[str, str]]:
     """Return a step's ``(reads, writes)``, each ``{name inside: name in the graph}``.
 
@@ -81,7 +76,7 @@ def step_maps(step: Step, item: Tool) -> tuple[dict[str, str], dict[str, str]]:
     value of its own name, and a write not renamed keeps its own name.
     """
     reads = {name: step.reads.get(name, name) for name in item.reads}
-    writes = {name: step.writes.get(name, name) for name in callable_writes(item)}
+    writes = {name: step.writes.get(name, name) for name in item.writes}
     return reads, writes
 
 
@@ -202,7 +197,7 @@ def _node_io(mas: MAS, nodes: dict[str, Agent | Step | Box]) -> tuple[_Reads, _W
         else:
             try:
                 item, _source = mas.resolve_callable(node)
-                parameters, produced = item.reads, callable_writes(item)
+                parameters, produced = item.reads, item.writes
             except ValueError as exc:
                 problems.append(str(exc))
                 continue
