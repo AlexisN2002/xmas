@@ -221,14 +221,3 @@ def _clash(first: frozenset[_Point], second: frozenset[_Point]) -> bool:
     return any(
         a[:2] == b[:2] and a[2] != b[2] for a in first for b in second if isinstance(a, tuple) and isinstance(b, tuple)
     )
-
-
-def classify_joins(nodes: Sequence[str], edges: Sequence[Edge]) -> dict[str, Join]:
-    """Return the :class:`Join` of every node with several incoming edges, in ``nodes`` order and :data:`END` last.
-
-    Raises ValueError naming every node that is neither a merge nor a join.
-    """
-    joins, refusals = RouteGraph(nodes, edges).classify()
-    if refusals:
-        raise ValueError("; ".join(refusals.values()))
-    return joins

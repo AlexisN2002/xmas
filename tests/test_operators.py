@@ -6,7 +6,6 @@ The models are scripted doubles.
 from __future__ import annotations
 
 import itertools
-import re
 from typing import Any
 
 import pytest
@@ -14,8 +13,8 @@ import pytest
 from xmas import END, MAS, Agent, Budget, ErrorKind
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BudgetExceeded
-from xmas.graph import classify_joins
 from xmas.nodes import Step
+from xmas.routes import RouteGraph
 from xmas.tools import tool
 
 from .conftest import VERDICT, MockLLM, worked_example
@@ -392,11 +391,11 @@ SHAPES: dict[str, tuple[str, list[tuple[str, str, str]], dict[str, str] | str]] 
 def test_each_fan_in_shape_is_a_merge_or_a_join(shape: str) -> None:
     names, triples, expected = SHAPES[shape]
     edges = [Edge(source, target, **KINDS[kind]) for source, target, kind in triples]
+    joins, refusals = RouteGraph(names.split(), edges).classify()
     if isinstance(expected, str):
-        with pytest.raises(ValueError, match=re.escape(expected)):
-            classify_joins(names.split(), edges)
+        assert any(problem.startswith(expected) for problem in refusals.values())
         return
-    joins = classify_joins(names.split(), edges)
+    assert not refusals
     assert {n: j.kind if j.kind == "merge" else f"join, {len(j.groups)} groups" for n, j in joins.items()} == expected
     relays = {name: join.relays for name, join in joins.items() if join.kind == "join"}
     assert relays == {

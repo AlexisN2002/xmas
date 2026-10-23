@@ -10,14 +10,8 @@ graph-rewriting component and needs nothing from xmas to work.
 from __future__ import annotations
 
 from collections.abc import Collection
-from typing import TYPE_CHECKING, Any
 
 import networkx as nx
-
-if TYPE_CHECKING:
-    from xmas.routes import Join as Join
-    from xmas.routes import RouteGraph as RouteGraph
-    from xmas.routes import classify_joins as classify_joins
 
 START = "__start__"
 """Source sentinel. Every agent with no predecessor is wired from it."""
@@ -27,17 +21,6 @@ END = "__end__"
 
 SENTINELS = (START, END)
 """The node names reserved by xmas; an agent may not use either."""
-
-_ROUTES = frozenset({"Join", "RouteGraph", "classify_joins"})
-
-
-def __getattr__(name: str) -> Any:
-    """Serve the names of :mod:`xmas.routes` on first use, so this file loads by path with networkx alone."""
-    if name in _ROUTES:
-        from xmas import routes
-
-        return getattr(routes, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def build_graph(

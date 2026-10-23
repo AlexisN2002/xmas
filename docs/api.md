@@ -219,7 +219,6 @@ system whose inputs are not exactly `{query: text}`.
     options:
       members:
         - Join
-        - classify_joins
 
 ## Version 2: operators, boxes, health
 
