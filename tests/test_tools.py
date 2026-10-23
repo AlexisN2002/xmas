@@ -24,7 +24,6 @@ from xmas.tools import (
     Tool,
     ToolCallRequest,
     ToolSource,
-    _numbers_from_strings,
     tool,
 )
 from xmas.utils import timestamp
@@ -435,13 +434,6 @@ def test_a_plain_agent_in_a_mixed_mas_sends_exactly_what_it_did_before() -> None
 
 
 RUN_PYTHON_SCHEMA = {"code": {"type": "string"}, "timeout_s": {"type": "integer"}}
-
-
-def test_a_numeric_string_reads_as_a_number_only_where_the_schema_types_one() -> None:
-    parameters = {"properties": {**RUN_PYTHON_SCHEMA, "scale": {"type": ["number", "null"]}}}
-    arguments = {"code": "20", "timeout_s": "20", "scale": "-1.5"}
-    assert _numbers_from_strings(arguments, parameters) == {"code": "20", "timeout_s": 20, "scale": -1.5}
-    assert _numbers_from_strings({"timeout_s": "20.0"}, parameters) == {"timeout_s": "20.0"}  # not an integer
 
 
 def test_a_failed_call_is_run_again() -> None:

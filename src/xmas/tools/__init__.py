@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import re
 import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -381,35 +380,6 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
     if problems:
         raise BadFormat(spec.name, ("; ".join(problems),))
     return produced
-
-
-_INTEGER = re.compile(r"-?[0-9]+")
-_NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")
-
-
-def _numbers_from_strings(arguments: dict[str, Any], parameters: dict[str, Any]) -> dict[str, Any]:
-    """Read top-level numeric strings as numbers where the schema types a property integer or number.
-
-    ``null`` may be allowed beside the number. Only plain decimal literals are
-    converted (``"-1.5"`` for ``number`` only), and a number-typed ``"20"``
-    becomes ``20``, not ``20.0``.
-    """
-    properties = parameters.get("properties")
-    if not isinstance(properties, dict):
-        return arguments
-    out = dict(arguments)
-    for key, value in arguments.items():
-        schema = properties.get(key)
-        declared = schema.get("type") if isinstance(schema, dict) else None
-        listed = [declared] if isinstance(declared, str) else declared if isinstance(declared, list) else []
-        types = {item for item in listed if isinstance(item, str)} - {"null"}
-        if not isinstance(value, str) or len(types) != 1 or not types <= {"integer", "number"}:
-            continue
-        if _INTEGER.fullmatch(value):
-            out[key] = int(value)
-        elif types == {"number"} and _NUMBER.fullmatch(value):
-            out[key] = float(value)
-    return out
 
 
 def _turn_usage(
