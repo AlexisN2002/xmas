@@ -3,7 +3,9 @@
 :func:`summarize` runs at the end of every run and never changes it: a flag is
 information for the person reading the trace, not a rule. It reads three things:
 
-- per record, a :class:`Flag` for each signal in :data:`SIGNALS`;
+- per record, a :class:`Flag` for each signal it shows, in this order: ``retried``,
+  ``bad_format``, ``error_routed``, ``empty``, ``stuck``, ``unfilled``, ``leak``,
+  ``long``, ``short``;
 - per ``while`` edge, how often the loop was taken and whether its cap was hit;
 - per run, each limit the budget sets, with what the run spent of it.
 """
@@ -13,7 +15,7 @@ from __future__ import annotations
 import re
 import statistics
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from xmas.errors import ErrorKind
@@ -23,16 +25,13 @@ if TYPE_CHECKING:
     from xmas.budget import Budget, RunMeter
     from xmas.trace import AgentRecord
 
-SIGNALS = ("retried", "bad_format", "error_routed", "empty", "stuck", "unfilled", "leak", "long", "short")
-"""The per-record signals, in the order a record's flags are listed."""
-
 DEFAULT_LEAKS = (r"<\|[A-Za-z_]{2,30}\|>", r"</?think>", r"<<<xmas:agent ")
 """Patterns that should never reach an output: chat-template tokens, reasoning tags, xmas's encoding header."""
 
 
 @dataclass(frozen=True)
 class HealthSettings:
-    """How sensitive the signals are; a v2 spec sets them under ``health:``.
+    """How sensitive the signals are; a version 2 spec sets them under ``health:``.
 
     Attributes:
         length_factor: An output is ``long`` beyond this many times its node's
@@ -59,7 +58,7 @@ class HealthSettings:
         for pattern in self.leak:
             try:
                 re.compile(pattern)
-            except re.error as exc:
+            except (re.error, TypeError) as exc:
                 raise ValueError(f"health leak pattern {pattern!r} does not compile: {exc}") from exc
 
 
@@ -68,7 +67,7 @@ class Flag:
     """One signal on one record.
 
     Attributes:
-        signal: Which signal, one of :data:`SIGNALS`.
+        signal: Which signal, such as ``stuck``.
         node: The node the record belongs to.
         step: The record's step in the run.
         detail: What was seen, in a short plain sentence.
@@ -81,7 +80,7 @@ class Flag:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form."""
-        return {"signal": self.signal, "node": self.node, "step": self.step, "detail": self.detail}
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -121,25 +120,14 @@ def summarize(
     while_edges: Iterable[tuple[str, str]] | None = None,
     values: Iterable[str] | None = None,
 ) -> Health:
-    """Read a run's records for the health signals.
+    """Read a run's records, in run order, for the health signals.
 
-    Args:
-        records: The run's records, in run order.
-        budget: The run's budget; ``meter.budget`` when ``None``.
-        meter: The run's meter, which says what was spent. Without one there is
-            no budget entry.
-        settings: The thresholds and extra leak patterns; the defaults when
-            ``None``.
-        while_edges: The system's ``while`` edges as ``(source, target)``. When
-            ``None`` they are read from the records: a route to a node that first
-            ran before the deciding node first ran goes back, so it is a loop.
-        values: The system's value names (its inputs and every write). A
-            placeholder that names none of them is literal prompt text, which
-            renders as written, so it is not ``unfilled``. When ``None`` every
-            placeholder outside a record's inputs counts.
-
-    Returns:
-        The flags, loops and budget use.
+    The budget is ``meter.budget`` unless given; without a meter nothing was
+    spent, so there is no budget entry. ``while_edges`` are the system's
+    ``(source, target)`` loops; when ``None``, a route to a node that first ran
+    before the deciding node did counts as one. ``values`` are the system's value
+    names: a placeholder naming none of them is literal prompt text, so it is not
+    ``unfilled``; when ``None``, every placeholder outside a record's inputs is.
     """
     settings = settings or HealthSettings()
     return Health(
@@ -154,17 +142,12 @@ def _text(record: AgentRecord) -> str:
     return "\n".join(record.outputs.values())
 
 
-def _failed(record: AgentRecord) -> bool:
-    """Whether the record is of a visit that failed."""
-    return record.error is not None
-
-
 def _flags(records: Sequence[AgentRecord], settings: HealthSettings, values: frozenset[str] | None) -> tuple[Flag, ...]:
-    """Return every record's flags, in record order and :data:`SIGNALS` order within a record."""
+    """Return every record's flags, in record order."""
     leaks = [re.compile(pattern) for pattern in (*DEFAULT_LEAKS, *settings.leak)]
     lengths: dict[str, list[int]] = {}
     for record in records:
-        if not _failed(record):
+        if record.error is None:
             lengths.setdefault(record.agent, []).append(len(_text(record)))
     medians = {node: statistics.median(sizes) for node, sizes in lengths.items() if len(sizes) >= settings.min_samples}
     previous: dict[str, AgentRecord] = {}
@@ -190,7 +173,7 @@ def _record_signals(
         found.append(("retried", f"{len(record.rejected)} answer(s) rejected: {record.rejected[0].error}"))
     if record.error_kind == ErrorKind.BAD_FORMAT:
         found.append(("bad_format", "the answer did not match its form after the retry"))
-    if _failed(record):
+    if record.error is not None:
         if record.route:  # an unrouted failure ended the run, and the trace's error says so
             kind = "unknown" if record.error_kind is None else record.error_kind.value
             found.append(("error_routed", f"{kind}: {record.error}"))
@@ -198,7 +181,7 @@ def _record_signals(
     text = _text(record)
     if not text.strip():
         found.append(("empty", "the output is empty"))
-    elif before is not None and not _failed(before) and _text(before) == text:
+    elif before is not None and before.error is None and _text(before) == text:
         found.append(("stuck", f"the same output as step {before.step}"))
     placeholders = extract_placeholders(record.prompt)
     missing = sorted((placeholders if values is None else placeholders & values) - set(record.inputs))

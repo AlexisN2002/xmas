@@ -22,14 +22,7 @@ _PLACEHOLDER = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
 
 
 def extract_placeholders(template: str) -> set[str]:
-    """Return the ``{placeholder}`` names appearing in a template.
-
-    Args:
-        template: A prompt template.
-
-    Returns:
-        The set of simple identifier placeholders found.
-    """
+    """Return the ``{placeholder}`` names appearing in a template."""
     return {match.group(1) for match in _PLACEHOLDER.finditer(template)}
 
 
