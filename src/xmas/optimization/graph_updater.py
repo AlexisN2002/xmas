@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, cast
 
 from xmas.agent import Agent
-from xmas.check import step_maps
 from xmas.edges import Edge, EdgeKind
 from xmas.graph import SENTINELS, START, ancestors, build_graph
 from xmas.mas import MAS
 from xmas.optimization.synthesis import LLMPromptSynthesizer, MechanicalSynthesizer, Rewrite
 from xmas.optimization.topology import Edges, Fixed, TopologyBudget, crossover, mas_edges, mutate, terminals
 from xmas.optimization.updaters import weakest
-from xmas.spec import SPEC_VERSION_2
+
+if TYPE_CHECKING:
+    from xmas.check import SystemInfo
 
 NEW_AGENT_PROMPT = "You are {name}. Do your part of the task and pass on your result."
 """Seed text for an agent a mutation invented, before its prompt is written."""
@@ -70,20 +72,12 @@ class GraphUpdater:
     # ------------------------------------------------------------- proposing
 
     def propose(self, mas: MAS, credit: dict[str, list[float]], n: int) -> list[MAS]:
-        """Propose candidate systems differing from ``mas`` in topology.
+        """Propose up to ``n`` runnable candidates differing from ``mas`` in topology.
 
         Credit steers where the change lands. Candidates are drawn generously and
         then ranked by whether they touched the agent that earned the least,
         because an edge added somewhere the system was already doing fine is a
         wasted evaluation.
-
-        Args:
-            mas: The current system.
-            credit: Per-agent credit from an attributor, possibly empty.
-            n: How many candidates to return.
-
-        Returns:
-            Up to ``n`` candidates, every one of them runnable.
         """
         if n <= 0:
             return []
@@ -104,15 +98,9 @@ class GraphUpdater:
         return self.build(mas, ranked, n)
 
     def recombine(self, first: MAS, second: MAS, n: int) -> list[MAS]:
-        """Propose candidates that inherit topology from two parents.
+        """Propose up to ``n`` runnable candidates inheriting topology from two parents.
 
-        Args:
-            first: One parent; a version 2 child keeps what it holds still.
-            second: The other.
-            n: How many candidates to return.
-
-        Returns:
-            Up to ``n`` candidates, every one of them runnable.
+        A version 2 child keeps what ``first`` holds still.
         """
         parents = ((self.names_of(first), self.edges_of(first)), (self.names_of(second), self.edges_of(second)))
         entry, fixed = self.entry_of(first), self.fixed_of(first)
@@ -122,20 +110,12 @@ class GraphUpdater:
     # -------------------------------------------------------------- building
 
     def build(self, mas: MAS, candidates: Iterable[tuple[list[str], Edges]], n: int) -> list[MAS]:
-        """Build up to ``n`` candidates, in order, dropping those a version 2 check refuses.
+        """Build up to ``n`` candidates, best first, dropping those a version 2 check refuses.
 
         The operators know a version 2 system's budget and what it holds still,
         not its reads, types and joins, so :func:`~xmas.check.check_system` has
         the last word. A version 1 candidate the operators passed always builds,
         so a refusal there is a defect and is raised.
-
-        Args:
-            mas: The parent.
-            candidates: Names and edges per candidate, best first.
-            n: How many to return at most.
-
-        Returns:
-            The systems built.
         """
         built: list[MAS] = []
         for names, edges in candidates:
@@ -144,31 +124,20 @@ class GraphUpdater:
             try:
                 built.append(self.rebuild(mas, names, edges))
             except ValueError:
-                if mas.version != SPEC_VERSION_2:
+                if mas.version != 2:
                     raise
         return built
 
     def rebuild(self, mas: MAS, names: list[str], edges: Edges) -> MAS:
-        """Build a runnable system from a mutated topology.
+        """Build a runnable system from a mutated topology; ``ValueError`` if a version 2 candidate does not check.
 
-        Steps and boxes come over as they are (through ``mas._v2_kwargs()``),
-        and so do the agents whose predecessors did not change, frozen ones
-        among them; a version 2 system also keeps its conditional edges and its
-        named ``START``/``END`` edges, in the parent's order.
-
-        Args:
-            mas: The parent, whose nodes and models are inherited where they survive.
-            names: The candidate's node names.
-            edges: Its node-level edge set.
-
-        Returns:
-            The candidate as a system.
-
-        Raises:
-            ValueError: If a version 2 candidate does not check.
+        Steps and boxes come over as they are, and so do the agents whose
+        predecessors did not change, frozen ones among them; a version 2 system
+        also keeps its conditional edges and its named ``START``/``END`` edges,
+        in the parent's order.
         """
         wiring: Sequence[tuple[str, str] | Edge]
-        if mas.version == SPEC_VERSION_2:
+        if mas.version == 2:
             kept = self.wiring_of(mas, names, edges)
             inputs, wiring = self.reads_for(mas, names, edges, kept), kept
         else:
@@ -183,7 +152,6 @@ class GraphUpdater:
                 prompt, output = NEW_AGENT_PROMPT.format(name=name), self.output_of(mas, name)
                 agents[name] = Agent(name, prompt, output=output, inputs=inputs[name])
             else:
-                # copy keeps model, tools, output_type and schema (main kept model and tools)
                 agents[name] = parent.copy(inputs=inputs[name])
             if parent is None or sorted(parent.inputs) != sorted(inputs[name]):
                 agent = agents[name]
@@ -207,42 +175,17 @@ class GraphUpdater:
         )
 
     def output_of(self, mas: MAS, name: str) -> str:
-        """Return the variable one agent of a candidate writes.
-
-        An agent that survived the mutation keeps writing whatever it already
-        wrote; only an agent the mutation invented needs a name, and it gets the
-        conventional one.
-
-        Args:
-            mas: The parent, whose agents supply the surviving names.
-            name: The agent to look up.
-
-        Returns:
-            The output variable name.
-        """
+        """Return the variable an agent of a candidate writes: the parent's, or ``{name}_out`` for an invented one."""
         parent = mas.agents.get(name)
         return parent.output if parent is not None else f"{name}_out"
 
     def inputs_for(self, names: list[str], wiring: Edges, outputs: dict[str, str]) -> dict[str, list[str]]:
-        """Work out what each agent reads, from who now feeds it.
+        """Work out what each agent of a version 1 candidate reads, from who now feeds it.
 
-        This is the inversion the recon asked for. The seed derived an agent's
-        inputs from the placeholders in its prompt, which coupled prompt
-        optimization to topology: rewriting a prompt could silently rewire the
-        dataflow. Here the topology decides, and the prompt is written to match.
-
-        Args:
-            names: The candidate's agent names.
-            wiring: The full edge list, sentinels included.
-            outputs: The variable each agent writes, keyed by agent name. Passed
-                in rather than derived from the name, because an agent that
-                survives a mutation keeps the output variable it already had:
-                assuming ``f"{name}_out"`` wires every rewired agent to a variable
-                nothing writes, and the new edge then changes the schedule and
-                nothing else.
-
-        Returns:
-            Input variable names per agent, in a stable order.
+        The topology decides, and the prompt is written to match: deriving the
+        inputs from a prompt's placeholders would let a prompt rewrite silently
+        rewire the dataflow. ``outputs`` is each agent's variable, since a
+        surviving agent keeps the one it had. ``wiring`` includes the sentinels.
         """
         explicit = {target for _, target in wiring}
         resolved: dict[str, list[str]] = {}
@@ -261,14 +204,6 @@ class GraphUpdater:
         so conditional edges keep their kind, predicate and declared order (a
         ``when`` group is decided in that order); its edges from ``START`` or to
         ``END`` stay while their node does; new pairs are appended as plain edges.
-
-        Args:
-            mas: The version 2 parent.
-            names: The candidate's node names.
-            edges: Its node-level edge set.
-
-        Returns:
-            The edges.
         """
         pairs, present = set(edges), {*names, *SENTINELS}
         kept = [
@@ -281,32 +216,21 @@ class GraphUpdater:
         return [*kept, *(Edge(source, target) for source, target in edges if (source, target) not in known)]
 
     def reads_for(self, mas: MAS, names: list[str], edges: Edges, wiring: list[Edge]) -> dict[str, list[str]]:
-        """Work out what each agent of a version 2 candidate reads.
+        """Work out what each agent of a version 2 candidate reads, invented ones included, in node order.
 
         An agent whose predecessors did not change keeps its reads, which covers
         every frozen agent and every endpoint of a conditional edge. Any other
         agent keeps the reads still satisfiable (an input, or written by a node
         that now runs before it) and gains every value its new predecessors
         write; one left with nothing reads the system's inputs. Steps and boxes
-        read what their callable or inner system needs and are not rewired.
-
-        Args:
-            mas: The version 2 parent.
-            names: The candidate's node names.
-            edges: Its node-level edge set.
-            wiring: Its edges as the ``MAS`` takes them.
-
-        Returns:
-            Reads per agent, invented ones included, in node order.
+        are not rewired.
         """
-        writes: dict[str, set[str]] = {
-            name: {self.output_of(mas, name)} for name in names if name not in mas.steps and name not in mas.boxes
-        }
+        code = {*mas.steps, *mas.boxes}
+        writes: dict[str, set[str]] = {name: {self.output_of(mas, name)} for name in names if name not in code}
         agents = list(writes)
-        for name, step in mas.steps.items():
-            writes[name] = set(step_maps(step, mas.resolve_callable(step)[0])[1].values())
-        for name, box in mas.boxes.items():
-            writes[name] = set(box.writes.values())
+        for value, writers in cast("SystemInfo", mas.info).writers.items():  # set on every version 2 system
+            for node in code.intersection(writers):
+                writes.setdefault(node, set()).add(value)
 
         graph = build_graph(names, [(edge.source, edge.target) for edge in wiring])
         before = self.edges_of(mas)
@@ -336,16 +260,8 @@ class GraphUpdater:
         return sorted((source, target) for source, target in pairs if not {source, target}.intersection(SENTINELS))
 
     def fixed_of(self, mas: MAS) -> Fixed | None:
-        """Return what no mutation of a version 2 system may change, or ``None`` for version 1.
-
-        Args:
-            mas: The system.
-
-        Returns:
-            Its frozen nodes and conditional-edge endpoints, its steps and
-            boxes, the nodes it ends in, and its conditional edges.
-        """
-        if mas.version != SPEC_VERSION_2:
+        """Return what no mutation of a version 2 system may change, or ``None`` for version 1."""
+        if mas.version != 2:
             return None
         conditional = [edge for edge in mas.edges if edge.kind is not EdgeKind.PLAIN]
         held = set(mas.frozen).union(*({edge.source, edge.target} for edge in conditional))
@@ -371,17 +287,7 @@ class GraphUpdater:
         return weakest([name for name in mas.agents if name not in held], credit)
 
     def touches(self, agent: str | None, before: Edges, after: Edges) -> bool:
-        """Whether a candidate changed the edges around one agent.
-
-        Args:
-            agent: The agent to check, or None when credit gave no target.
-            before: The parent's edges.
-            after: The candidate's edges.
-
-        Returns:
-            True when the agent's neighbourhood changed, or when there is no
-            target to aim at, so that an unguided search is not held back.
-        """
+        """Whether a candidate changed the edges around ``agent``; always, with no agent to aim at."""
         if agent is None:
             return True
         changed = set(before) ^ set(after)
