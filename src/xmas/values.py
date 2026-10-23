@@ -23,7 +23,8 @@ KINDS = ("text", "json", "image", "audio", "document", "table", "file")
 """Every value kind of the format; ``list of <kind>`` builds on them."""
 
 _LIST = "list"
-_LIST_PREFIX = "list of "
+LIST_PREFIX = "list of "
+"""How a list type starts, in value types and in answer forms alike."""
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,7 @@ class ValueType:
 
     def __str__(self) -> str:
         """Return the type as the spec writes it, such as ``list of text``."""
-        return f"{_LIST_PREFIX}{self.item}" if self.item is not None else self.kind
+        return f"{LIST_PREFIX}{self.item}" if self.item is not None else self.kind
 
 
 TEXT = ValueType("text")
@@ -70,8 +71,8 @@ def parse_type(text: str) -> ValueType:
     if not isinstance(text, str):
         raise ValueError(f"A value type is a string such as 'text', not {text!r}.")
     words = text.strip()
-    if words.startswith(_LIST_PREFIX):
-        return ValueType(_LIST, parse_type(words[len(_LIST_PREFIX) :]))
+    if words.startswith(LIST_PREFIX):
+        return ValueType(_LIST, parse_type(words[len(LIST_PREFIX) :]))
     return ValueType(words)
 
 

@@ -28,6 +28,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, create_model
 
 from xmas.errors import ErrorKind
+from xmas.values import LIST_PREFIX
 
 RETRY_NOTE = "Your previous answer did not match the required format: {problem}\nAnswer again with only the JSON."
 """Appended to the prompt of the one retry; ``{problem}`` is the first problem."""
@@ -35,7 +36,6 @@ RETRY_NOTE = "Your previous answer did not match the required format: {problem}\
 _BASE: dict[str, Any] = {"text": str, "bool": bool, "int": int, "number": float, "json": Any}
 _WORDS = {"text": "text", "bool": "true or false", "int": "integer", "number": "number", "json": "any JSON"}
 _OBJECT = "object"
-_LIST_PREFIX = "list of "
 _KEYS = frozenset({"type", "means", "optional", "one of", "fields"})
 _FENCE = re.compile(r"\A```[\w-]*[ \t]*\n(.*)\n[ \t]*```\Z", re.S)
 _ANY_JSON: TypeAdapter[Any] = TypeAdapter(Any)
@@ -209,8 +209,8 @@ def _plain(fields: Mapping[Any, Any], where: str) -> dict[str, dict[str, Any]]:
 
 def _item_kind(kind: Any) -> str | None:
     """Return the base type under any ``list of`` words, or ``None`` if unknown."""
-    while isinstance(kind, str) and kind.startswith(_LIST_PREFIX):
-        kind = kind[len(_LIST_PREFIX) :].strip()
+    while isinstance(kind, str) and kind.startswith(LIST_PREFIX):
+        kind = kind[len(LIST_PREFIX) :].strip()
     return kind if isinstance(kind, str) and (kind in _BASE or kind == _OBJECT) else None
 
 
@@ -227,8 +227,8 @@ def _model(fields: dict[str, dict[str, Any]], name: str) -> type[BaseModel]:
 
 def _annotation(spec: dict[str, Any], kind: str, name: str) -> Any:
     """Return the Python type of a field whose (remaining) type words are ``kind``."""
-    if kind.startswith(_LIST_PREFIX):
-        return list[_annotation(spec, kind[len(_LIST_PREFIX) :].strip(), name)]  # type: ignore[misc]
+    if kind.startswith(LIST_PREFIX):
+        return list[_annotation(spec, kind[len(LIST_PREFIX) :].strip(), name)]  # type: ignore[misc]
     if "one of" in spec:
         return Literal[tuple(spec["one of"])]
     if kind == _OBJECT:
@@ -238,8 +238,8 @@ def _annotation(spec: dict[str, Any], kind: str, name: str) -> Any:
 
 def _phrase(spec: dict[str, Any], kind: str) -> str:
     """Return the words for a field's type, such as ``list of text`` or ``one of "a", "b"``."""
-    if kind.startswith(_LIST_PREFIX):
-        return _LIST_PREFIX + _phrase(spec, kind[len(_LIST_PREFIX) :].strip())
+    if kind.startswith(LIST_PREFIX):
+        return LIST_PREFIX + _phrase(spec, kind[len(LIST_PREFIX) :].strip())
     if "one of" in spec:
         return "one of " + ", ".join(json.dumps(choice, ensure_ascii=False) for choice in spec["one of"])
     return _OBJECT if kind == _OBJECT else _WORDS[kind]
