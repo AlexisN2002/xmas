@@ -58,13 +58,15 @@ class RunMeter:
     Attributes:
         budget: The run's limits, or ``None`` to count without limits.
         owner: The MAS the meter belongs to, so a nested run of another MAS that
-            inherits this meter can tell it is not its own.
+            inherits this meter can tell it is not its own, unless the meter
+            adopted that MAS (:meth:`adopt`).
         started_s: ``time.monotonic()`` when the meter was made, then when the
             run's first agent started (:meth:`start`).
         calls: Calls started so far.
         cost_usd: Cost reported or priced so far, in USD.
         uncosted_calls: Finished calls whose cost is unknown.
-        records: Records of the agents that finished, in wall-clock order.
+        records: Records of the owner's agents that finished, in wall-clock
+            order; an adopted system's are kept apart (:meth:`records_of`).
     """
 
     def __init__(self, budget: Budget | None = None, owner: object | None = None) -> None:
@@ -76,8 +78,31 @@ class RunMeter:
         self.cost_usd = 0.0
         self.uncosted_calls = 0
         self.records: list[AgentRecord] = []
+        self._adopted: dict[int, tuple[object, list[AgentRecord]]] = {}
         self._lock = threading.Lock()
         self._started = False
+
+    def adopt(self, system: object) -> None:
+        """Let a nested system, such as a box's, run on this meter: one budget for both.
+
+        Its calls, cost and wall time count against this meter's limits, and its
+        records are kept apart from the owner's, per system.
+
+        Args:
+            system: The nested system.
+        """
+        with self._lock:
+            self._adopted.setdefault(id(system), (system, []))
+
+    def owns(self, system: object) -> bool:
+        """Whether ``system`` is the owner or an adopted system."""
+        return system is self.owner or id(system) in self._adopted
+
+    def records_of(self, system: object) -> list[AgentRecord]:
+        """Return the records kept for ``system``: the owner's, or an adopted system's."""
+        if system is self.owner:
+            return self.records
+        return self._adopted[id(system)][1] if id(system) in self._adopted else []
 
     @property
     def elapsed_s(self) -> float:
@@ -149,11 +174,13 @@ class RunMeter:
             else:
                 self.cost_usd += cost
 
-    def keep(self, record: AgentRecord) -> None:
+    def keep(self, record: AgentRecord, system: object | None = None) -> None:
         """Keep the record of an agent that finished, so a failed run still has it.
 
         Args:
             record: The finished agent's record.
+            system: The system the agent belongs to, when it is an adopted one;
+                ``None`` or the owner keeps it in :attr:`records`.
         """
         with self._lock:
-            self.records.append(record)
+            self.records_of(self.owner if system is None else system).append(record)
