@@ -117,9 +117,16 @@ class Tool:
         if not given:
             raise ValueError(f"Tool {name!r} needs at least one write.")
         typed = {key: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for key, vtype in given.items()}
-        fields = {"name": name, "description": description, "parameters": parameters, "fn": fn}
-        for key, value in {**fields, "arguments_model": arguments_model, "writes": typed}.items():
-            object.__setattr__(self, key, value)
+        values = {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+            "fn": fn,
+            "arguments_model": arguments_model,
+            "writes": typed,
+        }
+        for key, value in values.items():
+            object.__setattr__(self, key, value)  # frozen
 
     @property
     def reads(self) -> dict[str, ValueType]:
