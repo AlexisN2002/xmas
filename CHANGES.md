@@ -24,4 +24,14 @@ What changed in the format: a version 2 spec has `inputs`, `agents`, `steps` and
 
 What stays the same: version 1 files load, run and save exactly as before, and so do their optimizers. The request a one-agent system sends is checked byte for byte, as is the bare-prompt encoding of a single agent. promptolution's optimizers run unmodified, and the public calls `run`, `run_batch`, `predict`, `copy`, `to_yaml` and `from_yaml` keep their behaviour. Every tool call runs, since a tool call need not be idempotent. A failed plain call's error reads `RuntimeError: LLM batch failed: ...` as before; a version 2 failure reads `Type: message`. A version 1 trace gains a `health` key only when a signal fires. Three differences on xmas's own model class and tool agents: a permanent provider error (bad request, key or money refused) is sent once instead of six times, and `APILLM(full_response=False)` keeps the earlier behaviour for plain agents; a tool turn sends a permanent error once either way; and a tool agent whose last turn is cut by `max_tokens` or refused before it wrote anything fails with `length_cut` or `refusal`, as a plain agent does, instead of answering `""`.
 
-Planned next: saving a version 2 system as a `.mas` bundle (until then `to_yaml` refuses one and `to_dict` gives its spec), a `verify` step that checks an answer before the run goes on, running a node `for each` item of a list, image and other media values, people as nodes of a system, and a Stop that ends a run cleanly.
+Planned next, not in the code yet:
+
+- Save a version 2 system as a `.mas` bundle, a folder with one file per part. Until then `to_yaml` refuses one and `to_dict` gives its spec.
+- `verify`, which checks a saved bundle on three levels: checksums of every file and the code it points to; a dry check of the wiring, the prompts and the model names, with no model call; and the warm-up examples carried in the bundle, run under a small budget. A failure warns.
+- `for each`, which runs a chain once per item of a list.
+- `first of`, which races branches and keeps the first good result.
+- `run_state`, which starts a run from several named values and reads several outputs.
+- Images, audio, documents, tables and files as values.
+- People as nodes of a system.
+- A Stop that ends a running system and keeps every record so far.
+- Learning from human picks.
