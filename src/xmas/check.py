@@ -69,11 +69,17 @@ class SystemInfo:
         writers: The nodes writing each written value, in node order.
         joins: Each node with several incoming edges, :data:`~xmas.graph.END`
             included, as a merge or a join.
+        graph: The topology, with the implicit wiring from
+            :data:`~xmas.graph.START` and to :data:`~xmas.graph.END`.
+        predicates: The parsed predicate of every ``when``, ``while`` and
+            ``switch`` edge (a switch's is its path).
     """
 
     types: dict[str, ValueType]
     writers: dict[str, tuple[str, ...]]
     joins: dict[str, Join]
+    graph: nx.DiGraph[str]
+    predicates: dict[Edge, Predicate]
 
 
 def step_maps(step: Step, item: Tool) -> tuple[dict[str, str], dict[str, str]]:
@@ -243,7 +249,7 @@ def _writer_types(mas: MAS, writes: _Writes) -> tuple[dict[str, ValueType], dict
 
 def _topology(mas: MAS, nodes: list[str]) -> tuple[nx.DiGraph[str], RouteGraph | None, dict[str, Join], list[str]]:
     """Build the graph and, when its forward part has no cycle, its routes and joins; with the problems found."""
-    loops = [(edge.source, edge.target) for edge in mas.edges if edge.kind is EdgeKind.WHILE]
+    loops = mas.while_edges
     errors = [(edge.source, edge.target) for edge in mas.edges if edge.kind is EdgeKind.ERROR]
     graph = build_graph(nodes, [(edge.source, edge.target) for edge in mas.edges], back=loops, errors=errors)
     problems: list[str] = []
@@ -378,6 +384,7 @@ def check_system(mas: MAS) -> SystemInfo:
     edge_problems, predicates, buildable = _edge_problems(mas.edges, {*nodes, *SENTINELS})
     problems += io_problems + type_problems + edge_problems
 
+    graph: nx.DiGraph[str] | None = None
     routes: RouteGraph | None = None
     joins: dict[str, Join] = {}
     if buildable:
@@ -389,7 +396,7 @@ def check_system(mas: MAS) -> SystemInfo:
             problems += _predicate_problems(mas, predicates, types, writers, before)
     problems += _writer_count_problems(mas, writers, routes)
 
-    if problems:
+    if problems or graph is None:  # an edge list that makes no graph is always a problem of the list
         lines = "\n".join(f"- {problem}" for problem in problems)
         raise ValueError(f"The system does not check ({len(problems)} problem{'s' * (len(problems) > 1)}):\n{lines}")
-    return SystemInfo(types, {value: tuple(names) for value, names in writers.items()}, joins)
+    return SystemInfo(types, {value: tuple(names) for value, names in writers.items()}, joins, graph, predicates)

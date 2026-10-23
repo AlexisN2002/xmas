@@ -245,7 +245,7 @@ class MAS(BasePredictor):
     def _build_v2(
         self, inputs: Mapping[str, str | ValueType] | None, state: Mapping[str, Mapping[str, str]] | None
     ) -> None:
-        """Read the inputs and merges, run :func:`~xmas.check.check_system`, then build the graph."""
+        """Read the inputs and merges, and run :func:`~xmas.check.check_system`, which builds the graph."""
         given = inputs if inputs is not None else _QUERY_ONLY
         self.inputs = {name: kind if isinstance(kind, ValueType) else parse_type(kind) for name, kind in given.items()}
         self.merges = {}
@@ -254,9 +254,13 @@ class MAS(BasePredictor):
                 raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
             self.merges[value] = MERGE_LAST
         self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
-        errors = [(edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.ERROR]
-        pairs = [(edge.source, edge.target) for edge in self.edges]
-        self.graph = build_graph([*self.agents, *self.steps, *self.boxes], pairs, back=self.while_edges, errors=errors)
+        self.graph = self.info.graph
+
+    def _checked(self) -> SystemInfo:
+        """Return what the check learned, which only a version 2 system has."""
+        if self.info is None:
+            raise ValueError("A version 1 system has no check_system result.")
+        return self.info
 
     def _callables(self) -> ToolIndex:
         """Return the callables registry: every tool and tool source, indexed on first use."""

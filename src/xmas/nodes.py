@@ -10,10 +10,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover
-    from xmas.check import SystemInfo
     from xmas.mas import MAS
     from xmas.values import ValueType
 
@@ -106,7 +105,7 @@ class Box:
 
     def types(self) -> tuple[dict[str, ValueType], dict[str, ValueType]]:
         """Return the outer reads and writes, each with the type of its inner value: ``{outer: type}``."""
-        inner = cast("SystemInfo", self.system.info).types  # __post_init__ refused a version 1 system
+        inner = self.system._checked().types
         reads = {outer: self.system.inputs[name] for name, outer in self.reads.items()}
         return reads, {outer: inner[name] for name, outer in self.writes.items()}
 

@@ -41,7 +41,7 @@ from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
 from xmas.llms.meta import SupportsMeta, supports_meta
 from xmas.nodes import Box, Step
-from xmas.predicates import Context, Predicate, parse_predicate
+from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
 from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
@@ -405,16 +405,15 @@ class _Decision:
     errors: tuple[Edge, ...]
 
     @classmethod
-    def of(cls, edges: list[Edge]) -> _Decision:
-        """Build the decision of one node from its out-edges, in declared order."""
+    def of(cls, edges: list[Edge], predicates: Mapping[Edge, Predicate]) -> _Decision:
+        """Build the decision of one node from its out-edges, in declared order, and the check's predicates."""
         choices = []
         for edge in edges:
             if edge.kind is EdgeKind.SWITCH:
-                path = ("path", tuple(str(edge.switch).split(".")))
-                compare = ("cmp", "==", path, ("lit", edge.case))
+                compare = ("cmp", "==", predicates[edge].tree, ("lit", edge.case))
                 choices.append((edge, Predicate(f"{edge.switch} == {edge.case!r}", compare)))
             elif edge.kind in (EdgeKind.WHEN, EdgeKind.WHILE):
-                choices.append((edge, parse_predicate(str(edge.when))))
+                choices.append((edge, predicates[edge]))
         return cls(
             plain=tuple(edge.target for edge in edges if edge.kind is EdgeKind.PLAIN),
             choices=tuple(choices),
@@ -606,7 +605,7 @@ def _wire_v2(
     builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS, out: dict[str, list[Edge]], deciding: set[str]
 ) -> None:
     """Wire a version 2 graph: a deciding node routes by what its wrapper wrote, joins are barriers, the rest plain."""
-    direct, relays = _add_joins(builder, mas.info.joins if mas.info is not None else {})
+    direct, relays = _add_joins(builder, mas._checked().joins)
     for source, edges in out.items():
         targets = {
             edge.target: relays.get((source, edge.target), edge.target)
@@ -642,7 +641,9 @@ def compile_mas(mas: MAS) -> Any:
 
     out = _out_edges(mas) if mas.version == 2 else {}
     decisions = {
-        source: _Decision.of(edges) for source, edges in out.items() if any(e.kind is not EdgeKind.PLAIN for e in edges)
+        source: _Decision.of(edges, mas._checked().predicates)
+        for source, edges in out.items()
+        if any(e.kind is not EdgeKind.PLAIN for e in edges)
     }
     deferred = join_nodes(mas.graph) if mas.version != 2 else set()
     for name, body in bodies.items():
