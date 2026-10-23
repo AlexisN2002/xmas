@@ -1,8 +1,10 @@
 """Topology: the graph a MAS executes, and the questions asked of it.
 
-The topology is a ``networkx.DiGraph`` whose nodes are agent names plus two
-sentinels. Keeping it a plain nx graph is deliberate: a topology optimizer is
-then an ordinary graph-rewriting component and needs nothing from xmas to work.
+The topology is a ``networkx.DiGraph`` whose nodes are node names, agents and
+(version 2) steps alike, plus two sentinels. The functions here speak of agents
+because version 1 has no other node; they treat every node the same. Keeping it
+a plain nx graph is deliberate: a topology optimizer is then an ordinary
+graph-rewriting component and needs nothing from xmas to work.
 """
 
 from __future__ import annotations
@@ -55,7 +57,8 @@ def build_graph(agents: list[str], edges: list[tuple[str, str]]) -> nx.DiGraph[s
     carry meaning.
 
     Args:
-        agents: Agent names, which become the non-sentinel nodes.
+        agents: Node names, agents and steps alike, which become the
+            non-sentinel nodes.
         edges: Directed ``(source, target)`` pairs between agent names. Sentinels
             may be named explicitly to override the implicit wiring.
 
@@ -206,6 +209,41 @@ def back_edges(graph: nx.DiGraph[str]) -> set[tuple[str, str]]:
                 stack.append((target, _pending(graph, target)))
                 open_nodes.add(target)
     return found
+
+
+LOOP_REFUSAL = "a loop needs a while edge, phase 2b"
+"""Why a version 2 system with a cycle is refused: phase 2a runs no loops."""
+
+
+def loop_problems(graph: nx.DiGraph[str]) -> list[str]:
+    """Return one problem per cycle of a version 2 topology.
+
+    Version 1 loops on the ``<continue>`` marker of its back edges; version 2
+    loops only through a ``while`` edge, which arrives in phase 2b, so every
+    cycle is refused until then.
+
+    Args:
+        graph: The topology.
+
+    Returns:
+        One line per cycle-closing edge, naming it; empty for an acyclic graph.
+    """
+    return [
+        f"{LOOP_REFUSAL}: the edge {source} -> {target} closes a cycle" for source, target in sorted(back_edges(graph))
+    ]
+
+
+def ancestors(graph: nx.DiGraph[str], node: str) -> set[str]:
+    """Return every node with a path to ``node``, sentinels included.
+
+    Args:
+        graph: The topology.
+        node: The node to inspect.
+
+    Returns:
+        Its ancestors, excluding ``node`` unless it sits on a cycle.
+    """
+    return _reachable(graph, node, forward=False)
 
 
 def forward_predecessors(graph: nx.DiGraph[str], node: str) -> set[str]:
