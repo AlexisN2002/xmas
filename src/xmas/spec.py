@@ -6,8 +6,9 @@ framework-agnostic artefact an optimization run produces. No LLM object, no
 compiled graph and no callable is ever part of it.
 
 Two versions exist. A spec without ``version: 2`` is version 1 and goes through
-:func:`validate_spec` exactly as before. A ``version: 2`` spec adds steps, typed
-values, answer forms and the edge forms of :mod:`xmas.edges`, keeps its prompts
+:func:`validate_spec` exactly as before. A ``version: 2`` spec adds steps, boxes,
+typed values, answer forms, the edge forms of :mod:`xmas.edges`, ``frozen``
+nodes and ``health`` settings, keeps its prompts
 in a top-level ``prompts:`` section, and has its shape checked by
 :func:`validate_spec_v2`.
 """
@@ -38,7 +39,8 @@ V2_KEYS = (
 )
 """Every top-level key of a version 2 spec, in the order a dump writes them."""
 
-_LATER = frozenset({"boxes", "frozen", "health"})
+_BOX_KEYS = frozenset({"name", "reads", "writes", "system"})
+_HEALTH_KEYS = {"length_factor": (int, float), "min_samples": (int,), "leak": (list,)}
 _AGENT_V2_KEYS = frozenset({"name", "model", "reads", "writes", "tools", "schema"})
 _STEP_KEYS = frozenset({"name", "uses", "reads", "writes"})
 _CALLABLE_KEYS = frozenset({"kind", "import", "server", "reads", "writes"})
@@ -102,6 +104,23 @@ class MergeSpec(TypedDict):
     merge: str
 
 
+class BoxSpec(TypedDict):
+    """Serialized form of one box: its maps ``{inside: in the graph}`` and the inner system's spec."""
+
+    name: str
+    reads: dict[str, str]
+    writes: dict[str, str]
+    system: dict[str, Any]
+
+
+class HealthSpec(TypedDict, total=False):
+    """The health settings a spec changes from their defaults."""
+
+    length_factor: float
+    min_samples: int
+    leak: list[str]
+
+
 class MASSpecV2(TypedDict, total=False):
     """Serialized form of a version 2 MAS; keys in :data:`V2_KEYS` order, empty ones left out."""
 
@@ -109,8 +128,11 @@ class MASSpecV2(TypedDict, total=False):
     inputs: dict[str, str]
     agents: list[AgentSpecV2]
     steps: list[StepSpec]
+    boxes: list[BoxSpec]
     edges: list[str | dict[str, Any]]
     state: dict[str, MergeSpec]
+    frozen: list[str]
+    health: HealthSpec
     callables: dict[str, CallableSpec]
     default_model: str
     prompts: dict[str, str]
@@ -224,16 +246,14 @@ def validate_spec_v2(data: dict[str, Any]) -> MASSpecV2:
         data: Candidate spec with ``version: 2``, typically parsed from YAML.
 
     Returns:
-        The same mapping, narrowed to :class:`MASSpecV2`.
+        The same mapping, narrowed to :class:`MASSpecV2`; a box's inner system
+        is checked as a spec of its own when the box is built.
 
     Raises:
-        ValueError: If a key is unknown or arrives in phase 2b, a section has
-            the wrong shape, an agent has no prompt or not exactly one write, or
-            ``prompts`` names an unknown agent.
+        ValueError: If a key is unknown, a section has the wrong shape, an
+            agent has no prompt or not exactly one write, or ``prompts`` names
+            an unknown agent.
     """
-    later = sorted(_LATER.intersection(data))
-    if later:
-        raise ValueError(f"Spec keys {later} arrive in phase 2b.")
     unknown = set(data) - set(V2_KEYS)
     if unknown:
         raise ValueError(f"Unknown spec keys: {sorted(unknown)}.")
@@ -259,8 +279,31 @@ def validate_spec_v2(data: dict[str, Any]) -> MASSpecV2:
             raise ValueError(f"{where} needs a string 'uses'.")
         for key in ("reads", "writes"):
             _names_map(step.get(key, {}), f"{where} {key!r}")
-    if not agents and not steps:
-        raise ValueError("Spec needs at least one agent or step.")
+    boxes = _entries(data, "boxes", "Box")
+    for box in boxes:
+        where = f"Box {box['name']!r}"
+        if set(box) != _BOX_KEYS:
+            raise ValueError(f"{where} needs exactly the keys {sorted(_BOX_KEYS)}, got {sorted(box)}.")
+        for key in ("reads", "writes"):
+            _names_map(box[key], f"{where} {key!r}")
+        if not isinstance(box["system"], dict):
+            raise ValueError(f"{where} needs 'system' to be a version 2 spec.")
+    if not agents and not steps and not boxes:
+        raise ValueError("Spec needs at least one agent, step or box.")
+
+    frozen = data.get("frozen", [])
+    if not isinstance(frozen, list) or not all(isinstance(name, str) for name in frozen):
+        raise ValueError("Spec needs 'frozen' to be a list of node names.")
+    health = data.get("health", {})
+    if not isinstance(health, dict):
+        raise ValueError("Spec needs 'health' to be a mapping.")
+    for key, value in health.items():
+        kinds = _HEALTH_KEYS.get(key)
+        if kinds is None:
+            raise ValueError(f"Spec 'health' has unknown key {key!r}; known: {sorted(_HEALTH_KEYS)}.")
+        wrong = isinstance(value, bool) or not isinstance(value, kinds)
+        if wrong or (key == "leak" and not all(isinstance(pattern, str) for pattern in value)):
+            raise ValueError(f"Spec 'health' {key!r} has the wrong type: {value!r}.")
 
     if not isinstance(data.get("edges", []), list):
         raise ValueError("Spec needs 'edges' to be a list.")

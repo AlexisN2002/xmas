@@ -7,10 +7,13 @@ A spec lists its edges as items of two forms::
     - judge -> apology: else
     - count -> apology: {on error: [timeout, outage]}
 
+    - judge -> publish: {switch: verdict.action}              # case defaults to the target
+    - judge -> hold: {switch: verdict.action, case: wait}
+
 :func:`parse_edges` reads them into :class:`Edge` objects, one per (source,
-target) pair, and :func:`dump_edges` writes them back canonically. Phase 2a
-runs plain edges only; the conditional forms parse here, and
-:func:`xmas.check.check_system` refuses them until phase 2b runs them.
+target) pair, and :func:`dump_edges` writes them back canonically. Whether the
+predicates, paths and error kinds make sense is :func:`xmas.check.check_system`'s
+question.
 """
 
 from __future__ import annotations
@@ -163,10 +166,10 @@ def _conditional(source: str, target: str, spec: Any) -> Edge:
         case = spec.get("case")
         return Edge(source, target, EdgeKind.SWITCH, switch=_text(spec["switch"], where), case=case)
     errors = spec[_ON_ERROR]
-    if errors == ANY_ERROR:
-        errors = [ANY_ERROR]
+    if isinstance(errors, str):
+        errors = [errors]
     if not isinstance(errors, list) or not errors or not all(isinstance(kind, str) and kind for kind in errors):
-        raise ValueError(f"Edge {where!r}: 'on error' takes 'any' or a list of error kinds, not {errors!r}.")
+        raise ValueError(f"Edge {where!r}: 'on error' takes 'any', an error kind or a list of them, not {errors!r}.")
     return Edge(source, target, EdgeKind.ERROR, errors=tuple(errors))
 
 

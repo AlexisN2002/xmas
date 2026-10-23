@@ -1,16 +1,20 @@
-"""Nodes that are not agents: a :class:`Step` runs a callable when the graph reaches it.
+"""Nodes that are not agents: a :class:`Step` runs a callable, a :class:`Box` a whole system.
 
-A step lives in ``MAS.steps``, never in ``MAS.agents``, so prompts, encodings and
-prompt optimizers see agents only. Its maps rename between the callable and the
-graph: every map is ``{name inside: name in the graph}``. Boxes, which run a
-whole system as one node, join this module in phase 2b.
+Steps live in ``MAS.steps`` and boxes in ``MAS.boxes``, never in ``MAS.agents``,
+so prompts, encodings and prompt optimizers see agents only. Their maps rename
+between the inside and the graph: every map is ``{name inside: name in the
+graph}``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from xmas.mas import MAS
+    from xmas.values import ValueType
 
 _STEP_KEYS = ("name", "uses", "reads", "writes")
 
@@ -44,12 +48,7 @@ class Step:
         if not self.uses:
             raise ValueError(f"Step {self.name!r} needs the name of the callable it uses.")
         for label in ("reads", "writes"):
-            mapping = getattr(self, label)
-            if not isinstance(mapping, Mapping) or not all(
-                isinstance(k, str) and k and isinstance(v, str) and v for k, v in mapping.items()
-            ):
-                raise ValueError(f"Step {self.name!r}: {label} must map names to names, got {mapping!r}.")
-            object.__setattr__(self, label, dict(mapping))
+            object.__setattr__(self, label, _names_map(f"Step {self.name!r}", label, getattr(self, label)))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form; ``reads`` and ``writes`` only when not empty."""
@@ -74,3 +73,75 @@ class Step:
         if missing:
             raise ValueError(f"Step is missing required keys: {sorted(missing)}.")
         return cls(data["name"], data["uses"], data.get("reads") or {}, data.get("writes") or {})
+
+
+def _names_map(owner: str, label: str, mapping: Any) -> dict[str, str]:
+    """Return a plain copy of a ``{name: name}`` map, refusing anything else."""
+    if not isinstance(mapping, Mapping) or not all(
+        isinstance(k, str) and k and isinstance(v, str) and v for k, v in mapping.items()
+    ):
+        raise ValueError(f"{owner}: {label} must map names to names, got {mapping!r}.")
+    return dict(mapping)
+
+
+@dataclass(frozen=True)
+class Box:
+    """A node that runs a whole version 2 system on values of the outer one.
+
+    The inner system starts from the mapped values, runs on the outer run's
+    meter, and its writes come back under their outer names. Types carry over:
+    an outer value has the type of the inner value it maps to.
+
+    Attributes:
+        name: Unique node name in the outer MAS.
+        system: The inner version 2 system; it may hold boxes itself.
+        reads: ``{inner input: outer value}``, one entry for every input the
+            inner system declares.
+        writes: ``{inner value: outer value}`` for the inner writes the outer
+            system keeps; at least one.
+
+    Raises:
+        ValueError: If ``name`` is empty, ``system`` is not version 2, a map
+            holds a name that is not a non-empty string, ``reads`` does not
+            name exactly the inner inputs, or ``writes`` names no inner write
+            or one the inner system does not write.
+    """
+
+    name: str
+    system: MAS
+    reads: Mapping[str, str]
+    writes: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        """Check the maps against the inner system and keep plain copies of them."""
+        if not self.name:
+            raise ValueError("A box needs a name.")
+        where = f"Box {self.name!r}"
+        if self.system.info is None:
+            raise ValueError(f"{where}: the system in a box must be version 2.")
+        reads = _names_map(where, "reads", self.reads)
+        writes = _names_map(where, "writes", self.writes)
+        inputs = sorted(self.system.inputs)
+        if sorted(reads) != inputs:
+            raise ValueError(f"{where}: reads must map exactly the inner inputs {inputs}, got {sorted(reads)}.")
+        written = sorted(self.system.info.writers)
+        if not writes or not set(writes) <= set(written):
+            raise ValueError(f"{where}: writes must map inner writes, some of {written}, got {sorted(writes)}.")
+        object.__setattr__(self, "reads", reads)
+        object.__setattr__(self, "writes", writes)
+
+    def types(self) -> tuple[dict[str, ValueType], dict[str, ValueType]]:
+        """Return the outer reads and writes, each with the type of its inner value: ``{outer: type}``."""
+        info = self.system.info
+        inner = info.types if info is not None else {}
+        reads = {outer: self.system.inputs[name] for name, outer in self.reads.items()}
+        return reads, {outer: inner[name] for name, outer in self.writes.items()}
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the plain-data form, the inner system as its own version 2 spec."""
+        return {
+            "name": self.name,
+            "reads": dict(self.reads),
+            "writes": dict(self.writes),
+            "system": dict(self.system.to_dict()),
+        }

@@ -25,18 +25,22 @@ from xmas.graph import (
     agent_names,
     back_edges,
     build_graph,
+    forward_graph,
     join_nodes,
     terminal_agent,
     validate_graph,
 )
-from xmas.nodes import Step
+from xmas.health import HealthSettings
+from xmas.nodes import Box, Step
 from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import (
     SPEC_VERSION,
     SPEC_VERSION_2,
     AgentSpec,
     AgentSpecV2,
+    BoxSpec,
     CallableSpec,
+    HealthSpec,
     MASSpec,
     MASSpecV2,
     StepSpec,
@@ -71,14 +75,19 @@ class MAS(BasePredictor):
     :meth:`copy` is how candidates are derived from them.
 
     A system is version 1 or version 2. Version 2 adds steps (nodes that run a
-    callable without a model), typed values, answer forms and declared inputs,
-    and is checked by :func:`xmas.check.check_system` when it is built. A
-    version 1 system behaves, serializes and compiles exactly as before.
+    callable without a model), boxes (nodes that run a whole system), typed
+    values, answer forms, declared inputs and conditional edges, and is checked
+    by :func:`xmas.check.check_system` when it is built. A version 1 system
+    behaves, serializes and compiles exactly as before.
 
     Attributes:
         agents: Agents keyed by name. Mutable, so ``mas.agents["solver"].prompt``
             is a supported edit.
         steps: Steps keyed by name (version 2); empty in version 1.
+        boxes: Boxes keyed by name (version 2); empty in version 1.
+        frozen: Names of the nodes no optimizer may change (version 2).
+        health: The thresholds of the run's health signals, or ``None`` for
+            the defaults.
         edges: The declared edges, in order, without the implicit wiring from
             :data:`~xmas.graph.START` and to :data:`~xmas.graph.END`.
         inputs: The values a run starts with, with their types; ``{query: text}``
@@ -99,6 +108,9 @@ class MAS(BasePredictor):
 
     agents: dict[str, Agent]
     steps: dict[str, Step]
+    boxes: dict[str, Box]
+    frozen: frozenset[str]
+    health: HealthSettings | None
     edges: tuple[Edge, ...]
     inputs: dict[str, ValueType]
     merges: dict[str, str]
@@ -126,6 +138,9 @@ class MAS(BasePredictor):
         inputs: Mapping[str, str | ValueType] | None = None,
         state: Mapping[str, Mapping[str, str]] | None = None,
         version: int | None = None,
+        boxes: Sequence[Box] = (),
+        frozen: Iterable[str] = (),
+        health: HealthSettings | None = None,
     ) -> None:
         """Initialize a MAS.
 
@@ -156,8 +171,13 @@ class MAS(BasePredictor):
                 Defaults to ``{"query": "text"}``.
             state: ``{value: {"merge": "last"}}`` for each value several nodes
                 may write (version 2).
-            version: 1 or 2. Defaults to 2 when steps, conditional edges, a
-                non-text agent, ``inputs`` or ``state`` are used, else 1.
+            version: 1 or 2. Defaults to 2 when steps, boxes, conditional
+                edges, a non-text agent, ``inputs``, ``state`` or ``frozen``
+                are used, else 1.
+            boxes: Nodes that run a whole version 2 system (version 2).
+            frozen: Names of nodes no optimizer may change (version 2).
+            health: Thresholds of the health signals; ``None`` keeps the
+                defaults.
 
         Raises:
             ValueError: If names collide, an edge names an unknown node, the
@@ -167,8 +187,12 @@ class MAS(BasePredictor):
                 listing every problem :func:`~xmas.check.check_system` finds.
         """
         self.edges = tuple(edge if isinstance(edge, Edge) else Edge(*edge) for edge in edges or ())
+        self.frozen = frozenset(frozen)
+        self.health = health
         uses_v2 = (
             bool(steps)
+            or bool(boxes)
+            or bool(self.frozen)
             or inputs is not None
             or state is not None
             or any(edge.kind is not EdgeKind.PLAIN for edge in self.edges)
@@ -178,16 +202,21 @@ class MAS(BasePredictor):
         if self.version not in (SPEC_VERSION, SPEC_VERSION_2):
             raise ValueError(f"version must be 1 or 2, not {self.version!r}.")
         if self.version == SPEC_VERSION and uses_v2:
-            raise ValueError("Steps, inputs, state, conditional edges and typed writes need version 2.")
+            raise ValueError("Steps, boxes, inputs, state, frozen, conditional edges and typed writes need version 2.")
 
-        if not agents and (self.version == SPEC_VERSION or not steps):
-            raise ValueError("A MAS needs at least one agent." if not steps else "A MAS needs at least one node.")
+        if not agents and (self.version == SPEC_VERSION or not (steps or boxes)):
+            raise ValueError(
+                "A MAS needs at least one node."
+                if self.version == SPEC_VERSION_2
+                else "A MAS needs at least one agent."
+            )
 
         self.agents = {agent.name: agent for agent in agents}
         if len(self.agents) != len(agents):
             raise ValueError("Agent names must be unique.")
         self.steps = {step.name: step for step in steps}
-        names = [*self.agents, *(step.name for step in steps)]
+        self.boxes = {box.name: box for box in boxes}
+        names = [*self.agents, *(step.name for step in steps), *(box.name for box in boxes)]
         if len(set(names)) != len(names):
             raise ValueError(f"Node names must be unique: {sorted({n for n in names if names.count(n) > 1})}.")
         self.inputs = (
@@ -238,7 +267,7 @@ class MAS(BasePredictor):
             # The check builds and checks the topology itself, so that a bad edge
             # is one problem in the list rather than the first and only error.
             self.info = check_system(self)
-            self.graph = build_graph(names, pairs)
+            self.graph = build_graph(names, pairs, back=self.while_edges)
             return
         for agent in agents:  # fail at construction, not mid-run; tool-free systems never touch their sources
             if agent.tools:
@@ -283,9 +312,15 @@ class MAS(BasePredictor):
         return index[step.uses]
 
     @property
-    def nodes(self) -> dict[str, Agent | Step]:
-        """Every node, agents and steps, keyed by name in topological order."""
-        return {name: self.agents.get(name) or self.steps[name] for name in agent_names(self.graph)}
+    def nodes(self) -> dict[str, Agent | Step | Box]:
+        """Every node, agents, steps and boxes, keyed by name in the topological order of one pass."""
+        everything: dict[str, Agent | Step | Box] = {**self.agents, **self.steps, **self.boxes}
+        return {name: everything[name] for name in agent_names(forward_graph(self.graph, self.while_edges))}
+
+    @property
+    def while_edges(self) -> tuple[tuple[str, str], ...]:
+        """The ``(source, target)`` of every ``while`` edge, in declared order: the loops of a version 2 run."""
+        return tuple((edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.WHILE)
 
     # ----------------------------------------------------------------- models
 
@@ -529,7 +564,8 @@ class MAS(BasePredictor):
         pass ``**mas._v2_kwargs()``, so a field added here reaches all of them.
 
         Returns:
-            ``steps``, ``inputs``, ``state`` and ``version``.
+            ``steps``, ``inputs``, ``state``, ``version``, ``boxes``, ``frozen``
+            and ``health``.
         """
         v2 = self.version == SPEC_VERSION_2
         return {
@@ -537,6 +573,9 @@ class MAS(BasePredictor):
             "inputs": dict(self.inputs) if v2 else None,
             "state": {value: {"merge": rule} for value, rule in self.merges.items()} if v2 else None,
             "version": self.version,
+            "boxes": tuple(self.boxes.values()),
+            "frozen": self.frozen,
+            "health": self.health,
         }
 
     # ---------------------------------------------------------- serialization
@@ -575,10 +614,17 @@ class MAS(BasePredictor):
             spec["agents"] = [_agent_spec(agent) for agent in self.agents.values()]
         if self.steps:
             spec["steps"] = [cast("StepSpec", step.to_dict()) for step in self.steps.values()]
+        if self.boxes:
+            spec["boxes"] = [cast("BoxSpec", box.to_dict()) for box in self.boxes.values()]
         if self.edges:
             spec["edges"] = dump_edges(self.edges)
         if self.merges:
             spec["state"] = {value: {"merge": rule} for value, rule in self.merges.items()}
+        if self.frozen:
+            spec["frozen"] = sorted(self.frozen)
+        health = _health_spec(self.health)
+        if health:
+            spec["health"] = health
         callables = self._callable_specs()
         if callables:
             spec["callables"] = callables
@@ -677,6 +723,16 @@ class MAS(BasePredictor):
                     schema=item.get("schema"),
                 )
             )
+        boxes = [
+            Box(
+                item["name"],
+                cls._from_v2(item["system"], llm=llm, llms=llms, tools=tools),
+                item["reads"],
+                item["writes"],
+            )
+            for item in spec.get("boxes", [])
+        ]
+        health = spec.get("health")
         mas = cls(
             agents=agents,
             edges=parse_edges(spec.get("edges", [])),
@@ -688,6 +744,9 @@ class MAS(BasePredictor):
             inputs=spec.get("inputs"),
             state=cast("Mapping[str, Mapping[str, str]] | None", spec.get("state")),
             version=SPEC_VERSION_2,
+            boxes=boxes,
+            frozen=spec.get("frozen", ()),
+            health=None if health is None else _health_settings(health),
         )
         mas._check_callables(spec.get("callables", {}))
         return mas
@@ -761,9 +820,11 @@ class MAS(BasePredictor):
     def describe(self) -> dict[str, Any]:
         """Return the system as plain data, for drawing it and naming it.
 
-        Every node with its kind, model or callable, typed reads and writes;
-        every edge, the implicit wiring marked ``"implicit": True``; the join
-        kind of each node that waits for several predecessors; and an ``id``,
+        Every node with its kind, model, callable or inner system (a box's own
+        description), typed reads and writes, and whether it is frozen; every
+        edge with its condition, the implicit wiring marked ``"implicit":
+        True``; ``"merge"`` or ``"join"`` for each node with several incoming
+        edges; and an ``id``,
         the SHA-256 of the canonical JSON of the rest. Prompts are not part of
         it, so editing one keeps the id. A version 1 system describes too: its
         ``<continue>`` back edges are ``"loop"`` edges.
@@ -787,10 +848,18 @@ class MAS(BasePredictor):
                     "reads": typed(node.inputs),
                     "writes": {node.output: str(parse_type(node.output_type))},
                     "tools": list(node.tools),
-                    "frozen": False,
+                    "frozen": name in self.frozen,
                 }
                 if node.schema is not None:
                     entry["schema"] = _copy.deepcopy(node.schema)
+            elif isinstance(node, Box):
+                entry = {
+                    "name": name,
+                    "kind": "box",
+                    "reads": typed(node.reads.values()),
+                    "writes": typed(node.writes.values()),
+                    "system": node.system.describe(),
+                }
             else:
                 reads, writes = step_maps(node, self.resolve_callable(node)[0])
                 entry = {
@@ -800,6 +869,8 @@ class MAS(BasePredictor):
                     "reads": typed(reads.values()),
                     "writes": typed(writes.values()),
                 }
+            if name in self.frozen and "frozen" not in entry:
+                entry["frozen"] = True
             nodes.append(entry)
 
         declared = {(edge.source, edge.target): edge for edge in self.edges}
@@ -820,19 +891,26 @@ class MAS(BasePredictor):
                 item.update({key: value for key, value in fields.items() if value is not None})
                 if spec.errors:
                     item["errors"] = list(spec.errors)
-            if (source == START and self.graph.in_degree(target) == 1) or (
-                target == END and self.graph.out_degree(source) == 1
-            ):
+            if self.info is not None:
+                implicit = (source, target) not in declared
+            else:
+                implicit = (source == START and self.graph.in_degree(target) == 1) or (
+                    target == END and self.graph.out_degree(source) == 1
+                )
+            if implicit:
                 item["implicit"] = True
             edges.append(item)
 
-        joined = self.info.joins if self.info is not None else sorted(join_nodes(self.graph))
+        if self.info is not None:
+            joins = {name: join.kind for name, join in self.info.joins.items()}
+        else:
+            joins = dict.fromkeys(sorted(join_nodes(self.graph)), "join")
         description: dict[str, Any] = {
             "version": self.version,
             "inputs": {name: str(vtype) for name, vtype in self.inputs.items()},
             "nodes": nodes,
             "edges": edges,
-            "joins": dict.fromkeys(joined, "join"),
+            "joins": joins,
             "groups": [],
         }
         canonical = json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -852,7 +930,9 @@ class MAS(BasePredictor):
         Prompts are deliberately absent: they travel in the run state, so editing
         one must not throw away a compilation. Anything else about an agent, its
         wiring or its model, changes the graph itself. A version 2 system adds
-        its steps, edges, answer types and forms, inputs and merges.
+        its steps, boxes (each with its inner structure), edges, answer types
+        and forms, inputs and merges; frozen nodes and health settings change
+        no compiled graph and stay out.
         """
         agents = tuple(
             (agent.name, ",".join(agent.inputs), agent.output, agent.model, ",".join(agent.tools))
@@ -876,6 +956,10 @@ class MAS(BasePredictor):
             forms,
             tuple(sorted((name, str(vtype)) for name, vtype in self.inputs.items())),
             tuple(sorted(self.merges.items())),
+            tuple(
+                (box.name, box.system.structure, tuple(sorted(box.reads.items())), tuple(sorted(box.writes.items())))
+                for box in sorted(self.boxes.values(), key=lambda b: b.name)
+            ),
         )
 
     @property
@@ -899,7 +983,9 @@ class MAS(BasePredictor):
     def __repr__(self) -> str:
         """Return an unambiguous representation naming agents and edge count."""
         edges = sum(1 for source, target in self.graph.edges if source not in SENTINELS and target not in SENTINELS)
-        return f"MAS(agents={agent_names(self.graph)!r}, edges={edges}, terminal={self.terminal!r})"
+        terminals = sorted(self.graph.predecessors(END))
+        ending = f"terminal={terminals[0]!r}" if len(terminals) == 1 else f"terminals={terminals!r}"
+        return f"MAS(agents={agent_names(self.graph)!r}, edges={edges}, {ending})"
 
 
 def _agent_spec(agent: Agent) -> AgentSpecV2:
@@ -915,6 +1001,29 @@ def _agent_spec(agent: Agent) -> AgentSpecV2:
     if agent.schema is not None:
         data["schema"] = _copy.deepcopy(agent.schema)
     return data
+
+
+def _health_spec(settings: HealthSettings | None) -> HealthSpec:
+    """Return the health settings that differ from the defaults, as a spec writes them."""
+    spec = HealthSpec()
+    if settings is None:
+        return spec
+    default = HealthSettings()
+    if settings.length_factor != default.length_factor:
+        spec["length_factor"] = settings.length_factor
+    if settings.min_samples != default.min_samples:
+        spec["min_samples"] = settings.min_samples
+    if settings.leak:
+        spec["leak"] = list(settings.leak)
+    return spec
+
+
+def _health_settings(spec: HealthSpec) -> HealthSettings:
+    """Read a spec's ``health`` section."""
+    data: dict[str, Any] = dict(spec)
+    if "leak" in data:
+        data["leak"] = tuple(data["leak"])
+    return HealthSettings(**data)
 
 
 def _parsed(words: Mapping[str, str]) -> dict[str, ValueType]:
