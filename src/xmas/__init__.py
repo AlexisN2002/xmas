@@ -12,7 +12,7 @@ Note:
 
 from xmas.agent import Agent
 from xmas.budget import Budget
-from xmas.edges import Edge
+from xmas.edges import Edge, EdgeKind
 from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, RunStatus
 from xmas.graph import END, START
 from xmas.health import Health, HealthSettings
@@ -39,6 +39,7 @@ __all__ = [
     "Budget",
     "BudgetExceeded",
     "Edge",
+    "EdgeKind",
     "ErrorKind",
     "GSM8KTask",
     "Health",
