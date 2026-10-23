@@ -6,6 +6,7 @@ The models are scripted doubles.
 from __future__ import annotations
 
 import itertools
+import re
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from xmas import END, MAS, Agent, Budget, ErrorKind
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BudgetExceeded
+from xmas.graph import classify_joins
 from xmas.nodes import Step
 from xmas.tools import tool
 
@@ -326,3 +328,75 @@ def test_a_falsy_switch_case_is_a_case() -> None:
     assert [mas.run(query).output for query in ("cats", "", "kittens")] == ["zero", "no", "other"]
     restored = MAS.from_dict(dict(mas.to_dict()), llm=MockLLM(lambda p: p), tools=[score_of])
     assert [edge.case for edge in restored.edges] == [0, False, None]
+
+
+# Shapes of fan-in: (nodes, edges as (source, target, kind)) -> what each node with several inputs is, or the refusal.
+KINDS: dict[str, dict[str, Any]] = {
+    "plain": {},
+    "when": {"kind": EdgeKind.WHEN, "when": "flag"},
+    "switch": {"kind": EdgeKind.SWITCH, "switch": "verdict.action"},
+    "else": {"kind": EdgeKind.ELSE},
+    "while": {"kind": EdgeKind.WHILE, "when": "flag", "max_visits": 3},
+    "error": {"kind": EdgeKind.ERROR, "errors": ("any",)},
+}
+SHAPES: dict[str, tuple[str, list[tuple[str, str, str]], dict[str, str] | str]] = {
+    "loop with an exit": (
+        "writer render measure judge assemble sign_off",
+        [("writer", "render", "plain"), ("render", "measure", "plain"), ("measure", "judge", "plain"),
+         ("judge", "writer", "while"), ("judge", "assemble", "else"), ("assemble", "sign_off", "plain")],
+        {},
+    ),
+    "when/else diamond": (
+        "a b c m", [("a", "b", "when"), ("a", "c", "else"), ("b", "m", "plain"), ("c", "m", "plain")], {"m": "merge"}
+    ),
+    "parallel diamond": (
+        "a b c j", [("a", "b", "plain"), ("a", "c", "plain"), ("b", "j", "plain"), ("c", "j", "plain")],
+        {"j": "join, 2 groups"},
+    ),
+    "on-error fallback into a join": (
+        "f p1 p2 fb j",
+        [("f", "p1", "plain"), ("f", "p2", "plain"), ("p1", "j", "plain"), ("p1", "fb", "error"),
+         ("fb", "j", "plain"), ("p2", "j", "plain")],
+        {"j": "join, 2 groups"},
+    ),
+    "ambiguous": (
+        "f b x d e j",
+        [("f", "b", "plain"), ("f", "x", "plain"), ("x", "d", "when"), ("x", "e", "else"),
+         ("b", "j", "plain"), ("d", "j", "plain")],
+        "node 'j' is neither a merge nor a join: d -> j does not run on every pass that runs b -> j",
+    ),
+    "loop exit joins a parallel chain": (
+        "w c a b m s1 s3 fin",
+        [("w", "c", "plain"), ("c", "a", "when"), ("c", "b", "else"), ("a", "m", "plain"), ("b", "m", "plain"),
+         ("m", "w", "while"), ("m", "fin", "else"), ("s1", "s3", "plain"), ("s3", "fin", "plain")],
+        {"m": "merge", "fin": "join, 2 groups"},
+    ),
+    "parallel join with an inner diamond": (
+        "f b x y z w j",
+        [("f", "b", "plain"), ("f", "x", "plain"), ("x", "y", "when"), ("x", "z", "else"),
+         ("y", "w", "plain"), ("z", "w", "plain"), ("w", "j", "plain"), ("b", "j", "plain")],
+        {"w": "merge", "j": "join, 2 groups"},
+    ),
+    "switch to two terminals": (
+        "judge post hold", [("judge", "post", "switch"), ("judge", "hold", "else")], {END: "merge"}
+    ),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+def test_each_fan_in_shape_is_a_merge_or_a_join(shape: str) -> None:
+    names, triples, expected = SHAPES[shape]
+    edges = [Edge(source, target, **KINDS[kind]) for source, target, kind in triples]
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            classify_joins(names.split(), edges)
+        return
+    joins = classify_joins(names.split(), edges)
+    assert {n: j.kind if j.kind == "merge" else f"join, {len(j.groups)} groups" for n, j in joins.items()} == expected
+    relays = {name: join.relays for name, join in joins.items() if join.kind == "join"}
+    assert relays == {
+        "parallel diamond": {"j": (None, None)},
+        "on-error fallback into a join": {"j": ("__in__.j.0", None)},  # p1's ok route or fb
+        "loop exit joins a parallel chain": {"fin": ("__in__.fin.0", None)},  # m's else route
+        "parallel join with an inner diamond": {"j": (None, None)},
+    }.get(shape, {})
