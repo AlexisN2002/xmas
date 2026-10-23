@@ -38,10 +38,7 @@ else:
 
 
 class ErrorKind(enum.StrEnum):
-    """Why a call or a run failed.
-
-    ``CHECK_NOT_RUN`` is reserved for the verify phase and has no producer yet.
-    """
+    """Why a call or a run failed."""
 
     MONEY = "money"
     LENGTH_CUT = "length_cut"
@@ -49,11 +46,14 @@ class ErrorKind(enum.StrEnum):
     BAD_FORMAT = "bad_format"
     REFUSAL = "refusal"
     STOPPED = "stopped"
-    CHECK_NOT_RUN = "check_not_run"
     TIMEOUT = "timeout"
     RATE_LIMITED = "rate_limited"
     BUDGET = "budget"
     UNKNOWN = "unknown"
+
+
+RUN_ENDS = frozenset({ErrorKind.BUDGET, ErrorKind.STOPPED})
+"""The kinds that end a run: no ``on error`` edge routes them."""
 
 
 class RunStatus(enum.StrEnum):
@@ -76,9 +76,12 @@ class XmasError(RuntimeError):
         retry_after: Seconds the endpoint asked the caller to wait, or ``None``.
         kind: What :func:`classify` returns for this error when it carries no
             ``status``.
+        meta: The combined metadata of the paid attempts behind the error, so a
+            run's meter can count what they cost, or ``None`` when not known.
     """
 
     kind: ErrorKind = ErrorKind.UNKNOWN
+    meta: CallMeta | None = None
 
     def __init__(self, message: str, status: int | None = None, retry_after: float | None = None) -> None:
         """Initialize the error."""
@@ -91,7 +94,7 @@ class XmasError(RuntimeError):
         return type(self), (str(self), self.status, self.retry_after)
 
 
-class BudgetExceeded(XmasError):  # noqa: N818 (public name fixed by the phase-1 contract)
+class BudgetExceeded(XmasError):
     """A run reached a limit of its budget, so the next call was not started.
 
     Attributes:
@@ -128,17 +131,13 @@ class BudgetExceeded(XmasError):  # noqa: N818 (public name fixed by the phase-1
         return type(self), (self.limit, self.spent, self.allowed, self.calls)
 
 
-class Stopped(XmasError):  # noqa: N818 (public name fixed by the phase-1 contract)
-    """A run was stopped on request.
-
-    A caller's model wrapper (and later the Stop button) raises it to end the run
-    with status ``stopped``.
-    """
+class Stopped(XmasError):
+    """A run was stopped on request; a caller's model wrapper raises it to end the run with status ``stopped``."""
 
     kind = ErrorKind.STOPPED
 
 
-class EmptyResponse(XmasError):  # noqa: N818 (public name fixed by the phase-1 contract)
+class EmptyResponse(XmasError):
     """A model answered with no content.
 
     The message starts with promptolution's words, "Empty content from model", so
@@ -146,8 +145,6 @@ class EmptyResponse(XmasError):  # noqa: N818 (public name fixed by the phase-1 
 
     Attributes:
         kind: Why the answer was empty, such as ``LENGTH_CUT`` or ``REFUSAL``.
-        meta: The combined metadata of the paid attempts behind the error, so a
-            run's meter can count what they cost, or ``None`` when not known.
     """
 
     def __init__(self, message: str, kind: ErrorKind = ErrorKind.UNKNOWN, meta: CallMeta | None = None) -> None:
@@ -161,7 +158,7 @@ class EmptyResponse(XmasError):  # noqa: N818 (public name fixed by the phase-1 
         return type(self), (str(self), self.kind, self.meta)
 
 
-class BadFormat(XmasError):  # noqa: N818 (public name fixed by the phase-2 contract)
+class BadFormat(XmasError):
     """A node's output did not have its declared form.
 
     An agent with an answer form raises it when its answer and its one retry
@@ -170,8 +167,6 @@ class BadFormat(XmasError):  # noqa: N818 (public name fixed by the phase-2 cont
     Attributes:
         node: The node whose output was refused.
         problems: One line per refused attempt, first attempt first.
-        meta: The combined metadata of the paid attempts behind the error, so a
-            run's meter can count what they cost, or ``None`` when not known.
     """
 
     kind = ErrorKind.BAD_FORMAT
@@ -223,12 +218,6 @@ def classify(error: BaseException) -> ErrorKind:
 
     Otherwise the kind is ``UNKNOWN``. Walking the chain is what classifies
     promptolution's ``RuntimeError("LLM batch failed: ...")`` by its cause.
-
-    Args:
-        error: The exception to classify.
-
-    Returns:
-        The kind.
     """
     seen: set[int] = set()
     queue: deque[tuple[BaseException, int]] = deque([(error, 0)])
@@ -272,14 +261,8 @@ def kind_of_status(status: int, text: str = "") -> ErrorKind:
     402, or any 4xx whose text names money (403 "Key limit exceeded", 429
     "insufficient_quota"), is ``MONEY``; 429 is ``RATE_LIMITED``; 408 is
     ``TIMEOUT``; 500 and above are ``OUTAGE``; 400 or 403 naming moderation is
-    ``REFUSAL``; anything else (401, 404, 422) is ``UNKNOWN``.
-
-    Args:
-        status: The HTTP status code.
-        text: The error's message and body, searched for provider words.
-
-    Returns:
-        The kind.
+    ``REFUSAL``; anything else (401, 404, 422) is ``UNKNOWN``. ``text`` is the
+    error's message and body, searched for provider words.
     """
     if status == 402 or (400 <= status < 500 and MONEY_WORDS.search(text)):
         return ErrorKind.MONEY
@@ -295,15 +278,10 @@ def kind_of_status(status: int, text: str = "") -> ErrorKind:
 
 
 def kind_of_finish(finish_reason: str | None, refused: bool = False) -> ErrorKind | None:
-    """Return the kind of an answer that ended badly but still arrived.
+    """Return the kind of an answer that ended badly but still arrived, or ``None`` if it ended well.
 
-    Args:
-        finish_reason: The provider's finish reason.
-        refused: Whether the provider flagged the answer as a refusal.
-
-    Returns:
-        ``LENGTH_CUT`` for ``"length"``, ``REFUSAL`` for ``"content_filter"`` or a
-        refusal, otherwise ``None``.
+    ``LENGTH_CUT`` for the finish reason ``"length"``; ``REFUSAL`` for
+    ``"content_filter"`` or when the provider flagged a refusal.
     """
     if finish_reason == "length":
         return ErrorKind.LENGTH_CUT
@@ -313,15 +291,7 @@ def kind_of_finish(finish_reason: str | None, refused: bool = False) -> ErrorKin
 
 
 def status_for(kind: ErrorKind | None) -> RunStatus:
-    """Return the status of a failed run with this error kind.
-
-    Args:
-        kind: The run's error kind, or ``None`` when it is not known.
-
-    Returns:
-        ``OVER_BUDGET`` for ``BUDGET``, ``STOPPED`` for ``STOPPED``, otherwise
-        ``FAILED``.
-    """
+    """Return a failed run's status: ``OVER_BUDGET`` for ``BUDGET``, ``STOPPED`` for ``STOPPED``, else ``FAILED``."""
     if kind == ErrorKind.BUDGET:
         return RunStatus.OVER_BUDGET
     if kind == ErrorKind.STOPPED:

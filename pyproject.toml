@@ -120,6 +120,8 @@ ban-relative-imports = "parents"
 # test double has to match the signature it is standing in for, whether or not it
 # uses every argument.
 "tests/**/*.py" = ["D100", "D103", "D104", "ARG001", "ARG002", "ARG005"]
+# The typed errors are named for what happened (BudgetExceeded, Stopped), without an Error suffix.
+"src/xmas/errors.py" = ["N818"]
 
 [tool.ruff.format]
 docstring-code-format = true
