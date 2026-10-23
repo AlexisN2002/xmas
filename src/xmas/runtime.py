@@ -1,4 +1,4 @@
-"""Private execution engine.
+"""Compile a MAS and run it.
 
 The topology compiles to a LangGraph state graph here and nowhere else. No type
 from langgraph crosses back out: callers receive a :class:`~xmas.trace.Trace`,
@@ -33,7 +33,6 @@ from langgraph.graph import StateGraph
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from promptolution.utils.token_counter import get_token_counter
 
-from xmas import tools as _tools
 from xmas.agent import Agent
 from xmas.budget import RunMeter
 from xmas.check import step_maps
@@ -47,6 +46,7 @@ from xmas.predicates import Context, Predicate, parse_predicate
 from xmas.prompts import safe_format
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
 from xmas.spec import SPEC_VERSION_2
+from xmas.tools import run_step, run_tool_loop
 from xmas.trace import AgentRecord, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, parse_type, render_value
 
@@ -59,26 +59,10 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 CONTINUE_MARKER = "<continue>"
-"""Marker an agent emits to take a back edge instead of moving on.
-
-A cyclic topology is a retry loop, and something has to decide when to stop. The
-agent that closes the loop decides, by emitting this marker in its response, which
-mirrors the seed engine's ``<continue_iter>`` convention. An agent that never
-emits it turns its cycle into a single pass, so a mutated topology that grows a
-cycle stays runnable without anyone rewriting a prompt for it.
-"""
+"""Marker an agent emits to take a back edge instead of moving on."""
 
 _RUN_KEY = "xmas_run"
 """Key of the run's :class:`~xmas.budget.RunMeter` in ``config["configurable"]``."""
-
-MAX_NODE_VISITS = 3
-"""How often one agent may run in a single query before its back edges close.
-
-The second stop condition, and the one that holds when a prompt emits the marker
-unconditionally. Matches the seed's ``stop_condition_max_retries``. The graph-wide
-``max_steps`` still caps total super-steps on top of this.
-"""
-
 
 _RUN_ENDS = frozenset({ErrorKind.BUDGET, ErrorKind.STOPPED})
 """Error kinds that end the run itself: never routed, and no failed record, since no node failed."""
@@ -100,45 +84,29 @@ def _merge_counts(current: dict[str, int], incoming: dict[str, int]) -> dict[str
     return merged
 
 
-def _merge_values(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    """Merge one node's writes into the shared value map.
-
-    Agents writing concurrently each contribute their own key, so a plain merge
-    is well defined. Keeping every variable in one reduced channel, rather than
-    building a channel per variable, means the state schema is fixed and typed
-    no matter what variables a topology happens to use.
-
-    Args:
-        current: Values written so far.
-        incoming: Values from the agent that just finished.
-
-    Returns:
-        The merged mapping.
-    """
-    return {**current, **incoming}
-
-
 class MASState(TypedDict, total=False):
     """The state a run threads through the graph.
 
     Attributes:
         values: Every state variable, including ``query``, keyed by name: a
             ``str`` for text, plain JSON data for json (version 2). Version 1
-            writes only ``str``.
+            writes only ``str``. Nodes writing concurrently each contribute
+            their own key, so the reducer is a plain dict union.
         prompts: The prompt set for this run, keyed by agent name. Prompts travel
             in the state rather than being baked into the compiled graph, so one
             compilation serves every candidate an optimizer proposes.
         records: Accumulated per-agent records, in completion order.
-        visits: How often each agent has run, which is what bounds a retry loop.
+        visits: How often each node has run, which bounds a version 1 retry
+            loop and is what a version 2 ``while`` edge and ``visits(x)`` read.
         routes: Where each deciding node's latest visit sent the run (version
             2), keyed by node; absent until a node decides.
     """
 
-    values: Annotated[dict[str, Any], _merge_values]
+    values: Annotated[dict[str, Any], operator.or_]
     prompts: dict[str, str]
     records: Annotated[list[AgentRecord], operator.add]
     visits: Annotated[dict[str, int], _merge_counts]
-    routes: Annotated[dict[str, list[str]], _merge_values]
+    routes: Annotated[dict[str, list[str]], operator.or_]
 
 
 class CompiledGraph(Protocol):
@@ -159,9 +127,6 @@ class CompiledGraph(Protocol):
         """Run several states, concurrently where possible."""
         ...
 
-
-_Body = Callable[[MASState, RunMeter | None], AgentRecord]
-"""What a version 1 agent does in one visit: read the state, call its model, return its record."""
 
 _NodeBody = Callable[[MASState, RunMeter | None], tuple[AgentRecord, dict[str, Any]]]
 """What a node does in one visit: its record, and the values it writes."""
@@ -227,46 +192,6 @@ def _call(llm: BaseLLM, rendered: str, meter: RunMeter | None) -> tuple[str, Cal
     return response, meta
 
 
-def _plain_body(agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float]) -> _Body:
-    """Build what a plain agent does in one visit: render, check the budget, call, record.
-
-    Args:
-        agent: The agent.
-        llm: Its model.
-        count_tokens: Token counter for the model.
-
-    Returns:
-        The agent's body, for :func:`_wrap`.
-    """
-
-    def body(state: MASState, meter: RunMeter | None) -> AgentRecord:
-        prompts = state.get("prompts") or {}
-        template = prompts.get(agent.name, agent.prompt)
-
-        values = state.get("values") or {}
-        inputs = {name: str(values.get(name) or "") for name in agent.inputs}
-        rendered = safe_format(template, inputs)
-        response, meta = _call(llm, rendered, meter)
-
-        return AgentRecord(
-            agent=agent.name,
-            step=-1,  # renumbered once the run finishes and the order is known
-            prompt=template,
-            rendered_prompt=rendered,
-            inputs=inputs,
-            outputs={agent.output: response},
-            usage=TokenUsage(
-                input_tokens=int(count_tokens(rendered)),
-                output_tokens=int(count_tokens(response)),
-            ),
-            model=agent.model,
-            raw_response=response,
-            **(meta.record_fields() if meta is not None else {}),
-        )
-
-    return body
-
-
 def _wrap(
     mas: MAS, name: str, body: _NodeBody, decision: _Decision | None = None
 ) -> Callable[[MASState], dict[str, Any]]:
@@ -326,24 +251,53 @@ def _wrap(
     return node
 
 
-def _make_node(mas: MAS, agent: Agent, count_tokens: Callable[[str], float]) -> Callable[[MASState], dict[str, Any]]:
-    """Build the callable LangGraph runs for one agent.
+def agent_node(
+    mas: MAS, agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float]
+) -> Callable[[MASState], dict[str, Any]]:
+    """Build the callable LangGraph runs for one version 1 agent.
+
+    An agent with tools answers through :func:`xmas.tools.run_tool_loop`; every
+    other agent makes one model call. Each visit starts fresh. :func:`_wrap`
+    times the visit, keeps its record on the run's meter and writes the answer.
 
     Args:
-        mas: The system the agent belongs to, used to resolve its model.
+        mas: The system the agent belongs to, which resolves its tools.
         agent: The agent to wrap.
-        count_tokens: Token counter for the agent's model.
+        llm: Its model.
+        count_tokens: Token counter for the model.
 
     Returns:
         A function mapping the incoming state to this agent's state updates.
     """
-    llm: BaseLLM = mas.resolve_llm(agent)
-    # an agent with tools runs the tool loop; every other agent makes one call
-    body = _tools.tool_body(mas, agent, llm, count_tokens) if agent.tools else _plain_body(agent, llm, count_tokens)
+    tools = mas.resolve_tools(agent) if agent.tools else {}
 
     def visit(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
-        record = body(state, meter)
-        return record, {agent.output: record.raw_response}
+        template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
+        values = state.get("values") or {}
+        inputs = {name: str(values.get(name) or "") for name in agent.inputs}
+        rendered = safe_format(template, inputs)
+        calls: tuple[ToolCall, ...] = ()
+        if agent.tools and hasattr(llm, "get_tool_response"):  # resolve_tools checked the model can call tools
+            response, calls, usage, meta = run_tool_loop(
+                llm, rendered, tools, mas.max_tool_rounds, DEFAULT_SYS_PROMPT, count_tokens, meter=meter
+            )
+        else:
+            response, meta = _call(llm, rendered, meter)
+            usage = _usage(count_tokens, rendered, response)
+        record = AgentRecord(
+            agent=agent.name,
+            step=-1,  # renumbered once the run finishes and the order is known
+            prompt=template,
+            rendered_prompt=rendered,
+            inputs=inputs,
+            outputs={agent.output: response},
+            tool_calls=calls,
+            usage=usage,
+            model=agent.model,
+            raw_response=response,
+            **(meta.record_fields() if meta is not None else {}),
+        )
+        return record, {agent.output: response}
 
     return _wrap(mas, agent.name, visit)
 
@@ -416,8 +370,6 @@ def _agent_body(
     """
     form = compile_form(agent.schema) if parse_type(agent.output_type) == JSON else None
     tools = mas.resolve_tools(agent) if agent.tools else None
-    if tools is not None and not isinstance(llm, _tools.SupportsToolCalls):  # resolve_tools checked it; this narrows
-        raise ValueError(f"Agent {agent.name!r} uses tools, but its model cannot call them.")
 
     def body(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
         template = (state.get("prompts") or {}).get(agent.name, agent.prompt)
@@ -440,8 +392,8 @@ def _agent_body(
                     return error.problem
                 return None
 
-            response, calls, usage, meta = _tools.run_tool_loop(
-                cast("_tools.SupportsToolCalls", llm),
+            response, calls, usage, meta = run_tool_loop(
+                llm,
                 rendered,
                 tools,
                 mas.max_tool_rounds,
@@ -511,7 +463,7 @@ def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
             if name in values:
                 arguments[parameter] = values[name]
         try:
-            produced = _tools.run_step(spec, source, arguments)
+            produced = run_step(spec, source, arguments)
         except BadFormat as error:
             raise BadFormat(step.name, error.problems, error.meta) from error
         writes = {write_map[write]: value for write, value in produced.items()}
@@ -659,7 +611,7 @@ def _context(
 
     def call(function: str, args: tuple[Any, ...]) -> bool:
         spec, source = mas.resolve_callable(Step(function, function))
-        produced = _tools.run_step(spec, source, dict(zip(spec.reads, args, strict=True)))
+        produced = run_step(spec, source, dict(zip(spec.reads, args, strict=True)))
         return cast("bool", next(iter(produced.values())))
 
     return Context(
@@ -774,12 +726,9 @@ def _compile_v2(mas: MAS) -> CompiledGraph:
         source: _Decision.of(edges) for source, edges in out.items() if any(e.kind is not EdgeKind.PLAIN for e in edges)
     }
     bodies: dict[str, _NodeBody] = {}
-    counters: dict[int, Callable[[str], float]] = {}
     for agent in mas.agents.values():
         llm = mas.resolve_llm(agent)
-        if id(llm) not in counters:
-            counters[id(llm)] = get_token_counter(llm)
-        bodies[agent.name] = _agent_body(mas, agent, llm, counters[id(llm)], types)
+        bodies[agent.name] = _agent_body(mas, agent, llm, get_token_counter(llm), types)
     for step in mas.steps.values():
         bodies[step.name] = _step_body(mas, step, types)
     for box in mas.boxes.values():
@@ -815,20 +764,18 @@ def _v2_output(mas: MAS, records: list[AgentRecord]) -> str:
     return next(iter(outputs.values())) if len(outputs) == 1 else ran[-1].raw_response
 
 
-def _make_router(
-    agent: Agent,
-    back_targets: list[str],
-    forward_targets: list[str],
+def cycle_router(
+    mas: MAS, agent: Agent, back_targets: list[str], forward_targets: list[str]
 ) -> Callable[[MASState], list[str]]:
-    """Build the branch decision for an agent that closes a cycle.
+    """Build the branch decision for a version 1 agent that closes a cycle.
 
     The agent decides by what it wrote: emitting :data:`CONTINUE_MARKER` takes the
     back edge, anything else moves on. Two guards make the loop finite regardless
-    of what the model says, because a prompt that always emits the marker is a
-    thing an optimizer will eventually propose: the agent's own visit count, and
-    the graph-wide recursion limit behind it.
+    of what the model says: the agent's own visit count against ``mas.max_visits``,
+    and the graph-wide recursion limit behind it.
 
     Args:
+        mas: The system, which bounds the visits.
         agent: The agent whose out-edges are being routed.
         back_targets: Targets reached by a back edge, taken when looping.
         forward_targets: Targets reached otherwise, taken when moving on.
@@ -842,7 +789,7 @@ def _make_router(
         values = state.get("values") or {}
         visits = (state.get("visits") or {}).get(agent.name, 0)
         looping = CONTINUE_MARKER in str(values.get(agent.output) or "")
-        return back_targets if looping and visits < MAX_NODE_VISITS else onward
+        return back_targets if looping and visits < mas.max_visits else onward
 
     return route
 
@@ -860,10 +807,10 @@ def compile_mas(mas: MAS) -> CompiledGraph:
     the recursion limit. Routing the two exclusively, on the looping agent's own
     output, is what makes a cyclic topology terminate with an answer.
 
+    A version 2 system compiles by :func:`_compile_v2` instead.
+
     Args:
         mas: The system to compile.
-
-    A version 2 system compiles by :func:`_compile_v2` instead.
 
     Returns:
         The compiled graph.
@@ -874,18 +821,12 @@ def compile_mas(mas: MAS) -> CompiledGraph:
     joins = join_nodes(mas.graph)
     back = back_edges(mas.graph)
 
-    counters: dict[int, Callable[[str], float]] = {}
     for name, agent in mas.agents.items():
         llm = mas.resolve_llm(agent)
-        if id(llm) not in counters:
-            counters[id(llm)] = get_token_counter(llm)
-        # langgraph's add_node overloads bind their node type to a protocol that a
-        # typing.TypedDict class does not satisfy under mypy, even though passing a
-        # TypedDict schema is the documented usage. Runtime behaviour is covered by
-        # the join-semantics and quickstart tests.
+        # mypy rejects a TypedDict schema here; langgraph documents it as the usage.
         builder.add_node(
             name,
-            _make_node(mas, agent, counters[id(llm)]),  # type: ignore[arg-type]
+            agent_node(mas, agent, llm, get_token_counter(llm)),  # type: ignore[arg-type]
             defer=name in joins,
         )
 
@@ -897,8 +838,8 @@ def compile_mas(mas: MAS) -> CompiledGraph:
                 builder.add_edge(source, target)
             continue
         forward_targets = [target for target in targets if (source, target) not in back]
-        router = _make_router(mas.agents[source], back_targets, forward_targets)
-        builder.add_conditional_edges(source, router, sorted({*back_targets, *forward_targets, END}))
+        router = cycle_router(mas, mas.agents[source], back_targets, forward_targets)
+        builder.add_conditional_edges(source, router, back_targets + forward_targets + [END])
 
     return builder.compile()
 
@@ -909,12 +850,24 @@ def _health(mas: MAS, records: tuple[AgentRecord, ...], meter: RunMeter | None) 
     return summarize(records, meter=meter, settings=mas.health, while_edges=loops)
 
 
-def _to_trace(mas: MAS, query: str, result: dict[str, Any], meter: RunMeter | None = None) -> Trace:
-    """Assemble a trace from a finished run's state, its health summarized.
+def trace_from_state(mas: MAS, query: str, result: Any, meter: RunMeter | None = None) -> Trace:
+    """Assemble a trace from a finished run's state, or from the error that ended it, its health summarized.
 
     A version 2 trace's output is the rendered write of the terminal that ran.
-    Without a meter the health has no budget entry.
+    A failed run's trace is :func:`_failed_trace`'s, from the records the meter
+    kept. Without a meter the health has no budget entry, and a failed run has
+    no records.
     """
+    if isinstance(result, BaseException):
+        if meter is None:
+            return Trace(
+                query=query,
+                output="",
+                records=(),
+                error=f"{type(result).__name__}: {result}",
+                error_kind=_kind_of(result),
+            )
+        return _failed_trace(mas, query, result, meter)
     records: list[AgentRecord] = list(result.get("records") or [])
     numbered = tuple(dataclasses.replace(record, step=index) for index, record in enumerate(records))
     health = _health(mas, numbered, meter)
@@ -988,7 +941,7 @@ def _run_values(
     """
     state = MASState(values=dict(values), prompts=dict(prompts), records=[], visits={})
     result: dict[str, Any] = mas.compiled.invoke(state, config=_run_config(mas, meter))
-    return _to_trace(mas, render_value(values, JSON), result), dict(result.get("values") or {})
+    return trace_from_state(mas, render_value(values, JSON), result), dict(result.get("values") or {})
 
 
 def _run_config(mas: MAS, meter: RunMeter) -> dict[str, Any]:
@@ -1006,16 +959,10 @@ def run_one(mas: MAS, query: str, prompts: dict[str, str]) -> Trace:
 
     Returns:
         The trace of the run. A failure is recorded in ``Trace.error`` and
-        ``Trace.error_kind`` rather than raised, so one bad rollout does not lose
-        a whole batch, and the trace keeps the records of the agents that
-        finished.
+        ``Trace.error_kind`` rather than raised, and the trace keeps the records
+        of the agents that finished.
     """
-    meter = RunMeter(mas.budget, owner=mas)
-    try:
-        result: dict[str, Any] = mas.compiled.invoke(_initial_state(query, prompts), config=_run_config(mas, meter))
-    except Exception as error:  # a failed rollout is data, not a crash
-        return _failed_trace(mas, query, error, meter)
-    return _to_trace(mas, query, result, meter)
+    return run_many(mas, [query], [prompts])[0]
 
 
 def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> list[Trace]:
@@ -1030,18 +977,16 @@ def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> lis
         prompts: Prompt sets, one per input.
 
     Returns:
-        One trace per input, in the order given.
+        One trace per input, in the order given. A failed rollout is data, not a
+        crash: its trace carries the error and the rest of the batch is kept.
     """
     if not queries:
         return []
-
     states = [_initial_state(query, prompt_set) for query, prompt_set in zip(queries, prompts, strict=True)]
     meters = [RunMeter(mas.budget, owner=mas) for _ in states]
     configs = [_run_config(mas, meter) for meter in meters]
     results: list[Any] = mas.compiled.batch(states, config=configs, return_exceptions=True)
     return [
-        _failed_trace(mas, query, result, meter)
-        if isinstance(result, BaseException)
-        else _to_trace(mas, query, result, meter)
+        trace_from_state(mas, query, result, meter)
         for query, result, meter in zip(queries, results, meters, strict=True)
     ]

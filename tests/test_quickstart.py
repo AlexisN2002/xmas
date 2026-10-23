@@ -14,37 +14,29 @@ from .conftest import MockLLM
 
 
 def test_the_quickstart_runs_as_written(tmp_path: Path) -> None:
-    llm = MockLLM(lambda prompt: "391" if "Verify" in prompt else "17 * 23 = 391")
+    llm = MockLLM(lambda prompt: "Rayleigh scattering." if "as your own" in prompt else "Short waves scatter more.")
 
-    solver = Agent("solver", prompt="Solve step by step.", output="draft")
-    checker = Agent(
-        "checker",
-        prompt="Verify and answer.",
+    intern = Agent("intern", prompt="Answer this question, showing your working: {query}", output="draft")
+    boss = Agent(
+        "boss",
+        prompt="Question: {query}\nYour intern's draft: {draft}\nGive the final answer in one sentence, as your own.",
         inputs=["query", "draft"],
         output="prediction",
     )
 
-    mas = MAS([solver, checker], edges=[("solver", "checker")], llm=llm)
+    mas = MAS([intern, boss], edges=[("intern", "boss")], llm=llm)
 
-    answer = mas("What is 17 * 23?")  # __call__ runs it
-    trace = mas.last_trace  # full per-agent record of that call
-
-    assert answer == "391"
+    assert mas("Why is the sky blue?") == "Rayleigh scattering."
+    trace = mas.last_trace
     assert trace is not None
-    assert trace.agents == ("solver", "checker")
-    assert trace["solver"][0].outputs == {"draft": "17 * 23 = 391"}
+    assert trace.agents == ("intern", "boss")
+    assert trace["intern"][0].outputs == {"draft": "Short waves scatter more."}
+    assert "Your intern's draft: Short waves scatter more." in llm.calls[-1]
 
-    path = tmp_path / "gsm8k.yaml"
-    mas.to_yaml(path)  # serialization as methods
-    mas2 = MAS.from_yaml(path, llm=llm)
-
-    assert mas2.to_dict() == mas.to_dict()
-    assert mas2("What is 17 * 23?") == "391"
-
-    new = mas.copy(prompts={"solver": "Solve it carefully."})  # optimizers derive candidates this way
-
-    assert new.agents["solver"].prompt == "Solve it carefully."
-    assert mas.agents["solver"].prompt == "Solve step by step."
+    path = tmp_path / "team.yaml"
+    mas.to_yaml(path)
+    again = MAS.from_yaml(path, llm=llm)
+    assert again.to_dict() == mas.to_dict()
 
 
 def test_agents_are_addressable_and_mutable_through_the_mas() -> None:

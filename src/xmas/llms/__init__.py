@@ -1,28 +1,11 @@
-"""Model backends.
+"""Model backends: promptolution's APILLM plus ``score`` (teacher-forced log-probabilities) and a per-call log.
 
-Each backend subclasses its promptolution counterpart and adds ``score``, the
-teacher-forced sibling of generation. :class:`APILLM` can also return call
-metadata (:class:`CallMeta`) next to its answers.
+:class:`APILLM` can also return call metadata (:class:`CallMeta`) next to its answers.
 """
 
-from xmas.llms.api_llm import APILLM, RateLimitedError, ScoringUnsupportedError
-from xmas.llms.masking import assistant_span, mask_logprobs
+from xmas.llms.api_llm import APILLM
+from xmas.llms.call_log import CallLog, CallRecord
 from xmas.llms.meta import CallMeta, SupportsMeta, TokenPrice
-from xmas.llms.scoring import ScoredSequence, SupportsScore
-from xmas.llms.telemetry import CallLog, CallRecord, Price
+from xmas.llms.scoring import ScoredSequence
 
-__all__ = [
-    "APILLM",
-    "CallLog",
-    "CallMeta",
-    "CallRecord",
-    "Price",
-    "RateLimitedError",
-    "ScoredSequence",
-    "ScoringUnsupportedError",
-    "SupportsMeta",
-    "SupportsScore",
-    "TokenPrice",
-    "assistant_span",
-    "mask_logprobs",
-]
+__all__ = ["APILLM", "CallLog", "CallMeta", "CallRecord", "ScoredSequence", "SupportsMeta", "TokenPrice"]

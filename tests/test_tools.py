@@ -18,23 +18,21 @@ from pydantic import Field
 
 import xmas.tools
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
-from xmas.errors import classify
-from xmas.llms.api_llm import APILLM, RateLimitedError
-from xmas.llms.telemetry import CallLog
+from xmas.errors import XmasError, classify
+from xmas.llms.api_llm import APILLM
+from xmas.llms.call_log import CallLog
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
 from xmas.optimization.topology import TopologyBudget
 from xmas.tools import (
     REPEATED_CALL_NOTE,
     LocalTools,
-    SupportsToolCalls,
     Tool,
-    ToolAccessError,
     ToolCallRequest,
-    ToolError,
     ToolSource,
     tool,
 )
+from xmas.utils import timestamp
 
 from .conftest import MockLLM
 
@@ -59,7 +57,7 @@ class ToolMockLLM(MockLLM):
         return self.turns.pop(0) if self.turns else self.default
 
 
-class FakeToolSource:
+class FakeToolSource(ToolSource):
     """A ToolSource with scripted answers; records every call."""
 
     def __init__(
@@ -145,7 +143,7 @@ def test_tool_keeps_annotated_constraints_and_takes_a_name() -> None:
     assert clip_value.parameters["properties"]["json"] == {"type": "integer", "minimum": 0}
     assert clip_value.parameters["required"] == ["json"]
     assert clip_value.validate({"json": "3"}) == {"json": 3, "schema": "x"}  # names that shadow BaseModel work
-    with pytest.raises(ToolError, match="json"):
+    with pytest.raises(XmasError, match="json"):
         clip_value.validate({"json": -1})
 
 
@@ -214,16 +212,16 @@ def test_to_openai_shape() -> None:
 
 def test_validate_coerces_and_reports() -> None:
     assert add.validate({"a": "4"}) == {"a": 4, "b": 2}
-    with pytest.raises(ToolError, match="invalid arguments for add"):
+    with pytest.raises(XmasError, match="invalid arguments for add"):
         add.validate({"a": "four"})
-    with pytest.raises(ToolError, match="c: Extra inputs"):
+    with pytest.raises(XmasError, match="c: Extra inputs"):
         add.validate({"a": 1, "c": 3})
     remote = Tool(
         "r", "r", {"type": "object", "properties": {"x": {}}, "required": ["x"], "additionalProperties": False}
     )
-    with pytest.raises(ToolError, match="missing"):
+    with pytest.raises(XmasError, match="missing"):
         remote.validate({})
-    with pytest.raises(ToolError, match="unexpected"):
+    with pytest.raises(XmasError, match="unexpected"):
         remote.validate({"x": 1, "y": 2})
     assert remote.validate({"x": 1}) == {"x": 1}
 
@@ -246,11 +244,11 @@ def test_local_tools_stringify_results_and_wrap_exceptions() -> None:
     assert isinstance(source, ToolSource)
     assert source.call("add", {"a": 1}) == "3"
     assert source.call("listing", {"n": 3}) == "[0, 1, 2]"
-    with pytest.raises(ToolError, match="KeyError"):
+    with pytest.raises(XmasError, match="KeyError"):
         source.call("boom", {})
-    with pytest.raises(ToolError, match="invalid arguments"):
+    with pytest.raises(XmasError, match="invalid arguments"):
         source.call("add", {})
-    with pytest.raises(ToolError, match="unknown tool"):
+    with pytest.raises(XmasError, match="unknown tool"):
         source.call("nope", {})
 
 
@@ -437,7 +435,7 @@ def test_default_is_five_rounds() -> None:
 
 
 def test_failed_calls_are_fed_back_and_the_run_goes_on() -> None:
-    source = FakeToolSource(answers={"run_python": ToolError("exit_code=1 killed=none\nTraceback")})
+    source = FakeToolSource(answers={"run_python": XmasError("exit_code=1 killed=none\nTraceback")})
     llm = ToolMockLLM(
         [
             ("", [req("run_python", "{not json", "1"), req("run_python", "[1]", "2")]),
@@ -451,7 +449,7 @@ def test_failed_calls_are_fed_back_and_the_run_goes_on() -> None:
     assert trace.output == "gave up"
     calls = trace["coder"][0].tool_calls
     assert all(call.failed for call in calls)
-    assert calls[0].arguments == {"_raw": "{not json"}
+    assert calls[0].arguments == {"raw": "{not json"}
     assert calls[0].result.startswith("invalid JSON arguments")
     assert calls[1].result == "invalid JSON arguments: not an object"
     assert calls[2].result == "unknown tool; available: run_python"
@@ -463,8 +461,8 @@ def test_failed_calls_are_fed_back_and_the_run_goes_on() -> None:
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
-        (ToolAccessError("tool_not_in_scope: nope"), "ToolAccessError: tool_not_in_scope: nope"),
-        (RateLimitedError("too_many_concurrent: 4 in flight", retry_after=1.0), "RateLimitedError: too_many"),
+        (XmasError("mcp: tool_not_in_scope (403): nope", status=403), "XmasError: mcp: tool_not_in_scope (403)"),
+        (XmasError("mcp: too_many_concurrent (429): 4 in flight", 429, 1.0), "XmasError: mcp: too_many"),
     ],
 )
 def test_refusals_end_the_run(error: Exception, expected: str) -> None:
@@ -495,7 +493,7 @@ def test_tools_inside_a_cycle_start_fresh_each_visit() -> None:
 
     assert trace.error is None
     visits = trace["checker"]
-    assert len(visits) == 3  # MAX_NODE_VISITS still bounds the cycle
+    assert len(visits) == 3  # MAS(max_visits=3) still bounds the cycle
     assert all(len(record.tool_calls) == 1 for record in visits)
     first_turns = [messages for messages, _ in llm.seen if len(messages) == 2]
     assert len(first_turns) == 3  # every visit opens with system + user only
@@ -575,7 +573,7 @@ def test_a_failed_call_is_run_again() -> None:
         def call(self, name: str, arguments: dict[str, Any]) -> str:
             self.calls.append((name, arguments))
             if len(self.calls) == 1:
-                raise ToolError("exit_code=1")
+                raise XmasError("exit_code=1")
             return "ok"
 
     source = FlakySource()
@@ -654,7 +652,7 @@ def api_llm(
 ) -> tuple[APILLM, list[dict[str, Any]], CallLog]:
     log = CallLog()
     llm = APILLM(
-        model="m", base_url="https://gateway.example/v1", api_key="k", telemetry=log, retry_base_delay_s=0, **kwargs
+        model="m", base_url="https://gateway.example/v1", api_key="k", call_log=log, retry_base_delay_s=0, **kwargs
     )
     sent: list[dict[str, Any]] = []
 
@@ -673,7 +671,7 @@ def api_llm(
 def test_api_llm_offers_tools_and_parses_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     call = {"id": "c1", "type": "function", "function": {"name": "add", "arguments": '{"a": 1}'}}
     llm, sent, log = api_llm(monkeypatch, [completion(None, [call])])
-    assert isinstance(llm, SupportsToolCalls)
+    assert hasattr(llm, "get_tool_response")
 
     messages = [{"role": "user", "content": "hi"}]
     text, requests = llm.get_tool_response(messages, [add])
@@ -685,6 +683,14 @@ def test_api_llm_offers_tools_and_parses_calls(monkeypatch: pytest.MonkeyPatch) 
     assert "tool_choice" not in sent[0]
     record = log.records[0]
     assert (record.ok, record.input_tokens, record.output_tokens) == (True, 11, 7)
+
+
+def test_api_llm_omits_tools_on_the_final_turn_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    llm, sent, _ = api_llm(monkeypatch, [RuntimeError("flaky"), completion("42", usage=False)])
+    text, requests = llm.get_tool_response([{"role": "user", "content": "hi there"}], [])
+    assert (text, requests) == ("42", [])
+    assert len(sent) == 2
+    assert "tools" not in sent[1]
 
 
 SAMPLING = ("temperature", "top_p", "stop")
@@ -702,19 +708,26 @@ def test_api_llm_sends_no_sampling_parameters_unless_set(monkeypatch: pytest.Mon
     assert {key: sent[0][key] for key in SAMPLING} == chosen
 
 
-def test_api_llm_omits_tools_on_the_final_turn_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    llm, sent, _ = api_llm(monkeypatch, [RuntimeError("flaky"), completion("42", usage=False)])
-    text, requests = llm.get_tool_response([{"role": "user", "content": "hi there"}], [])
-    assert (text, requests) == ("42", [])
-    assert len(sent) == 2
-    assert "tools" not in sent[1]
-
-
 def test_api_llm_records_a_failed_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     llm, _, log = api_llm(monkeypatch, [RuntimeError("down")] * 6)
     with pytest.raises(RuntimeError, match="down"):
         llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
     assert log.records[-1].ok is False
+
+
+def test_api_llm_tool_turn_records_carry_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    llm, _, log = api_llm(monkeypatch, [completion("ok"), *([RuntimeError("down")] * 6)])
+    before = timestamp()
+    llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
+    with pytest.raises(RuntimeError, match="down"):
+        llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
+    good, failed = log.records
+    assert good.response_id == "x"
+    assert failed.response_id is None
+    for record in (good, failed):
+        assert record.params == {"max_tokens": llm.max_tokens}
+        assert record.ts >= before
+    assert good.ts <= failed.ts
 
 
 def test_api_llm_drives_a_whole_tool_agent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -737,8 +750,17 @@ def test_api_llm_drives_a_whole_tool_agent(monkeypatch: pytest.MonkeyPatch) -> N
     assert over.error == "BudgetExceeded: calls 1 >= max 1 before call 2"
 
 
-def test_a_refused_tool_source_is_classified_as_a_refusal() -> None:
-    assert classify(ToolAccessError("tool_not_in_scope: nope")) is ErrorKind.REFUSAL
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (XmasError("mcp: unauthorized (401): bad key", status=401), ErrorKind.REFUSAL),
+        (XmasError("mcp: tool_not_in_scope (403): nope", status=403), ErrorKind.REFUSAL),
+        (XmasError("mcp: too_many_concurrent (429): 4 in flight", status=429, retry_after=1.0), ErrorKind.RATE_LIMITED),
+    ],
+    ids=["401", "403", "429"],
+)
+def test_a_refused_tool_source_is_classified_by_its_status(error: XmasError, kind: ErrorKind) -> None:
+    assert classify(error) is kind
 
 
 URL = "https://gateway.example/v1/chat/completions"

@@ -161,7 +161,7 @@ class AgentRecord:
     inputs: dict[str, str]
     outputs: dict[str, str]
     tool_calls: tuple[ToolCall, ...] = ()
-    usage: TokenUsage = field(default_factory=TokenUsage)
+    usage: TokenUsage = TokenUsage()
     model: str | None = None
     raw_response: str = ""
     latency_s: float | None = field(default=None, compare=False)
@@ -265,10 +265,11 @@ class Trace:
     @property
     def agents(self) -> tuple[str, ...]:
         """Names of the agents that ran, in first-execution order."""
-        seen: dict[str, None] = {}
+        names: list[str] = []
         for record in self.records:
-            seen.setdefault(record.agent, None)
-        return tuple(seen)
+            if record.agent not in names:
+                names.append(record.agent)
+        return tuple(names)
 
     @property
     def usage(self) -> TokenUsage:

@@ -92,6 +92,16 @@ def _job_containers() -> set[str]:
     return set(listed.stdout.split())
 
 
+@dataclass(frozen=True)
+class DevServer:
+    """A running serving-xmas dev server and a key it accepts."""
+
+    url: str
+    """The MCP endpoint, ``http://127.0.0.1:<port>/mcp``."""
+    key: str
+    """A key scoped to ``run_python``."""
+
+
 def _server_env(base: Mapping[str, str], settings: Mapping[str, str]) -> dict[str, str]:
     """Return the dev server's environment: ``base`` minus inherited settings, plus ``settings``.
 
@@ -118,16 +128,6 @@ def test_server_env_drops_inherited_settings() -> None:
     env = _server_env(base, {"SX_PORT": "4242", "SX_LOG_LEVEL": "warning"})
     assert env == {"PATH": "/usr/bin", "HOME": "/home/x", "SX_PORT": "4242", "SX_LOG_LEVEL": "warning"}
     assert base["SX_STATE_DIR"] == "/caller/state"  # the caller's mapping is left alone
-
-
-@dataclass(frozen=True)
-class DevServer:
-    """A running serving-xmas dev server and a key it accepts."""
-
-    url: str
-    """The MCP endpoint, ``http://127.0.0.1:<port>/mcp``."""
-    key: str
-    """A key scoped to ``run_python``."""
 
 
 @pytest.fixture(scope="module")
@@ -258,5 +258,5 @@ def test_a_gateway_model_runs_python_on_the_dev_server(serving_xmas: DevServer) 
     assert trace.error is None, trace.error
     calls = trace["coder"][0].tool_calls
     assert calls, "the model answered without calling run_python"
-    assert any(c.tool == "run_python" and not c.failed for c in calls), [c.to_dict() for c in calls]
+    assert any(c.tool == "run_python" and not c.failed for c in calls), calls
     assert ANSWER in trace.output.replace(",", "")

@@ -5,15 +5,15 @@ from __future__ import annotations
 import copy as _copy
 import hashlib
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import networkx as nx
 import yaml
 from promptolution.llms.base_llm import BaseLLM
 from promptolution.predictors.base_predictor import BasePredictor
 
-from xmas import _engine
+from xmas import runtime
 from xmas.agent import DEFAULT_INPUT, Agent
 from xmas.budget import Budget
 from xmas.check import MERGE_LAST, SystemInfo, callable_writes, check_system, step_maps
@@ -52,11 +52,9 @@ from xmas.trace import Trace
 from xmas.values import TEXT, ValueType, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Iterable, Mapping, Sequence
+    import networkx as nx
 
-    from xmas._engine import CompiledGraph
-
-_Structure = tuple[object, ...]
+    from xmas.runtime import CompiledGraph
 
 _QUERY_ONLY = {DEFAULT_INPUT: TEXT}
 
@@ -104,6 +102,16 @@ class MAS(BasePredictor):
         default_model: Name recorded for the default model in a serialized spec.
         budget: Limits for each run, or ``None`` for none. Runtime state, never
             part of the spec.
+        max_visits: How often one agent of a version 1 cycle may run in a single
+            query before its back edges close; a version 2 ``while`` edge names
+            its own ``max_visits``.
+        last_trace: Trace of the most recent :meth:`__call__`, or ``None`` before any.
+        last_traces: Traces of the most recent :meth:`predict` or :meth:`run_batch`
+            call. Assigned once, at the end of the batch, so a reader either sees
+            the previous batch or the whole new one; this is the seam an attributor
+            reads after a task evaluation. One MAS instance serves one batch at a
+            time; run concurrent batches on separate instances, or use :meth:`run`,
+            which shares no state at all.
     """
 
     agents: dict[str, Agent]
@@ -117,9 +125,6 @@ class MAS(BasePredictor):
     version: int
     info: SystemInfo | None
     graph: nx.DiGraph[str]
-    llms: dict[str, BaseLLM]
-    max_steps: int
-    default_model: str | None
     budget: Budget | None
 
     def __init__(
@@ -132,6 +137,7 @@ class MAS(BasePredictor):
         default_model: str | None = None,
         tools: Sequence[ToolSource | Tool] = (),
         max_tool_rounds: int = 5,
+        max_visits: int = 3,
         budget: Budget | None = None,
         *,
         steps: Sequence[Step] = (),
@@ -162,6 +168,9 @@ class MAS(BasePredictor):
                 the spec.
             max_tool_rounds: Model turns per agent visit that may request tools,
                 before one last turn with the tools withheld.
+            max_visits: How often one agent may run in a single query before its
+                back edges close, so a version 1 prompt that always loops still
+                ends. A version 2 ``while`` edge carries its own ``max_visits``.
             budget: Limits for each run: every run, and every item of a batch,
                 gets its own meter with these limits. A run that reaches one
                 ends with status ``over_budget``. Runtime state like ``llm``;
@@ -210,6 +219,9 @@ class MAS(BasePredictor):
                 if self.version == SPEC_VERSION_2
                 else "A MAS needs at least one agent."
             )
+        if max_tool_rounds < 0:
+            raise ValueError("max_tool_rounds must be >= 0.")
+        super().__init__(llm=llm)  # type: ignore[arg-type]
 
         self.agents = {agent.name: agent for agent in agents}
         if len(self.agents) != len(agents):
@@ -242,6 +254,7 @@ class MAS(BasePredictor):
 
         self.llms = dict(llms or {})
         self.max_steps = max_steps
+        self.max_visits = max_visits
         self.budget = budget
         self.default_model = default_model if default_model is not None else getattr(llm, "model_id", None)
 
@@ -251,33 +264,28 @@ class MAS(BasePredictor):
                     f"Agent {agent.name!r} binds to model {agent.model!r}, which is not in llms={sorted(self.llms)}."
                 )
 
-        self._compiled: CompiledGraph | None = None
-        self._structure: _Structure | None = None
-        self._last_trace: Trace | None = None
-        self._last_traces: tuple[Trace, ...] = ()
+        self.compilation: tuple[str, CompiledGraph] | None = None
+        self.last_trace: Trace | None = None
+        self.last_traces: tuple[Trace, ...] = ()
 
-        super().__init__(llm=llm)  # type: ignore[arg-type]
-
-        if max_tool_rounds < 0:
-            raise ValueError("max_tool_rounds must be >= 0.")
         self.tools = tuple(tools)
+        self.tool_index: ToolIndex | None = None  # built on first use, so tool-free systems never touch their sources
         self.max_tool_rounds = max_tool_rounds
-        self._tool_index: tuple[tuple[ToolSource | Tool, ...], ToolIndex] | None = None
         if self.version == SPEC_VERSION_2:
             # The check builds and checks the topology itself, so that a bad edge
             # is one problem in the list rather than the first and only error.
             self.info = check_system(self)
             self.graph = build_graph(names, pairs, back=self.while_edges)
             return
-        for agent in agents:  # fail at construction, not mid-run; tool-free systems never touch their sources
+        for agent in agents:  # fail at construction, not mid-run
             if agent.tools:
                 self.resolve_tools(agent)
 
     def _callables(self) -> ToolIndex:
-        """Return the callables registry, indexed once per ``tools`` tuple."""
-        if self._tool_index is None or self._tool_index[0] is not self.tools:
-            self._tool_index = (self.tools, index_tools(self.tools))
-        return self._tool_index[1]
+        """Return the callables registry: every tool and tool source, indexed on first use."""
+        if self.tool_index is None:
+            self.tool_index = index_tools(self.tools)
+        return self.tool_index
 
     def resolve_tools(self, agent: Agent) -> ToolIndex:
         """Return the tools an agent may call, keyed by name.
@@ -322,8 +330,6 @@ class MAS(BasePredictor):
         """The ``(source, target)`` of every ``while`` edge, in declared order: the loops of a version 2 run."""
         return tuple((edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.WHILE)
 
-    # ----------------------------------------------------------------- models
-
     def resolve_llm(self, agent: Agent) -> BaseLLM:
         """Return the model that serves an agent.
 
@@ -342,8 +348,6 @@ class MAS(BasePredictor):
             raise ValueError(f"Agent {agent.name!r} has no model binding and the MAS has no default llm.")
         return self.llm
 
-    # ---------------------------------------------------------------- running
-
     def __call__(self, query: str) -> str:
         """Run the MAS on one input and return the terminal agent's output.
 
@@ -357,7 +361,7 @@ class MAS(BasePredictor):
             RuntimeError: If the run failed.
         """
         trace = self.run(query)
-        self._last_trace = trace
+        self.last_trace = trace
         if trace.error is not None:
             raise RuntimeError(f"MAS run failed: {trace.error}")
         return trace.output
@@ -391,7 +395,7 @@ class MAS(BasePredictor):
             ValueError: If the system's inputs are not ``{query: text}``.
         """
         self._check_runs_on_query()
-        return _engine.run_one(self, query, self.prompts())
+        return runtime.run_one(self, query, self.prompts())
 
     def run_batch(self, queries: list[str]) -> list[Trace]:
         """Run the MAS over several inputs, concurrently where the LLM allows.
@@ -407,36 +411,13 @@ class MAS(BasePredictor):
         """
         self._check_runs_on_query()
         prompts = self.prompts()
-        traces = _engine.run_many(self, queries, [prompts] * len(queries))
-        self._last_traces = tuple(traces)
+        traces = runtime.run_many(self, queries, [prompts] * len(queries))
+        self.last_traces = tuple(traces)
         return traces
 
     def prompts(self) -> dict[str, str]:
         """Return the current prompt of every agent, keyed by name."""
         return {name: agent.prompt for name, agent in self.agents.items()}
-
-    @property
-    def last_trace(self) -> Trace | None:
-        """Trace of the most recent :meth:`__call__`, or ``None`` before any.
-
-        This is the single-call ergonomic. Batched execution records into
-        :attr:`last_traces` instead; see there for the concurrency contract.
-        """
-        return self._last_trace
-
-    @property
-    def last_traces(self) -> tuple[Trace, ...]:
-        """Traces of the most recent :meth:`predict` or :meth:`run_batch` call.
-
-        Assigned once, at the end of the batch, rather than appended to as the
-        batch progresses, so a reader either sees the previous batch or the whole
-        new one. This is the seam an attributor reads after a task evaluation.
-        One MAS instance still serves one batch at a time; run concurrent batches
-        on separate instances, or use :meth:`run`, which shares no state at all.
-        """
-        return self._last_traces
-
-    # ------------------------------------------------- promptolution predictor
 
     def predict(
         self,
@@ -473,10 +454,10 @@ class MAS(BasePredictor):
 
         names = list(self.agents)
         decoded = [decode_prompts(item, names) for item in encoded]
-        traces = _engine.run_many(self, list(xs), decoded)
-        self._last_traces = tuple(traces)
+        traces = runtime.run_many(self, list(xs), decoded)
+        self.last_traces = tuple(traces)
 
-        preds = self._extract_preds([trace.output for trace in traces])
+        preds = [trace.output for trace in traces]
         # A failed rollout keeps its finished agents' records, but promptolution
         # gets an empty sequence for it, as it did before records were kept.
         seqs = [
@@ -486,21 +467,12 @@ class MAS(BasePredictor):
         return preds, seqs
 
     def _extract_preds(self, preds: list[str]) -> list[str]:
-        """Return predictions unchanged; a MAS's terminal agent already extracts.
-
-        Args:
-            preds: Raw terminal-agent outputs.
-
-        Returns:
-            The same list.
-        """
+        """Return predictions unchanged; promptolution declares this abstract and forces the name."""
         return list(preds)
 
     def encode(self) -> str:
         """Return this MAS's prompts as a single promptolution prompt string."""
         return encode_prompts(self.prompts())
-
-    # ------------------------------------------------------------- components
 
     def copy(
         self,
@@ -527,19 +499,15 @@ class MAS(BasePredictor):
             ValueError: If a key names an unknown agent, or the result is not
                 runnable.
         """
-        for label, mapping in (("prompts", prompts), ("models", models)):
-            unknown = set(mapping or {}) - set(self.agents)
-            if unknown:
-                raise ValueError(f"copy({label}=...) names unknown agents: {sorted(unknown)}.")
-
-        new_agents = []
-        for name, agent in self.agents.items():
-            overrides: dict[str, Any] = {}
-            if prompts is not None and name in prompts:
-                overrides["prompt"] = prompts[name]
-            if models is not None and name in models:
-                overrides["model"] = models[name]
-            new_agents.append(agent.copy(**overrides) if overrides else agent.copy())
+        prompts = prompts or {}
+        models = models or {}
+        unknown = (set(prompts) | set(models)) - set(self.agents)
+        if unknown:
+            raise ValueError(f"copy() names unknown agents: {sorted(unknown)}.")
+        new_agents = [
+            agent.copy(prompt=prompts.get(name, agent.prompt), model=models.get(name, agent.model))
+            for name, agent in self.agents.items()
+        ]
 
         if edges is None:
             edges = list(self.graph.edges) if self.version == SPEC_VERSION else list(self.edges)
@@ -552,6 +520,7 @@ class MAS(BasePredictor):
             default_model=self.default_model,
             tools=self.tools,
             max_tool_rounds=self.max_tool_rounds,
+            max_visits=self.max_visits,
             budget=self.budget,
             **self._v2_kwargs(),
         )
@@ -578,8 +547,6 @@ class MAS(BasePredictor):
             "health": self.health,
         }
 
-    # ---------------------------------------------------------- serialization
-
     def to_dict(self) -> MASSpec | MASSpecV2:
         """Return the plain-data spec for this MAS.
 
@@ -597,10 +564,9 @@ class MAS(BasePredictor):
         if self.version == SPEC_VERSION_2:
             return self._to_dict_v2()
         ordered = agent_names(self.graph)
-        agents: list[AgentSpec] = [cast("AgentSpec", self.agents[name].to_dict()) for name in ordered]
         return MASSpec(
             version=SPEC_VERSION,
-            agents=agents,
+            agents=[cast("AgentSpec", self.agents[name].to_dict()) for name in ordered],
             edges=[[source, target] for source, target in self.graph.edges],
             default_model=self.default_model,
         )
@@ -789,7 +755,7 @@ class MAS(BasePredictor):
                 "until then keep its to_dict()."
             )
         Path(path).write_text(
-            yaml.safe_dump(dict(self.to_dict()), sort_keys=False, allow_unicode=True),
+            yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
 
@@ -814,8 +780,6 @@ class MAS(BasePredictor):
         """
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(data, llm=llm, llms=llms, tools=tools)
-
-    # --------------------------------------------------------------- describe
 
     def describe(self) -> dict[str, Any]:
         """Return the system as plain data, for drawing it and naming it.
@@ -882,8 +846,8 @@ class MAS(BasePredictor):
         for source, target in ordered:
             item: dict[str, Any] = {"from": source, "to": target, "kind": EdgeKind.PLAIN.value}
             if (source, target) in loops:
-                when = f"{_engine.CONTINUE_MARKER} in output"
-                item.update(kind="loop", when=when, max_visits=_engine.MAX_NODE_VISITS)
+                when = f"{runtime.CONTINUE_MARKER} in output"
+                item.update(kind="loop", when=when, max_visits=self.max_visits)
             elif (source, target) in declared:
                 spec = declared[(source, target)]
                 item["kind"] = spec.kind.value
@@ -917,10 +881,8 @@ class MAS(BasePredictor):
         description["id"] = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return description
 
-    # -------------------------------------------------------------- internals
-
     @property
-    def structure(self) -> _Structure:
+    def structure(self) -> str:
         """What the compiled graph depends on, and what makes two MASs swappable.
 
         Two systems with the same structure differ only in prompts, so one can
@@ -930,37 +892,32 @@ class MAS(BasePredictor):
         Prompts are deliberately absent: they travel in the run state, so editing
         one must not throw away a compilation. Anything else about an agent, its
         wiring or its model, changes the graph itself. A version 2 system adds
-        its steps, boxes (each with its inner structure), edges, answer types
-        and forms, inputs and merges; frozen nodes and health settings change
-        no compiled graph and stay out.
+        lines for its steps, edges, answer types and forms, inputs, merges and
+        boxes (each with its inner structure, indented); frozen nodes and health
+        settings change no compiled graph and stay out.
         """
-        agents = tuple(
-            (agent.name, ",".join(agent.inputs), agent.output, agent.model, ",".join(agent.tools))
+        lines = [
+            f"{agent.name} {','.join(agent.inputs)} -> {agent.output} model={agent.model} tools={','.join(agent.tools)}"
             for agent in sorted(self.agents.values(), key=lambda a: a.name)
-        )
-        base = (agents, tuple(sorted(self.graph.edges)))
+        ]
+        lines += [f"{source} -> {target}" for source, target in sorted(self.graph.edges)]
         if self.version == SPEC_VERSION:
-            return base
-        steps = tuple(
-            (step.name, step.uses, tuple(sorted(step.reads.items())), tuple(sorted(step.writes.items())))
+            return "\n".join(lines)
+        lines += [
+            f"step {step.name} uses={step.uses} reads={_canonical(step.reads)} writes={_canonical(step.writes)}"
             for step in sorted(self.steps.values(), key=lambda s: s.name)
-        )
-        forms = tuple(
-            (agent.name, str(parse_type(agent.output_type)), json.dumps(agent.schema, sort_keys=True))
+        ]
+        lines += [f"edge {_canonical(edge.as_tuple())}" for edge in self.edges]
+        lines += [
+            f"form {agent.name} {parse_type(agent.output_type)} {_canonical(agent.schema)}"
             for agent in sorted(self.agents.values(), key=lambda a: a.name)
-        )
-        return (
-            *base,
-            steps,
-            tuple(edge.as_tuple() for edge in self.edges),
-            forms,
-            tuple(sorted((name, str(vtype)) for name, vtype in self.inputs.items())),
-            tuple(sorted(self.merges.items())),
-            tuple(
-                (box.name, box.system.structure, tuple(sorted(box.reads.items())), tuple(sorted(box.writes.items())))
-                for box in sorted(self.boxes.values(), key=lambda b: b.name)
-            ),
-        )
+        ]
+        lines += [f"input {name} {vtype}" for name, vtype in sorted(self.inputs.items())]
+        lines += [f"merge {value} {rule}" for value, rule in sorted(self.merges.items())]
+        for box in sorted(self.boxes.values(), key=lambda b: b.name):
+            lines.append(f"box {box.name} reads={_canonical(box.reads)} writes={_canonical(box.writes)}")
+            lines += [f"  {line}" for line in box.system.structure.splitlines()]
+        return "\n".join(lines)
 
     @property
     def compiled(self) -> CompiledGraph:
@@ -969,11 +926,9 @@ class MAS(BasePredictor):
         The compiled object's type is an implementation detail and never appears
         in a public signature.
         """
-        current = self.structure
-        if self._compiled is None or self._structure != current:
-            self._compiled = _engine.compile_mas(self)
-            self._structure = current
-        return self._compiled
+        if self.compilation is None or self.compilation[0] != self.structure:
+            self.compilation = (self.structure, runtime.compile_mas(self))
+        return self.compilation[1]
 
     @property
     def terminal(self) -> str:
@@ -1034,3 +989,8 @@ def _parsed(words: Mapping[str, str]) -> dict[str, ValueType]:
 def _type_words(types: Mapping[str, ValueType]) -> dict[str, str]:
     """Write ``{name: type}`` as type words."""
     return {name: str(vtype) for name, vtype in types.items()}
+
+
+def _canonical(value: Any) -> str:
+    """Write a structure part as canonical JSON, so equal parts give equal lines."""
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)

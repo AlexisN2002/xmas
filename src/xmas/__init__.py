@@ -19,7 +19,7 @@ from xmas.health import Health, HealthSettings
 from xmas.llms import APILLM, ScoredSequence
 from xmas.mas import MAS
 from xmas.nodes import Box, Step
-from xmas.tasks import GSM8KTask, MASTask, ProbingTask, ReferencePool
+from xmas.tasks import GSM8KTask, MASTask
 from xmas.trace import AgentRecord, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType
 
@@ -44,8 +44,6 @@ __all__ = [
     "Health",
     "HealthSettings",
     "MASTask",
-    "ProbingTask",
-    "ReferencePool",
     "RunStatus",
     "ScoredSequence",
     "Step",

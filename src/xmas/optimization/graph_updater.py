@@ -11,7 +11,7 @@ from xmas.check import step_maps
 from xmas.edges import Edge, EdgeKind
 from xmas.graph import SENTINELS, START, ancestors, build_graph
 from xmas.mas import MAS
-from xmas.optimization.synthesis import PromptSynthesizer, Rewrite
+from xmas.optimization.synthesis import LLMPromptSynthesizer, MechanicalSynthesizer, Rewrite
 from xmas.optimization.topology import Edges, Fixed, TopologyBudget, crossover, mas_edges, mutate, terminals
 from xmas.spec import SPEC_VERSION_2
 
@@ -22,8 +22,7 @@ NEW_AGENT_PROMPT = "You are {name}. Do your part of the task and pass on your re
 class GraphUpdater:
     """Proposes candidates that differ from a system in topology.
 
-    Implements :class:`~xmas.optimization.updaters.TopologyUpdater`. Three things
-    happen for every candidate, and skipping any one of them makes the search
+    Three things happen for every candidate, and skipping any one of them makes the search
     look like it is working while it is not:
 
     1. the edge set is mutated, by the operators ported from the seed;
@@ -46,7 +45,7 @@ class GraphUpdater:
 
     def __init__(
         self,
-        synthesizer: PromptSynthesizer,
+        synthesizer: LLMPromptSynthesizer | MechanicalSynthesizer,
         budget: TopologyBudget | None = None,
         *,
         operations: int = 1,
@@ -184,6 +183,7 @@ class GraphUpdater:
                 prompt, output = NEW_AGENT_PROMPT.format(name=name), self.output_of(mas, name)
                 agents[name] = Agent(name, prompt, output=output, inputs=inputs[name])
             else:
+                # copy keeps model, tools, output_type and schema (main kept model and tools)
                 agents[name] = parent.copy(inputs=inputs[name])
             if parent is None or sorted(parent.inputs) != sorted(inputs[name]):
                 agent = agents[name]
@@ -269,12 +269,12 @@ class GraphUpdater:
         Returns:
             The edges.
         """
-        pairs, present = set(edges), set(names) | SENTINELS
+        pairs, present = set(edges), {*names, *SENTINELS}
         kept = [
             edge
             for edge in mas.edges
             if (edge.source, edge.target) in pairs
-            or ({edge.source, edge.target} & SENTINELS and {edge.source, edge.target} <= present)
+            or ({edge.source, edge.target}.intersection(SENTINELS) and {edge.source, edge.target} <= present)
         ]
         known = {(edge.source, edge.target) for edge in kept}
         return [*kept, *(Edge(source, target) for source, target in edges if (source, target) not in known)]
@@ -332,7 +332,7 @@ class GraphUpdater:
     def edges_of(self, mas: MAS) -> Edges:
         """Return a system's node-level edges as pairs, conditional ones included, without the sentinel wiring."""
         pairs = {(edge.source, edge.target) for edge in mas.edges}
-        return sorted((source, target) for source, target in pairs if not {source, target} & SENTINELS)
+        return sorted((source, target) for source, target in pairs if not {source, target}.intersection(SENTINELS))
 
     def fixed_of(self, mas: MAS) -> Fixed | None:
         """Return what no mutation of a version 2 system may change, or ``None`` for version 1.
@@ -349,7 +349,7 @@ class GraphUpdater:
         conditional = [edge for edge in mas.edges if edge.kind is not EdgeKind.PLAIN]
         held = set(mas.frozen).union(*({edge.source, edge.target} for edge in conditional))
         return Fixed(
-            nodes=frozenset(held - SENTINELS),
+            nodes=frozenset(held.difference(SENTINELS)),
             code=frozenset([*mas.steps, *mas.boxes]),
             terminals=frozenset(terminals(self.names_of(mas), self.edges_of(mas))),
             conditional=frozenset((edge.source, edge.target) for edge in conditional),

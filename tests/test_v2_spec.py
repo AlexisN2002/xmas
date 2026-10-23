@@ -24,7 +24,7 @@ from xmas.graph import Join, classify_joins
 from xmas.health import HealthSettings
 from xmas.nodes import Box, Step
 from xmas.spec import validate_spec
-from xmas.tools import Tool, tool
+from xmas.tools import Tool, ToolSource, tool
 
 
 @tool
@@ -45,7 +45,7 @@ def repeat(text: str, times: int) -> str:
     return text * times
 
 
-class RemoteTools:
+class RemoteTools(ToolSource):
     """A tool source standing in for an MCP server."""
 
     url = "https://tools.example.com/mcp"
@@ -166,7 +166,9 @@ def test_worked_example_round_trips_and_v1_is_untouched(tmp_path: Path) -> None:
     v1_spec = v1.to_dict()
     assert set(v1_spec) == {"version", "agents", "edges", "default_model"}
     assert MAS.from_dict(dict(v1_spec)).to_dict() == v1_spec
-    assert v1.copy().structure == v1.structure and len(v1.structure) == 2
+    assert v1.copy().structure == v1.structure
+    v2_lines = ("step ", "edge ", "form ", "input ", "merge ", "box ")
+    assert not any(line.startswith(v2_lines) for line in v1.structure.splitlines())
     with pytest.raises(ValueError, match="Unknown spec keys"):
         MAS.from_dict({**v1_spec, "steps": []})
     with pytest.raises(ValueError, match="Unsupported spec version"):

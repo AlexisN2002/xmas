@@ -16,7 +16,7 @@ import enum
 import json
 import re
 from collections import deque
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 import openai
@@ -64,13 +64,29 @@ class RunStatus(enum.StrEnum):
 
 
 class XmasError(RuntimeError):
-    """Base of the errors xmas raises itself.
+    """The error xmas raises itself; the message reads '<source>: <what> (<code>)', e.g. 'llm: rate limited (429)'.
+
+    A plain ``XmasError`` is a failed call; its subclasses below name a run's
+    typed failures.
 
     Attributes:
-        kind: What :func:`classify` returns for this error.
+        status: The HTTP-style status code, or ``None``.
+        retry_after: Seconds the endpoint asked the caller to wait, or ``None``.
+        kind: What :func:`classify` returns for this error when it carries no
+            ``status``.
     """
 
     kind: ErrorKind = ErrorKind.UNKNOWN
+
+    def __init__(self, message: str, status: int | None = None, retry_after: float | None = None) -> None:
+        """Initialize the error."""
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickle with the status and the wait, which the message alone would lose."""
+        return type(self), (str(self), self.status, self.retry_after)
 
 
 class BudgetExceeded(XmasError):  # noqa: N818 (public name fixed by the phase-1 contract)
@@ -172,7 +188,7 @@ class BadFormat(XmasError):  # noqa: N818 (public name fixed by the phase-2 cont
 
 MONEY_WORDS = re.compile(
     r"key limit exceeded|requires more credits|insufficient credits|insufficient_quota"
-    r"|exceeded your current quota|payment required|in_flight_budget_exhausted",
+    r"|exceeded your current quota|payment required|in_flight_budget_exhausted|insufficient_budget",
     re.I,
 )
 """Provider texts that mean the key or account is out of money."""
@@ -190,6 +206,9 @@ def classify(error: BaseException) -> ErrorKind:
     first, at most 8 deep, and visits each exception once, so a cycle ends it.
     The first rule that matches any visited exception wins:
 
+    0. an :class:`XmasError` with a ``status``: :func:`kind_of_status` of it and
+       the message, except that 401 and 403 (the source refused the caller) are
+       ``REFUSAL`` when no money words appear;
     1. a ``kind`` attribute that is an :class:`ErrorKind`;
     2. ``openai.APIStatusError``: :func:`kind_of_status` of its status code and its
        message plus body;
@@ -224,7 +243,12 @@ def classify(error: BaseException) -> ErrorKind:
 
 
 def _own_kind(exc: BaseException) -> ErrorKind | None:
-    """Return the kind of one exception by rules 1 to 5, or ``None`` if none matches."""
+    """Return the kind of one exception by rules 0 to 5, or ``None`` if none matches."""
+    if isinstance(exc, XmasError) and exc.status is not None:
+        status_kind = kind_of_status(exc.status, str(exc))
+        if status_kind == ErrorKind.UNKNOWN and exc.status in (401, 403):
+            return ErrorKind.REFUSAL
+        return status_kind
     kind = getattr(exc, "kind", None)
     if isinstance(kind, ErrorKind):
         return kind

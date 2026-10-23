@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from xmas import MAS, Agent, Budget, ErrorKind, TokenUsage, ToolCall
-from xmas import _engine as engine
+from xmas import runtime as engine
 from xmas.budget import RunMeter
 from xmas.errors import BadFormat
 from xmas.llms.meta import CallMeta

@@ -131,7 +131,8 @@ class Agent:
             The reconstructed agent.
 
         Raises:
-            ValueError: If a required key is missing or an unknown key is present.
+            ValueError: If a required key is missing, an unknown key is present,
+                or a value has the wrong type.
         """
         unknown = set(data) - {"name", "prompt", "inputs", "output", "tools", "model", "output_type", "schema"}
         if unknown:
@@ -139,6 +140,21 @@ class Agent:
         missing = {"name", "prompt", "output"} - set(data)
         if missing:
             raise ValueError(f"Agent is missing required keys: {sorted(missing)}.")
+        for key in ("name", "prompt", "output"):
+            if not isinstance(data[key], str):
+                raise ValueError(f"Agent {data['name']!r} needs a string {key!r}.")
+        for key in ("inputs", "tools"):
+            value = data.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"Agent {data['name']!r} needs {key!r} to be a list of strings.")
+        model = data.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ValueError(f"Agent {data['name']!r} needs 'model' to be a string or null.")
+        if not isinstance(data.get("output_type", "text"), str):
+            raise ValueError(f"Agent {data['name']!r} needs 'output_type' to be a string.")
+        schema = data.get("schema")
+        if schema is not None and not isinstance(schema, dict):
+            raise ValueError(f"Agent {data['name']!r} needs 'schema' to be a mapping or null.")
         return cls(
             name=data["name"],
             prompt=data["prompt"],

@@ -15,12 +15,13 @@ from xmas.budget import Budget
 from xmas.errors import ErrorKind, RunStatus
 from xmas.graph import END, START
 from xmas.optimization.attribution import ContrastiveAttributor
+from xmas.optimization.attribution import prompt as attribution_prompt
 
 from .conftest import MockLLM
 
 
 def build_pair(llm: MockLLM) -> MAS:
-    """The two-agent system from the README quickstart."""
+    """A two-agent solver and checker."""
     solver = Agent("solver", prompt="Solve step by step.", output="draft")
     checker = Agent("checker", prompt="Verify and answer.", inputs=["query", "draft"], output="prediction")
     return MAS([solver, checker], edges=[("solver", "checker")], llm=llm)
@@ -184,7 +185,8 @@ def test_a_failed_run_becomes_data_not_an_exception() -> None:
 
     # the judge is still told the terminal agent's key, not the last key the failed rollout's records hold
     ok = solve_and_check(MockLLM()).run("2+2")
-    judged = ContrastiveAttributor(MockLLM())._prompt([0, 1], [trace, ok], [0.0, 1.0], ["solver", "checker"])
+    template, names = ContrastiveAttributor.ATTRIBUTION_PROMPT, ["solver", "checker"]
+    judged = attribution_prompt(template, {"executions": []}, [trace, ok], names)
     assert 'under the key "prediction"' in judged
 
 

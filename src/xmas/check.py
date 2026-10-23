@@ -265,7 +265,7 @@ def check_system(mas: MAS) -> SystemInfo:
     for value in sorted(set(mas.merges) - set(types)):
         problems.append(f"state names {value!r}, which no node writes and no input declares")
 
-    edge_problems, predicates, buildable = _edge_problems(mas.edges, set(nodes) | SENTINELS)
+    edge_problems, predicates, buildable = _edge_problems(mas.edges, {*nodes, *SENTINELS})
     problems.extend(edge_problems)
 
     routes: RouteGraph | None = None
