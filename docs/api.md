@@ -139,7 +139,7 @@ call (same tool, same arguments) from its earlier result.
 ## Version 2: steps, typed values, answer forms
 
 A system is version 2 when it uses anything below (or `MAS(..., version=2)`);
-every version 1 system runs, serializes and compiles exactly as before. What a
+a system that uses none of it is version 1, with its own spec format. What a
 version 2 system can do:
 
 - **Steps.** `MAS(..., steps=[Step("count", uses="count_words")])` runs a
@@ -151,7 +151,8 @@ version 2 system can do:
   callable's `string` parameters read text, the others json, and its write is
   text when the function returns `str` (or the tool is remote), else json. A
   json value reaches a prompt as one line of JSON. Images, files and lists of
-  them are words the format already knows; they run in phase 3.
+  them are type words the format knows, but only text and json run: the check
+  refuses the others.
 - **Answer forms.** `Agent(..., output_type="json", schema={...})` makes the
   agent answer in JSON. Its prompt ends with format lines no optimizer can
   drop; an answer that does not fit gets exactly one retry, then the run fails
@@ -176,12 +177,12 @@ A version 2 spec (`version: 2`) has the keys `inputs`, `agents` (`reads`,
 (a string is a chain, `a -> b -> c`), `state`, `frozen`, `health`, `callables`
 (what each callable reads and writes), `default_model` and `prompts` (one per
 agent). Models
-appear by name only and keys never appear; in the `.mas` bundle (phase 5)
-endpoints and keys come from configuration, never from the bundle.
+appear by name only and keys never appear: endpoints and keys come from
+configuration, never from the spec.
 
-Still refused, with a message saying so: `to_yaml` on a version 2 system (its
-file is the `.mas` bundle, phase 5). `run(query)` needs the inputs to be exactly
-`{query: text}`.
+Refused, with a message saying so: `to_yaml` on a version 2 system (its file
+format is the `.mas` bundle; `to_dict()` gives its spec), and `run(query)` on a
+system whose inputs are not exactly `{query: text}`.
 
 ::: xmas.nodes.Step
 
@@ -198,6 +199,7 @@ file is the `.mas` bundle, phase 5). `run(query)` needs the inputs to be exactly
         - TEXT
         - JSON
         - parse_type
+        - LIST_PREFIX
 
 ::: xmas.schemas
     options:
@@ -212,6 +214,12 @@ file is the `.mas` bundle, phase 5). `run(query)` needs the inputs to be exactly
       members:
         - check_system
         - SystemInfo
+
+::: xmas.routes
+    options:
+      members:
+        - Join
+        - classify_joins
 
 ## Version 2: operators, boxes, health
 
@@ -257,8 +265,8 @@ min_samples, leak}`; a healthy run's trace dict has no `health` key.
 
 `MAS.describe()` returns plain data: every node with its kind, model name,
 reads, writes and `frozen`; every edge with its kind and condition; the join of
-each node fed by several edges; an `id` hashed from it. Like the spec and the
-`.mas` bundle, it names models only: endpoints and keys come from configuration.
+each node fed by several edges; an `id` hashed from it. Like the spec, it names
+models only: endpoints and keys come from configuration.
 
 ::: xmas.predicates
     options:
