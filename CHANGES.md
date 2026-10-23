@@ -1,5 +1,21 @@
 # Changes in xmas, newest first
 
+## Phase 2b: conditions, loops, error routes, boxes and health (23 Oct 2026)
+
+What a user of xmas can do now that they could not before:
+
+- Let a node decide where the run goes: `when` (taken if a condition on its fresh answer holds), `else`, and `switch` (pick the edge whose case equals a field, for example `verdict.action`). Conditions are a small checked language, never code: fields, comparisons, `and or not`, `exists`, `len`, `visits`, `cost`, `elapsed`.
+- Loop with a cap: a `while` edge goes back until its target ran `max_visits` times, then the record is marked capped and the `else` edge takes over.
+- Route a failure by its kind: `on error: [timeout, outage]` (or `any`) sends the run to a fallback node and keeps the failed record; a budget stop is never caught. A failed run keeps its failed record too.
+- Put a whole system inside another as one node (a box). It spends from the outer budget, and the trace keeps its records nested, with `Trace.walk()` naming the path.
+- Mark nodes `frozen`: no optimizer changes their prompt, model, wiring or edges. Topology search now works on version 2 systems and keeps steps, boxes, frozen nodes and conditions as they are.
+- Read health signals on every trace: retried, bad format, routed errors, empty, stuck, unfilled placeholders, leaked markup, unusually long or short answers, how often each loop ran and whether it hit its cap, and how much of each budget limit was used. For information only; a healthy run shows none.
+- A node fed by several edges is a merge (runs on whichever arrives) or a join (waits for one of each group, once per pass); the check refuses anything else and names the clashing edges.
+
+What changed in the format: edges in a version 2 spec may carry `{when: ...}`, `{when: ..., max_visits: n}`, `{switch: ...}`, `else` or `{on error: [...]}`; new sections `boxes`, `frozen` and `health` (length factor, minimum samples, extra leak patterns).
+
+What stays the same: every version 1 system, its traces and optimizers; a healthy run's trace has no health key. Still to come: saving a version 2 system as a `.mas` bundle.
+
 ## Phase 2a: steps, typed values and answer forms (23 Oct 2026)
 
 What a user of xmas can do now that they could not before:
