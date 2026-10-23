@@ -271,8 +271,9 @@ class ContrastiveAttributor:
             "executions": [self.rollout(traces[index], rewards[index]) for index in group],
         }
         # The judge is told which key holds the answer. The seed hardcoded
-        # "prediction"; here it is whatever the last agent to write wrote.
-        records = traces[group[0]].records
+        # "prediction"; here it is whatever the last agent to write wrote, in a
+        # rollout that finished: a failed one keeps only the agents before the failure.
+        records = next((traces[index].records for index in group if not traces[index].failed), ())
         output_variable = next(iter(records[-1].outputs), "prediction") if records else "prediction"
         return (
             self.template.replace("{executions}", json.dumps(payload, ensure_ascii=False, indent=2))

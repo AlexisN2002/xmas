@@ -11,6 +11,8 @@ Note:
 """
 
 from xmas.agent import Agent
+from xmas.budget import Budget
+from xmas.errors import BudgetExceeded, ErrorKind, RunStatus
 from xmas.graph import END, START
 from xmas.llms import APILLM, ScoredSequence
 from xmas.mas import MAS
@@ -26,10 +28,14 @@ __all__ = [
     "START",
     "Agent",
     "AgentRecord",
+    "Budget",
+    "BudgetExceeded",
+    "ErrorKind",
     "GSM8KTask",
     "MASTask",
     "ProbingTask",
     "ReferencePool",
+    "RunStatus",
     "ScoredSequence",
     "TokenUsage",
     "ToolCall",

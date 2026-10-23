@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections.abc import Sequence
-from typing import Any
+from concurrent.futures import TimeoutError as FuturesTimeout
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from promptolution.llms import api_llm as _promptolution
+from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 
+from xmas.errors import EmptyResponse, ErrorKind
+from xmas.llms.meta import CallMeta, TokenPrice, meta_from_completion
 from xmas.llms.scoring import ScoredSequence
 from xmas.llms.telemetry import GENERATE, SCORE, CallLog, CallRecord, approximate_tokens
-from xmas.tools import Tool, ToolCallRequest, complete_with_tools
+from xmas.tools import Tool, ToolCallRequest, _create_with_retries
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletion
 
 ENV_BASE_URL = "XMAS_BASE_URL"
 """Environment variable holding the endpoint base URL."""
@@ -42,9 +50,13 @@ class RateLimitedError(RuntimeError):
     one 429 into a retry storm.
 
     Attributes:
+        kind: Always :attr:`~xmas.errors.ErrorKind.RATE_LIMITED`, so
+            :func:`~xmas.errors.classify` reads it without matching the message.
         retry_after: Seconds the endpoint asked the caller to wait, or ``None``
             when it did not say.
     """
+
+    kind: ErrorKind = ErrorKind.RATE_LIMITED
 
     def __init__(self, message: str, retry_after: float | None = None) -> None:
         """Initialize the error.
@@ -60,15 +72,27 @@ class RateLimitedError(RuntimeError):
 class APILLM(_promptolution.APILLM):
     """An OpenAI-compatible model that can also score a fixed continuation.
 
-    Generation is inherited untouched from promptolution: batching, concurrency,
-    retries and token metering already live there, and reimplementing any of it
-    here would create a second place for the same bug. What xmas adds is
-    :meth:`score`.
+    :meth:`get_response` is inherited from promptolution: batching, concurrency,
+    retries and token metering live there. What xmas adds is :meth:`score`, the
+    tool turn :meth:`get_tool_response`, and a second plain path,
+    :meth:`generate_with_meta`, that sends the very same request but keeps what
+    the provider reported (tokens, cost, finish reason, served model).
+
+    The engine takes the second path when ``full_response`` is ``True``. By
+    default it is, unless a subclass overrides a hook of the old path
+    (``get_response``, ``_get_response``, ``_aget_batch``,
+    ``_ainvoke_with_retries``, ``_ainvoke_once`` or ``get_tool_response``): such
+    a subclass keeps the path it hooked, and its own accounting with it.
 
     The constructor accepts ``model`` and ``base_url``, which is what the xmas
     surface reads like, and forwards them to promptolution's ``model_id`` and
     ``api_url``. Both spellings are accepted so that code written against either
     library keeps working.
+
+    Attributes:
+        full_response: Whether the engine reads this model through
+            :meth:`generate_with_meta` and :meth:`get_tool_response_meta`.
+        price: The price used for a call whose response reports no cost.
     """
 
     def __init__(
@@ -78,6 +102,8 @@ class APILLM(_promptolution.APILLM):
         api_key: str | None = None,
         telemetry: CallLog | None = None,
         backend_tag: str = "gateway",
+        full_response: bool | None = None,
+        price: TokenPrice | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the model.
@@ -95,6 +121,15 @@ class APILLM(_promptolution.APILLM):
             backend_tag: What this backend calls itself in a record. Calls from
                 two serving paths must never be pooled into one statistic, and
                 this is what keeps them separable afterwards.
+            full_response: ``True`` sends plain agents through
+                :meth:`generate_with_meta`, ``False`` keeps promptolution's
+                path, and ``None`` decides by class: on, unless the class
+                overrides a hook of the old path. The class is read once, at
+                construction, so a hook patched onto an instance afterwards is
+                not seen; pass ``full_response=False`` to keep promptolution's
+                path.
+            price: USD per million tokens, used only when a response reports
+                no cost. ``None`` leaves such a cost unknown.
             **kwargs: Forwarded to promptolution's ``APILLM``.
 
         Raises:
@@ -112,6 +147,8 @@ class APILLM(_promptolution.APILLM):
         self.base_url = base_url.rstrip("/")
         self.telemetry = telemetry
         self.backend_tag = backend_tag
+        self.full_response: bool = not _overrides_call_path(type(self)) if full_response is None else full_response
+        self.price = price
         super().__init__(model_id=model, api_url=self.base_url, api_key=api_key, **kwargs)
 
     def _record(self, record: CallRecord) -> None:
@@ -189,7 +226,248 @@ class APILLM(_promptolution.APILLM):
             The message text (``""`` when the model only called tools) and the
             requested calls, in order.
         """
-        return complete_with_tools(self, messages, tools)
+        text, requests, _ = self.get_tool_response_meta(messages, tools)
+        return text, requests
+
+    def get_tool_response_meta(
+        self, messages: list[dict[str, Any]], tools: Sequence[Tool]
+    ) -> tuple[str, list[ToolCallRequest], CallMeta]:
+        """Run one chat turn that may request tools, and keep its metadata.
+
+        The request carries ``model``, ``messages``, ``max_tokens`` and the tools;
+        sampling parameters (``temperature``, ``top_p``, ``stop``, ...) are sent
+        only when set in ``call_kwargs``, never as defaults, so a route that
+        refuses them still serves the call. One ``GENERATE`` call is recorded,
+        with the provider's exact token counts when it reports them.
+
+        A response without choices is asked again, with the attempt count and
+        backoff of an empty plain answer, and every paid attempt is summed into
+        the meta.
+
+        Args:
+            messages: OpenAI-shaped history (system, user, assistant with
+                ``tool_calls``, tool).
+            tools: Tools on offer. Empty omits the ``tools`` key, which forces a
+                text answer.
+
+        Returns:
+            The message text (``""`` when the model only called tools), the
+            requested calls in order, and the turn's metadata.
+
+        Raises:
+            EmptyResponse: If no attempt's response had a choice.
+        """
+        kwargs: dict[str, Any] = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
+        kwargs.update(self._call_kwargs)
+        if tools:
+            kwargs["tools"] = [spec.to_openai() for spec in tools]
+        started = time.perf_counter()
+        try:
+            completion, meta = self._tool_completion(kwargs)
+        except EmptyResponse as error:  # a failed _chat records itself; a turn without choices is recorded here
+            self._record(
+                CallRecord(
+                    operation=GENERATE,
+                    model=self.model,
+                    backend=self.backend_tag,
+                    latency_s=time.perf_counter() - started,
+                    ok=False,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            )
+            raise
+        message = completion.choices[0].message
+        text = message.content or ""
+        requests = [
+            ToolCallRequest(call.id, call.function.name, call.function.arguments or "{}")
+            for call in message.tool_calls or []
+            if call.type == "function"
+        ]
+        if meta.tokens is not None:  # the provider's counts, when it sent them
+            input_tokens, output_tokens = meta.tokens.input_tokens, meta.tokens.output_tokens
+        else:
+            input_tokens = sum(approximate_tokens(str(item.get("content") or "")) for item in messages)
+            output_tokens = approximate_tokens(text) + sum(approximate_tokens(r.arguments) for r in requests)
+        self.input_token_count += input_tokens
+        self.output_token_count += output_tokens
+        self._record(
+            CallRecord(
+                operation=GENERATE,
+                model=self.model,
+                backend=self.backend_tag,
+                latency_s=time.perf_counter() - started,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        )
+        return text, requests, meta
+
+    def generate_with_meta(self, prompt: str, system_prompt: str = DEFAULT_SYS_PROMPT) -> tuple[str, CallMeta]:
+        """Answer one prompt with promptolution's exact request, and keep its metadata.
+
+        The request is built as promptolution's ``_ainvoke_once`` builds it, key
+        for key and in the same order, so the bytes on the wire are the same.
+        Token counters and the call log read as after :meth:`get_response`.
+
+        Retries are xmas's: a 408, 409, 429, 5xx, connection error or timeout is
+        retried with promptolution's attempt count and backoff, and any other
+        4xx, or a 4xx whose text names money, is raised at once. An empty answer is asked again the same way,
+        unless the model was cut by ``max_tokens`` or refused, which the same
+        request would only repeat. Every paid attempt is summed into the meta.
+
+        Args:
+            prompt: The user message.
+            system_prompt: The system message.
+
+        Returns:
+            The answer text and the metadata of the attempts it took.
+
+        Raises:
+            EmptyResponse: If the answer has no content: at once, with kind
+                ``length_cut`` or ``refusal``, when the model was cut or
+                refused; otherwise after the last attempt.
+            TimeoutError: If the call outlives ``gather_timeout_s + 5``.
+        """
+        messages = [
+            {"role": "system", "content": str(system_prompt)},
+            {"role": "user", "content": str(prompt)},
+        ]
+        kwargs: dict[str, Any] = {
+            "model": self.model_id,
+            "messages": messages,
+            "max_tokens": self.max_tokens,
+        }
+        kwargs.update(self._call_kwargs)
+
+        before = self.get_token_count()
+        started = time.perf_counter()
+        try:
+            text, meta = self._answer(kwargs)
+        except EmptyResponse as error:  # a failed _chat records itself; an empty answer is recorded here
+            self._record(
+                CallRecord(
+                    operation=GENERATE,
+                    model=self.model,
+                    backend=self.backend_tag,
+                    latency_s=time.perf_counter() - started,
+                    ok=False,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            )
+            raise
+        self.update_token_count([prompt, system_prompt], [text])
+        after = self.get_token_count()
+        self._record(
+            CallRecord(
+                operation=GENERATE,
+                model=self.model,
+                backend=self.backend_tag,
+                latency_s=time.perf_counter() - started,
+                input_tokens=after["input_tokens"] - before["input_tokens"],
+                output_tokens=after["output_tokens"] - before["output_tokens"],
+            )
+        )
+        return text, meta
+
+    def _answer(self, kwargs: dict[str, Any]) -> tuple[str, CallMeta]:
+        """Send one plain request until it has content, summing the paid attempts.
+
+        Args:
+            kwargs: The request.
+
+        Returns:
+            The content and the combined meta.
+
+        Raises:
+            EmptyResponse: As described in :meth:`generate_with_meta`, with the
+                paid attempts' meta.
+        """
+        paid: CallMeta | None = None
+        for attempt in range(self.max_retries + 1):
+            completion, latency = self._chat(kwargs, "model call")
+            meta = meta_from_completion(completion, latency, self.price)
+            paid = meta if paid is None else paid.combine(meta)
+            # no choices at all is an empty answer too, asked again as promptolution does
+            content = completion.choices[0].message.content if completion.choices else None
+            if content is not None:
+                return content, paid
+            if meta.error_kind is not None:
+                raise EmptyResponse(
+                    f"Empty content from model (finish_reason={meta.finish_reason}, refused={meta.refused})",
+                    kind=meta.error_kind,
+                    meta=paid,
+                )
+            if attempt < self.max_retries:
+                time.sleep(self.retry_base_delay_s * (2**attempt))
+        raise EmptyResponse(f"Empty content from model after {self.max_retries + 1} attempts", meta=paid)
+
+    def _tool_completion(self, kwargs: dict[str, Any]) -> tuple[ChatCompletion, CallMeta]:
+        """Send one tool turn until its response has a choice, summing the paid attempts.
+
+        Args:
+            kwargs: The request.
+
+        Returns:
+            The completion and the combined meta.
+
+        Raises:
+            EmptyResponse: After the last attempt, with the kind of the last
+                finish reason and the paid attempts' meta.
+        """
+        paid: CallMeta | None = None
+        for attempt in range(self.max_retries + 1):
+            completion, latency = self._chat(kwargs, "tool turn")
+            meta = meta_from_completion(completion, latency, self.price)
+            paid = meta if paid is None else paid.combine(meta)
+            if completion.choices:
+                return completion, paid
+            if attempt < self.max_retries:
+                time.sleep(self.retry_base_delay_s * (2**attempt))
+        kind = ErrorKind.UNKNOWN if paid is None or paid.error_kind is None else paid.error_kind
+        raise EmptyResponse(
+            f"Empty content from model after {self.max_retries + 1} attempts (no choices in a tool turn)",
+            kind=kind,
+            meta=paid,
+        )
+
+    def _chat(self, kwargs: dict[str, Any], what: str) -> tuple[ChatCompletion, float]:
+        """Send one chat-completions request on the model's loop, with retries.
+
+        Runs on promptolution's background loop and semaphore with its per-call
+        timeout and backoff; a permanent 4xx is raised at once. A failure is
+        recorded as one failed ``GENERATE`` call and re-raised.
+
+        Args:
+            kwargs: The request, passed to ``client.chat.completions.create``.
+            what: How a timeout names the call, e.g. ``"tool turn"``.
+
+        Returns:
+            The completion and the wall seconds it took.
+
+        Raises:
+            TimeoutError: If the call outlives ``gather_timeout_s + 5``.
+        """
+        started = time.perf_counter()
+        future = asyncio.run_coroutine_threadsafe(_create_with_retries(self, kwargs), self._loop)
+        try:
+            try:
+                completion = future.result(timeout=self.gather_timeout_s + 5.0)
+            except FuturesTimeout:
+                future.cancel()
+                raise TimeoutError(f"{what} timed out after {self.gather_timeout_s + 5.0}s") from None
+        except Exception as error:
+            self._record(
+                CallRecord(
+                    operation=GENERATE,
+                    model=self.model,
+                    backend=self.backend_tag,
+                    latency_s=time.perf_counter() - started,
+                    ok=False,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            )
+            raise
+        return completion, time.perf_counter() - started
 
     @property
     def model(self) -> str:
@@ -318,6 +596,37 @@ class APILLM(_promptolution.APILLM):
             tokens=tuple(str(token) for token in tokens),
             token_logprobs=tuple(float(value) for value in logprobs),
         )
+
+
+_CALL_PATH = (
+    "get_response",
+    "_get_response",
+    "_aget_batch",
+    "_ainvoke_with_retries",
+    "_ainvoke_once",
+    "get_tool_response",
+)
+"""The old path's hooks: a class that overrides one keeps that path by default."""
+
+_OWN_HOOKS = {name: getattr(APILLM, name) for name in _CALL_PATH}
+"""The hooks as this module made them, so a later patch counts too, even on promptolution's class."""
+
+
+def _overrides_call_path(cls: type) -> bool:
+    """Whether ``cls`` replaces any of xmas :class:`APILLM`'s call hooks.
+
+    Compared by identity, so an override that merely calls ``super()`` still
+    counts: the class asked to see the calls. So does a hook patched onto
+    ``APILLM`` or promptolution's ``APILLM`` after import, the way a test fakes
+    the gateway.
+
+    Args:
+        cls: ``APILLM`` or a subclass.
+
+    Returns:
+        ``True`` when at least one hook is not ``APILLM``'s own.
+    """
+    return any(getattr(cls, name, None) is not _OWN_HOOKS[name] for name in _CALL_PATH)
 
 
 def _retry_after(response: httpx.Response) -> float | None:

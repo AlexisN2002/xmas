@@ -45,10 +45,50 @@ The record a run leaves behind, and the input an attributor computes on.
 
 ::: xmas.trace.TokenUsage
 
+## Budgets and errors
+
+`MAS(..., budget=Budget(...))` limits every run, and every item of a batch, on
+its own. A call starts only while the run is below every limit, so a limit of
+`0` spends nothing, and calls already in flight may overshoot a budget, by at
+most one model call, with its retries, per parallel branch. A cost limit stops
+the run before the next call when a call reported no cost and its model has no
+price, because a limit that cannot be checked would not bind. A run stopped
+this way is data, not an exception: its trace has status `over_budget`, and
+every failed trace carries an `error_kind`.
+
+On xmas's own model class, `APILLM`, permanent errors (a 4xx other than 408,
+409 and 429, or a 4xx that names money) are not retried;
+`APILLM(full_response=False)` restores promptolution's path for plain agents,
+which retries every error.
+
+::: xmas.budget.Budget
+
+::: xmas.errors
+    options:
+      members:
+        - ErrorKind
+        - RunStatus
+        - XmasError
+        - BudgetExceeded
+        - Stopped
+        - EmptyResponse
+        - classify
+        - kind_of_status
+        - kind_of_finish
+        - status_for
+
 ## Models
 
 Each backend subclasses its promptolution counterpart and adds `score()`, the
 teacher-forced sibling of generation.
+
+`APILLM(full_response=None)`, the default, sends plain agents' calls through
+xmas's own path, which sends the same request and keeps the provider's tokens,
+cost, finish reason and served model on the agent's record, as tool turns
+already do; a subclass that overrides a hook of promptolution's path keeps that
+path, and `full_response=False` keeps it for any model. `APILLM(price=TokenPrice(...))` prices the tokens of a call
+whose response reports no cost; without a price, that cost stays unknown
+(`None`), never `0`.
 
 ::: xmas.llms.api_llm.APILLM
 
@@ -57,6 +97,10 @@ teacher-forced sibling of generation.
 ::: xmas.llms.scoring.ScoredSequence
 
 ::: xmas.llms.scoring.SupportsScore
+
+::: xmas.llms.meta.TokenPrice
+
+::: xmas.llms.meta.CallMeta
 
 ## Tools
 

@@ -12,6 +12,7 @@ from promptolution.predictors.base_predictor import BasePredictor
 
 from xmas import _engine
 from xmas.agent import Agent
+from xmas.budget import Budget
 from xmas.graph import SENTINELS, agent_names, build_graph, terminal_agent, validate_graph
 from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import SPEC_VERSION, AgentSpec, MASSpec, validate_spec
@@ -47,6 +48,8 @@ class MAS(BasePredictor):
         llm: The default model, used by any agent without its own binding.
         llms: Additional models by name, which agents bind to via ``Agent.model``.
         default_model: Name recorded for the default model in a serialized spec.
+        budget: Limits for each run, or ``None`` for none. Runtime state, never
+            part of the spec.
     """
 
     agents: dict[str, Agent]
@@ -54,6 +57,7 @@ class MAS(BasePredictor):
     llms: dict[str, BaseLLM]
     max_steps: int
     default_model: str | None
+    budget: Budget | None
 
     def __init__(
         self,
@@ -65,6 +69,7 @@ class MAS(BasePredictor):
         default_model: str | None = None,
         tools: Sequence[ToolSource | Tool] = (),
         max_tool_rounds: int = 5,
+        budget: Budget | None = None,
     ) -> None:
         """Initialize a MAS.
 
@@ -84,6 +89,10 @@ class MAS(BasePredictor):
                 never part of the spec.
             max_tool_rounds: Model turns per agent visit that may request tools,
                 before one last turn with the tools withheld.
+            budget: Limits for each run: every run, and every item of a batch,
+                gets its own meter with these limits. A run that reaches one
+                ends with status ``over_budget``. Runtime state like ``llm``;
+                never part of the spec.
 
         Raises:
             ValueError: If names collide, an edge names an unknown agent, the
@@ -107,6 +116,7 @@ class MAS(BasePredictor):
 
         self.llms = dict(llms or {})
         self.max_steps = max_steps
+        self.budget = budget
         self.default_model = default_model if default_model is not None else getattr(llm, "model_id", None)
 
         for agent in agents:
@@ -265,7 +275,8 @@ class MAS(BasePredictor):
                 already carry their instructions, so this is not applied.
 
         Returns:
-            A ``(predictions, sequences)`` pair, matching ``BasePredictor``.
+            A ``(predictions, sequences)`` pair, matching ``BasePredictor``. A
+            failed rollout's sequence is empty.
         """
         if not xs:
             return [], []
@@ -280,7 +291,12 @@ class MAS(BasePredictor):
         self._last_traces = tuple(traces)
 
         preds = self._extract_preds([trace.output for trace in traces])
-        seqs = ["\n".join(f"{r.rendered_prompt}\n{r.raw_response}" for r in trace.records) for trace in traces]
+        # A failed rollout keeps its finished agents' records, but promptolution
+        # gets an empty sequence for it, as it did before records were kept.
+        seqs = [
+            "" if trace.failed else "\n".join(f"{r.rendered_prompt}\n{r.raw_response}" for r in trace.records)
+            for trace in traces
+        ]
         return preds, seqs
 
     def _extract_preds(self, preds: list[str]) -> list[str]:
@@ -309,8 +325,8 @@ class MAS(BasePredictor):
         """Derive a new MAS with some components replaced.
 
         This is how an optimizer proposes a candidate. Models are shared with the
-        original by reference; everything else is copied, so the original is never
-        touched.
+        original by reference, and the budget is carried over; everything else is
+        copied, so the original is never touched.
 
         Args:
             prompts: Replacement prompts, keyed by agent name.
@@ -348,6 +364,7 @@ class MAS(BasePredictor):
             default_model=self.default_model,
             tools=self.tools,
             max_tool_rounds=self.max_tool_rounds,
+            budget=self.budget,
         )
 
     # ---------------------------------------------------------- serialization
@@ -357,7 +374,8 @@ class MAS(BasePredictor):
 
         Returns:
             Prompts, topology and model bindings, and nothing else. Models are
-            recorded by name; the LLM objects are runtime state, not spec.
+            recorded by name; the LLM objects, tools and budget are runtime
+            state, not spec.
         """
         ordered = agent_names(self.graph)
         agents: list[AgentSpec] = [cast("AgentSpec", self.agents[name].to_dict()) for name in ordered]

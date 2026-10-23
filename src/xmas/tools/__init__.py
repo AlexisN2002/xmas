@@ -23,18 +23,16 @@ import asyncio
 import inspect
 import json
 import re
-import time
 import typing
 from collections.abc import Callable, Sequence
-from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, overload, runtime_checkable
 
 import openai
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
-from xmas.llms.telemetry import GENERATE, CallRecord, approximate_tokens
+from xmas.errors import MONEY_WORDS, EmptyResponse, ErrorKind
 from xmas.prompts import safe_format
 from xmas.trace import AgentRecord, TokenUsage, ToolCall
 
@@ -44,7 +42,9 @@ if TYPE_CHECKING:  # pragma: no cover
 
     from xmas._engine import MASState
     from xmas.agent import Agent
+    from xmas.budget import RunMeter
     from xmas.llms.api_llm import APILLM
+    from xmas.llms.meta import CallMeta, SupportsMeta
     from xmas.mas import MAS
 
 __all__ = [
@@ -87,7 +87,13 @@ class ToolAccessError(RuntimeError):
     """The tool source refused the caller (bad key, tool out of scope, budget spent).
 
     Ends the run; the message lands in ``Trace.error``.
+
+    Attributes:
+        kind: Always :attr:`~xmas.errors.ErrorKind.REFUSAL`, so
+            :func:`~xmas.errors.classify` reads it without matching the message.
     """
+
+    kind: ErrorKind = ErrorKind.REFUSAL
 
 
 # --------------------------------------------------------------------- schema
@@ -517,23 +523,25 @@ _RETRYABLE_4XX = frozenset({408, 409, 429})
 
 
 def _is_permanent(exc: Exception) -> bool:
-    """Whether retrying cannot help: a 4xx answer other than 408, 409 and 429.
+    """Whether retrying cannot help: a 4xx answer other than 408, 409 and 429, or a 4xx that names money.
 
-    The status rule the openai client applies to its own retries. Connection
-    errors, timeouts and 5xx stay retryable.
+    The status rule the openai client applies to its own retries, plus money: a
+    4xx whose message or body matches :data:`~xmas.errors.MONEY_WORDS` (402,
+    403 "Key limit exceeded", 429 "insufficient_quota") means the key is out of
+    money, which asking again only repeats. Connection errors, timeouts, 5xx and
+    a plain 429 stay retryable.
     """
-    return (
-        isinstance(exc, openai.APIStatusError)
-        and 400 <= exc.status_code < 500
-        and exc.status_code not in _RETRYABLE_4XX
-    )
+    if not isinstance(exc, openai.APIStatusError) or not 400 <= exc.status_code < 500:
+        return False
+    text = str(exc) if exc.body is None else f"{exc} {exc.body}"
+    return exc.status_code not in _RETRYABLE_4XX or MONEY_WORDS.search(text) is not None
 
 
 async def _create_with_retries(llm: APILLM, kwargs: dict[str, Any]) -> ChatCompletion:
     """One chat-completions call with promptolution's timeout and backoff.
 
-    A permanent client error (400, 401, 403, 404, 422, ...) is raised at once
-    instead of being sent ``max_retries`` more times.
+    A permanent client error (400, 401, 403, 404, 422, a 4xx that names money,
+    ...) is raised at once instead of being sent ``max_retries`` more times.
     """
     last: Exception | None = None
     for attempt in range(llm.max_retries + 1):
@@ -551,78 +559,6 @@ async def _create_with_retries(llm: APILLM, kwargs: dict[str, Any]) -> ChatCompl
                 await asyncio.sleep(llm.retry_base_delay_s * (2**attempt))
     assert last is not None
     raise last
-
-
-def complete_with_tools(
-    llm: APILLM, messages: list[dict[str, Any]], tools: Sequence[Tool]
-) -> tuple[str, list[ToolCallRequest]]:
-    """Implement :meth:`xmas.llms.APILLM.get_tool_response`.
-
-    Runs on the model's own background loop and semaphore, and records one
-    ``GENERATE`` call with the provider's exact token counts when it reports them.
-    The request carries ``model``, ``messages``, ``max_tokens`` and the tools;
-    sampling parameters (``temperature``, ``top_p``, ``stop``, ...) are sent only
-    when set in the model's ``call_kwargs``, never as defaults, so a route that
-    refuses them still serves the call.
-
-    Args:
-        llm: The model.
-        messages: OpenAI-shaped history.
-        tools: Tools on offer. Empty omits the ``tools`` key.
-
-    Returns:
-        The message text and the requested calls, in order.
-    """
-    kwargs: dict[str, Any] = {"model": llm.model_id, "messages": messages, "max_tokens": llm.max_tokens}
-    kwargs.update(llm._call_kwargs)
-    if tools:
-        kwargs["tools"] = [spec.to_openai() for spec in tools]
-    started = time.perf_counter()
-    future = asyncio.run_coroutine_threadsafe(_create_with_retries(llm, kwargs), llm._loop)
-    try:
-        try:
-            completion = future.result(timeout=llm.gather_timeout_s + 5.0)
-        except FuturesTimeout:
-            future.cancel()
-            raise TimeoutError(f"tool turn timed out after {llm.gather_timeout_s + 5.0}s") from None
-    except Exception as error:
-        llm._record(
-            CallRecord(
-                operation=GENERATE,
-                model=llm.model,
-                backend=llm.backend_tag,
-                latency_s=time.perf_counter() - started,
-                ok=False,
-                error=f"{type(error).__name__}: {error}",
-            )
-        )
-        raise
-    message = completion.choices[0].message
-    text = message.content or ""
-    requests = [
-        ToolCallRequest(call.id, call.function.name, call.function.arguments or "{}")
-        for call in message.tool_calls or []
-        if call.type == "function"
-    ]
-    usage = completion.usage
-    if usage is not None:
-        input_tokens, output_tokens = usage.prompt_tokens, usage.completion_tokens
-    else:
-        input_tokens = sum(approximate_tokens(str(item.get("content") or "")) for item in messages)
-        output_tokens = approximate_tokens(text) + sum(approximate_tokens(r.arguments) for r in requests)
-    llm.input_token_count += input_tokens
-    llm.output_token_count += output_tokens
-    llm._record(
-        CallRecord(
-            operation=GENERATE,
-            model=llm.model,
-            backend=llm.backend_tag,
-            latency_s=time.perf_counter() - started,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
-    )
-    return text, requests
 
 
 # ---------------------------------------------------------------- engine side
@@ -725,7 +661,8 @@ def run_tool_loop(
     max_rounds: int,
     system_prompt: str,
     count_tokens: Callable[[str], float],
-) -> tuple[str, tuple[ToolCall, ...], TokenUsage]:
+    meter: RunMeter | None = None,
+) -> tuple[str, tuple[ToolCall, ...], TokenUsage, CallMeta | None]:
     """Answer one rendered prompt, letting the model call tools.
 
     At most ``max_rounds`` turns may request tools. Calls within a turn run in
@@ -734,6 +671,11 @@ def run_tool_loop(
     that already succeeded in this loop is not run again; it is answered, and
     recorded, with the earlier result under ``REPEATED_CALL_NOTE``.
 
+    Every model turn is checked against the run's budget before it starts. A
+    model that returns call metadata (see :func:`xmas.llms.meta.supports_meta`)
+    is asked through ``get_tool_response_meta``, and the turns' metadata is
+    combined into one.
+
     Args:
         llm: The agent's model.
         rendered: The rendered prompt.
@@ -741,10 +683,19 @@ def run_tool_loop(
         max_rounds: Turns that may request tools.
         system_prompt: The system message, as a plain agent's call would send.
         count_tokens: Token counter for the agent's model.
+        meter: The run's meter, or ``None`` outside a metered run.
 
     Returns:
-        The final text, the calls made, and the approximate usage over all turns.
+        The final text, the calls made, the approximate usage over all turns, and
+        the combined metadata of the turns, or ``None`` when the model gives none.
+
+    Raises:
+        BudgetExceeded: If the meter refuses a turn (``xmas.errors.BudgetExceeded``).
+        EmptyResponse: If a turn came back empty after its retries; the meter
+            counts the paid attempts first.
     """
+    from xmas.llms.meta import supports_meta  # here, not at the top: xmas.llms imports this module
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": rendered},
@@ -753,11 +704,27 @@ def run_tool_loop(
     calls: list[ToolCall] = []
     succeeded: dict[tuple[str, str], str] = {}
     usage = TokenUsage()
+    meta_llm = cast("SupportsMeta", llm) if supports_meta(llm) else None
+    meta: CallMeta | None = None
 
     def turn(offered: list[Tool]) -> tuple[str, list[ToolCallRequest]]:
-        nonlocal usage
+        nonlocal usage, meta
+        if meter is not None:
+            meter.before_call()
         sent = sum(int(count_tokens(str(item.get("content") or ""))) for item in messages)
-        text, requests = llm.get_tool_response(messages, offered)
+        turn_meta: CallMeta | None = None
+        try:
+            if meta_llm is None:
+                text, requests = llm.get_tool_response(messages, offered)
+            else:
+                text, requests, turn_meta = meta_llm.get_tool_response_meta(messages, offered)
+                meta = turn_meta if meta is None else meta.combine(turn_meta)
+        except EmptyResponse as error:  # its attempts were paid: the meter counts them, then the run fails
+            if meter is not None:
+                meter.after_call(error.meta)
+            raise
+        if meter is not None:
+            meter.after_call(turn_meta)
         received = int(count_tokens(text)) + sum(int(count_tokens(r.arguments)) for r in requests)
         usage = usage + TokenUsage(input_tokens=sent, output_tokens=received)
         return text, requests
@@ -765,7 +732,7 @@ def run_tool_loop(
     for _ in range(max_rounds):
         text, requests = turn(specs)
         if not requests:
-            return text, tuple(calls), usage
+            return text, tuple(calls), usage, meta
         messages.append({"role": "assistant", "content": text or None, "tool_calls": [_wire(r) for r in requests]})
         for request in requests:
             key = _call_key(tools, request) if DEDUPE_TOOL_CALLS else None
@@ -779,17 +746,19 @@ def run_tool_loop(
             calls.append(call)
             messages.append({"role": "tool", "tool_call_id": request.id, "content": call.result})
     text, _ = turn([])
-    return text, tuple(calls), usage
+    return text, tuple(calls), usage, meta
 
 
-def tool_node(
+def tool_body(
     mas: MAS, agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float]
-) -> Callable[[MASState], dict[str, Any]]:
-    """Build the node the engine runs for an agent with tools.
+) -> Callable[[MASState, RunMeter | None], AgentRecord]:
+    """Build the body the engine runs for an agent with tools.
 
-    The same contract as the engine's plain node (render, answer, record), with
-    the single model call replaced by :func:`run_tool_loop`. Each visit starts a
-    fresh loop; nothing carries over between visits of a cyclic agent.
+    The same contract as the engine's plain body (render, answer, record), with
+    the single model call replaced by :func:`run_tool_loop`. The engine wraps the
+    body: it times it, keeps the record on the run's meter, and writes the
+    record's ``raw_response`` to the agent's output. Each visit starts a fresh
+    loop; nothing carries over between visits of a cyclic agent.
 
     Args:
         mas: The system, which resolves the agent's tools and bounds the rounds.
@@ -798,25 +767,26 @@ def tool_node(
         count_tokens: Token counter for the model.
 
     Returns:
-        A function mapping the incoming state to this agent's state updates.
+        A function mapping the incoming state and the run's meter (``None``
+        outside a metered run) to this agent's record.
     """
     tools = mas.resolve_tools(agent)
     if not isinstance(llm, SupportsToolCalls):  # resolve_tools checked it; this narrows the type
         raise ValueError(f"Agent {agent.name!r} uses tools, but its model cannot call them.")
     caller: SupportsToolCalls = llm
 
-    def node(state: MASState) -> dict[str, Any]:
+    def body(state: MASState, meter: RunMeter | None) -> AgentRecord:
         prompts = state.get("prompts") or {}
         template = prompts.get(agent.name, agent.prompt)
 
         values = state.get("values") or {}
         inputs = {name: str(values.get(name) or "") for name in agent.inputs}
         rendered = safe_format(template, inputs)
-        response, calls, usage = run_tool_loop(
-            caller, rendered, tools, mas.max_tool_rounds, DEFAULT_SYS_PROMPT, count_tokens
+        response, calls, usage, meta = run_tool_loop(
+            caller, rendered, tools, mas.max_tool_rounds, DEFAULT_SYS_PROMPT, count_tokens, meter=meter
         )
 
-        record = AgentRecord(
+        return AgentRecord(
             agent=agent.name,
             step=-1,
             prompt=template,
@@ -827,7 +797,7 @@ def tool_node(
             usage=usage,
             model=agent.model,
             raw_response=response,
+            **({} if meta is None else meta.record_fields()),
         )
-        return {"values": {agent.output: response}, "records": [record], "visits": {agent.name: 1}}
 
-    return node
+    return body

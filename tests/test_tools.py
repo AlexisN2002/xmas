@@ -17,7 +17,8 @@ from openai.types.chat import ChatCompletion
 from pydantic import Field
 
 import xmas.tools
-from xmas import END, MAS, START, Agent, ToolCall
+from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
+from xmas.errors import classify
 from xmas.llms.api_llm import APILLM, RateLimitedError
 from xmas.llms.telemetry import CallLog
 from xmas.optimization.graph_updater import GraphUpdater
@@ -328,11 +329,14 @@ def test_bad_tools_items_and_rounds_are_rejected() -> None:
 
 def test_copy_from_dict_and_rebuild_keep_tools() -> None:
     source = FakeToolSource()
-    mas = MAS(agents=[coder()], llm=ToolMockLLM(), tools=[source], max_tool_rounds=2)
+    budget = Budget(max_calls=7)
+    mas = MAS(agents=[coder()], llm=ToolMockLLM(), tools=[source], max_tool_rounds=2, budget=budget)
 
     copied = mas.copy(prompts={"coder": "Again {query}"})
     assert copied.tools == (source,)
     assert copied.max_tool_rounds == 2
+    assert copied.budget is budget
+    assert "budget" not in mas.to_dict()
 
     restored = MAS.from_dict(dict(mas.to_dict()), llm=ToolMockLLM(), tools=[source])
     assert restored.agents["coder"].tools == ["run_python"]
@@ -345,6 +349,7 @@ def test_copy_from_dict_and_rebuild_keep_tools() -> None:
     assert rebuilt.agents["helper"].tools == []
     assert rebuilt.tools == (source,)
     assert rebuilt.max_tool_rounds == 2
+    assert rebuilt.budget is budget  # a mutated topology keeps the runtime state, the budget included
 
 
 def test_from_yaml_takes_tools(tmp_path: Any) -> None:
@@ -718,8 +723,22 @@ def test_api_llm_drives_a_whole_tool_agent(monkeypatch: pytest.MonkeyPatch) -> N
     trace = MAS(agents=[coder(["add"])], llm=llm, tools=[add]).run("q")
     assert trace.error is None
     assert trace.output == "42"
-    assert trace["coder"][0].tool_calls == (ToolCall("add", {"a": 40}, "42"),)
+    record = trace["coder"][0]
+    assert record.tool_calls == (ToolCall("add", {"a": 40}, "42"),)
     assert sent[1]["messages"][-1] == {"role": "tool", "tool_call_id": "c1", "content": "42"}
+    assert record.tokens == TokenUsage(22, 14)  # the provider's 11 in and 7 out, on each of the two turns
+    assert (record.served_model, record.finish_reason) == ("m", "stop")  # the last turn's
+    assert record.latency_s is not None
+
+    llm, sent, _ = api_llm(monkeypatch, [completion("", [call]), completion("unreachable")])
+    over = MAS(agents=[coder(["add"])], llm=llm, tools=[add], budget=Budget(max_calls=1)).run("q")
+    assert len(sent) == 1  # the second turn is refused before it is sent
+    assert over.status == "over_budget"
+    assert over.error == "BudgetExceeded: calls 1 >= max 1 before call 2"
+
+
+def test_a_refused_tool_source_is_classified_as_a_refusal() -> None:
+    assert classify(ToolAccessError("tool_not_in_scope: nope")) is ErrorKind.REFUSAL
 
 
 URL = "https://gateway.example/v1/chat/completions"
@@ -764,6 +783,34 @@ def test_api_llm_does_not_retry_a_permanent_client_error(
     assert len(sent) == 1
     assert slept == []
     assert log.records[-1].ok is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        status_error(openai.APIStatusError, 402, "Error code: 402 - Payment Required"),
+        status_error(openai.PermissionDeniedError, 403, "Error code: 403 - Key limit exceeded"),
+        openai.RateLimitError(  # the money words are in the body only
+            "Error code: 429",
+            response=httpx2.Response(429, request=httpx2.Request("POST", URL)),
+            body={"error": {"code": "insufficient_quota", "message": "You exceeded your current quota"}},
+        ),
+    ],
+    ids=["402", "403-key-limit", "429-insufficient-quota"],
+)
+def test_api_llm_sends_a_money_error_once(
+    monkeypatch: pytest.MonkeyPatch, slept: list[float], error: openai.APIStatusError
+) -> None:
+    llm, sent, _ = api_llm(monkeypatch, [error, completion("unreachable")])
+    llm.retry_base_delay_s = 1.0
+    with pytest.raises(type(error)) as raised:
+        llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
+    assert (classify(raised.value), len(sent), slept) == (ErrorKind.MONEY, 1, [])
+
+    llm, sent, _ = api_llm(monkeypatch, [error, completion("unreachable")])  # the plain path too
+    with pytest.raises(type(error)):
+        llm.generate_with_meta("hi")
+    assert len(sent) == 1
 
 
 def test_a_tool_less_route_fails_the_run_after_one_call(monkeypatch: pytest.MonkeyPatch, slept: list[float]) -> None:

@@ -156,6 +156,7 @@ class GraphUpdater:
             default_model=mas.default_model,
             tools=mas.tools,
             max_tool_rounds=mas.max_tool_rounds,
+            budget=mas.budget,
         )
 
     def output_of(self, mas: MAS, name: str) -> str:

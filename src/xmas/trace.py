@@ -4,6 +4,11 @@ A trace is the input an :class:`~xmas.optimization.Attributor` computes on, so i
 is modelled as data rather than as a log: every field is a plain value, the whole
 structure round-trips through :meth:`Trace.to_dict`, and nothing in it is
 formatted for human reading.
+
+The plain-data form stays readable by v1 readers: every v1 key is always emitted,
+in v1 order, and a newer key appears only when its value is set. Enum values are
+emitted as plain strings, so both ``json.dumps`` and ``yaml.safe_dump`` accept the
+dicts.
 """
 
 from __future__ import annotations
@@ -11,13 +16,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from xmas.errors import ErrorKind, RunStatus, status_for
+
 
 @dataclass(frozen=True)
 class TokenUsage:
-    """Input and output token counts for a single model call."""
+    """Input and output token counts for a single model call.
+
+    Attributes:
+        input_tokens: Tokens sent to the model.
+        output_tokens: Tokens the model produced.
+        cached_tokens: The part of ``input_tokens`` read from a prompt cache, or
+            ``None`` when the provider did not say.
+        reasoning_tokens: The part of ``output_tokens`` spent on reasoning, or
+            ``None`` when the provider did not say.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -25,19 +43,37 @@ class TokenUsage:
         return self.input_tokens + self.output_tokens
 
     def __add__(self, other: TokenUsage) -> TokenUsage:
-        """Add two usages component-wise, so usage aggregates over a trace."""
+        """Add two usages component-wise, so usage aggregates over a trace.
+
+        A cached or reasoning count is ``None`` only when it is ``None`` on both
+        sides.
+        """
         return TokenUsage(
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
+            cached_tokens=_add_counts(self.cached_tokens, other.cached_tokens),
+            reasoning_tokens=_add_counts(self.reasoning_tokens, other.reasoning_tokens),
         )
 
     def to_dict(self) -> dict[str, int]:
-        """Return the plain-data form."""
-        return {
+        """Return the plain-data form, with the cached and reasoning counts only when set."""
+        data = {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
         }
+        if self.cached_tokens is not None:
+            data["cached_tokens"] = self.cached_tokens
+        if self.reasoning_tokens is not None:
+            data["reasoning_tokens"] = self.reasoning_tokens
+        return data
+
+
+def _add_counts(left: int | None, right: int | None) -> int | None:
+    """Sum two optional counts, giving ``None`` only when both are ``None``."""
+    if left is None and right is None:
+        return None
+    return (left or 0) + (right or 0)
 
 
 @dataclass(frozen=True)
@@ -71,10 +107,20 @@ class AgentRecord:
         inputs: The state values the agent read, keyed by variable name.
         outputs: The state values the agent wrote, keyed by variable name.
         tool_calls: Tool invocations made while producing the outputs, in order.
-        usage: Token usage attributable to this agent for this run.
-        model: Name of the model that served the call.
+        usage: Token usage attributable to this agent for this run, as xmas
+            estimates it. The provider's own counts are in ``tokens``.
+        model: The agent's model binding name, or ``None`` for the default. The
+            model the provider says served the call is ``served_model``.
         raw_response: The unparsed model response, kept because output extraction
             is lossy and an attributor may need what was discarded.
+        latency_s: Wall seconds of the agent's model work, tool turns and tool
+            calls included. Left out of ``==``, so equal runs compare equal.
+        cost_usd: What the agent's calls cost in USD, or ``None`` when unknown;
+            never ``0`` for an unknown cost.
+        tokens: The provider's token counts, or ``None`` when it reported none.
+        finish_reason: Why the model stopped, as the provider said.
+        error_kind: The kind of a cut or refused answer that still produced text.
+        served_model: The model the provider says served the call.
     """
 
     agent: str
@@ -87,10 +133,16 @@ class AgentRecord:
     usage: TokenUsage = field(default_factory=TokenUsage)
     model: str | None = None
     raw_response: str = ""
+    latency_s: float | None = field(default=None, compare=False)
+    cost_usd: float | None = None
+    tokens: TokenUsage | None = None
+    finish_reason: str | None = None
+    error_kind: ErrorKind | None = None
+    served_model: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the plain-data form."""
-        return {
+        """Return the plain-data form: the ten v1 keys, then each newer field that is set."""
+        data: dict[str, Any] = {
             "agent": self.agent,
             "step": self.step,
             "prompt": self.prompt,
@@ -102,6 +154,16 @@ class AgentRecord:
             "model": self.model,
             "raw_response": self.raw_response,
         }
+        newer = {
+            "latency_s": self.latency_s,
+            "cost_usd": self.cost_usd,
+            "tokens": None if self.tokens is None else self.tokens.to_dict(),
+            "finish_reason": self.finish_reason,
+            "error_kind": None if self.error_kind is None else self.error_kind.value,
+            "served_model": self.served_model,
+        }
+        data.update((key, value) for key, value in newer.items() if value is not None)
+        return data
 
 
 @dataclass(frozen=True)
@@ -115,12 +177,14 @@ class Trace:
             An agent that runs twice (a cycle) contributes two records.
         error: Populated when the run failed, so a failed rollout is still data an
             attributor can reason about rather than a raised exception.
+        error_kind: What kind of failure ``error`` is, when it is known.
     """
 
     query: str
     output: str
     records: tuple[AgentRecord, ...] = ()
     error: str | None = None
+    error_kind: ErrorKind | None = None
 
     def __getitem__(self, agent: str) -> tuple[AgentRecord, ...]:
         """Return every record for one agent, in execution order.
@@ -155,11 +219,39 @@ class Trace:
         """Whether the run ended in an error."""
         return self.error is not None
 
+    @property
+    def status(self) -> RunStatus:
+        """How the run ended: ``ok`` without an error, else derived from ``error_kind``."""
+        return RunStatus.OK if self.error is None else status_for(self.error_kind)
+
+    @property
+    def cost_usd(self) -> float | None:
+        """The records' costs summed, or ``None`` when there is no record or any record's cost is unknown."""
+        if not self.records:  # nothing ran, or nothing finished: unknown, not 0
+            return None
+        total = 0.0
+        for record in self.records:
+            if record.cost_usd is None:
+                return None
+            total += record.cost_usd
+        return total
+
     def to_dict(self) -> dict[str, Any]:
-        """Return the plain-data form, suitable for JSON or YAML."""
-        return {
+        """Return the plain-data form, suitable for JSON or YAML.
+
+        The four v1 keys come first. ``"status"`` follows only for a failed run,
+        so it is never ``"ok"``, and ``"error_kind"`` only when it is known. A
+        reader that finds no ``"status"`` reads ``"ok"`` when ``error`` is null
+        and ``"failed"`` otherwise.
+        """
+        data: dict[str, Any] = {
             "query": self.query,
             "output": self.output,
             "records": [record.to_dict() for record in self.records],
             "error": self.error,
         }
+        if self.error is not None:
+            data["status"] = self.status.value
+        if self.error_kind is not None:
+            data["error_kind"] = self.error_kind.value
+        return data
