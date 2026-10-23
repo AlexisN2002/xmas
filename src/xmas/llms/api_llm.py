@@ -457,17 +457,10 @@ _CALL_PATH = (
 )
 """The hooks whose override keeps a class on promptolution's path by default."""
 
-_BASE_HOOKS = {name: getattr(promptolution.APILLM, name, None) for name in _CALL_PATH}
-"""promptolution's hooks at import, so a later patch of its class counts too."""
-
 
 def _overrides_call_path(cls: type) -> bool:
-    """Whether ``cls``, or promptolution's class since import, replaces a hook of :data:`_CALL_PATH`."""
-    return any(
-        getattr(cls, name) is not getattr(APILLM, name)
-        or getattr(promptolution.APILLM, name, None) is not _BASE_HOOKS[name]
-        for name in _CALL_PATH
-    )
+    """Whether ``cls`` replaces a hook of :data:`_CALL_PATH`."""
+    return any(getattr(cls, name) is not getattr(APILLM, name) for name in _CALL_PATH)
 
 
 def parse_score(response: httpx.Response) -> ScoredSequence:

@@ -9,7 +9,6 @@ from typing import Any
 import httpx
 import pytest
 from openai.types.chat import ChatCompletion
-from promptolution.llms import api_llm as _promptolution
 
 from xmas import MAS, Agent, AgentRecord, Budget, TokenUsage
 from xmas.errors import EmptyResponse, ErrorKind, XmasError
@@ -309,16 +308,6 @@ def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch
     assert len(sent) == 1
     assert recording_llm(monkeypatch, [], cls=Hooked, full_response=True)[0].full_response is True
     assert recording_llm(monkeypatch, [], full_response=False)[0].full_response is False
-
-    # so does a patch of promptolution's own class, the way a test fakes the gateway
-    async def fake_once(self: Any, prompt: str, system_prompt: str) -> ChatCompletion:
-        return answer("faked")
-
-    monkeypatch.setattr(_promptolution.APILLM, "_ainvoke_once", fake_once)
-    patched, sent = recording_llm(monkeypatch, [])
-    assert patched.full_response is False
-    assert MAS(agents=[Agent("solver", "Solve {query}", output="answer")], llm=patched).run("q").output == "faked"
-    assert sent == []
 
 
 def test_the_paid_attempts_behind_an_empty_answer_reach_the_meter(monkeypatch: pytest.MonkeyPatch) -> None:
