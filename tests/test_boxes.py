@@ -110,7 +110,7 @@ def test_an_inner_failure_fails_the_box_with_its_kind_and_the_outer_error_edge_r
 
 
 def test_a_failed_box_keeps_its_inner_trace_and_cost() -> None:
-    """The inner system's paid calls before its failure stay in the box's failed record, and in the trace's cost."""
+    """The inner records before the failure stay in the failed box's record; one unknown cost makes its sum unknown."""
     llm = MockLLM(answers=[], meta=True)
     inner = MAS(
         [
@@ -135,8 +135,9 @@ def test_a_failed_box_keeps_its_inner_trace_and_cost() -> None:
         (box,) = trace["shorten"]
         assert box.inner is not None and [r.agent for r in box.inner.records] == ["cutter", "polish"]
         assert box.inner.records[1].error_kind == ErrorKind.TIMEOUT and box.inner.error_kind == ErrorKind.TIMEOUT
-        assert box.cost_usd == pytest.approx(0.01) and box.tokens == TokenUsage(10, 2)
-        assert trace.cost_usd == pytest.approx(0.03)  # writer, cutter and apology: what the meter paid
+        assert box.inner.records[0].cost_usd == pytest.approx(0.01)  # the cutter's paid call stays in the record
+        assert box.cost_usd is None and box.tokens is None  # polish's cost is unknown, so the box's is too
+        assert trace.cost_usd is None
         assert [(path, r.agent) for path, r in trace.walk()][1:4] == [
             ((), "shorten"),
             (("shorten",), "cutter"),

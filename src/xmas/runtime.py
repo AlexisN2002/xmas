@@ -380,10 +380,10 @@ def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
 
 
 def _paid_inside(trace: Trace) -> dict[str, Any]:
-    """Return a box record's cost and tokens: what its inner records report, summed; ``None`` when none does."""
-    costs = [record.cost_usd for record in trace.records if record.cost_usd is not None]
-    tokens = [record.tokens for record in trace.records if record.tokens is not None]
-    return {"cost_usd": sum(costs) if costs else None, "tokens": sum(tokens[1:], tokens[0]) if tokens else None}
+    """Return a box record's cost and tokens: its inner records' summed, ``None`` when any of them is unknown."""
+    tokens = [record.tokens for record in trace.records]
+    known = cast("list[TokenUsage]", tokens)
+    return {"cost_usd": trace.cost_usd, "tokens": None if not tokens or None in tokens else sum(known[1:], known[0])}
 
 
 @dataclasses.dataclass(frozen=True)
