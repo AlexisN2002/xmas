@@ -13,10 +13,14 @@ dicts.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from xmas.errors import ErrorKind, RunStatus, status_for
+
+if TYPE_CHECKING:  # pragma: no cover
+    from xmas.health import Health
 
 
 @dataclass(frozen=True)
@@ -138,10 +142,16 @@ class AgentRecord:
         finish_reason: Why the model stopped, as the provider said.
         error_kind: The kind of a cut or refused answer that still produced text.
         served_model: The model the provider says served the call.
-        kind: What kind of node ran: ``"agent"``, or ``"step"`` for a step.
+        kind: What kind of node ran: ``"agent"``, ``"step"`` for a step, or
+            ``"box"`` for a box.
         rejected: Answers refused by the agent's answer form before the one it
             kept in ``raw_response``, in order.
         error: Why the visit failed, when it failed and the run went on.
+        route: The nodes the visit's decision sent the run to, for a node with
+            conditional or error edges; ``None`` for a node without.
+        capped: Whether a ``while`` edge that held was skipped because its
+            target had run ``max_visits`` times.
+        inner: The inner system's trace, for a box.
     """
 
     agent: str
@@ -163,12 +173,15 @@ class AgentRecord:
     kind: str = "agent"
     rejected: tuple[Rejected, ...] = ()
     error: str | None = None
+    route: tuple[str, ...] | None = None
+    capped: bool = False
+    inner: Trace | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form: the ten v1 keys, then each newer field that is set.
 
-        ``kind`` is set when it is not ``"agent"`` and ``rejected`` when it is not
-        empty.
+        ``kind`` is set when it is not ``"agent"``, ``rejected`` when it is not
+        empty and ``capped`` when it is true.
         """
         data: dict[str, Any] = {
             "agent": self.agent,
@@ -192,6 +205,9 @@ class AgentRecord:
             "kind": None if self.kind == "agent" else self.kind,
             "rejected": [rejected.to_dict() for rejected in self.rejected] or None,
             "error": self.error,
+            "route": None if self.route is None else list(self.route),
+            "capped": self.capped or None,
+            "inner": None if self.inner is None else self.inner.to_dict(),
         }
         data.update((key, value) for key, value in newer.items() if value is not None)
         return data
@@ -209,6 +225,9 @@ class Trace:
         error: Populated when the run failed, so a failed rollout is still data an
             attributor can reason about rather than a raised exception.
         error_kind: What kind of failure ``error`` is, when it is known.
+        health: What looked wrong in the run (:func:`xmas.health.summarize`),
+            or ``None`` for a trace the engine did not finish. Left out of
+            ``==``, since its budget entry holds the wall time.
     """
 
     query: str
@@ -216,6 +235,7 @@ class Trace:
     records: tuple[AgentRecord, ...] = ()
     error: str | None = None
     error_kind: ErrorKind | None = None
+    health: Health | None = field(default=None, compare=False)
 
     def __getitem__(self, agent: str) -> tuple[AgentRecord, ...]:
         """Return every record for one agent, in execution order.
@@ -228,6 +248,19 @@ class Trace:
             outcome for a conditional branch rather than an error.
         """
         return tuple(record for record in self.records if record.agent == agent)
+
+    def walk(self) -> Iterator[tuple[tuple[str, ...], AgentRecord]]:
+        """Yield every record depth first, a box's inner records right after the box's own.
+
+        Yields:
+            ``(path, record)``, where ``path`` names the boxes enclosing the
+            record, outermost first; ``()`` for this trace's own records.
+        """
+        for record in self.records:
+            yield (), record
+            if record.inner is not None:
+                for path, inner in record.inner.walk():
+                    yield (record.agent, *path), inner
 
     @property
     def agents(self) -> tuple[str, ...]:
@@ -271,9 +304,10 @@ class Trace:
         """Return the plain-data form, suitable for JSON or YAML.
 
         The four v1 keys come first. ``"status"`` follows only for a failed run,
-        so it is never ``"ok"``, and ``"error_kind"`` only when it is known. A
-        reader that finds no ``"status"`` reads ``"ok"`` when ``error`` is null
-        and ``"failed"`` otherwise.
+        so it is never ``"ok"``, ``"error_kind"`` only when it is known, and
+        ``"health"`` only when it reports something. A reader that finds no
+        ``"status"`` reads ``"ok"`` when ``error`` is null and ``"failed"``
+        otherwise.
         """
         data: dict[str, Any] = {
             "query": self.query,
@@ -285,4 +319,7 @@ class Trace:
             data["status"] = self.status.value
         if self.error_kind is not None:
             data["error_kind"] = self.error_kind.value
+        health = None if self.health is None else self.health.to_dict()
+        if health:
+            data["health"] = health
         return data

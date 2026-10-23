@@ -13,8 +13,10 @@ returns what it did.
 A version 2 system (``mas.version == 2``) compiles by its own rules, and every
 version 1 path stays as it was: values are typed (text or json) and render by
 :func:`~xmas.values.render_value`; steps run callables; a json agent answers in
-its answer form, with one retry; and a node fed by several edges is a barrier
-join that runs once, after all of them, where version 1 defers.
+its answer form, with one retry; a node with conditional or error edges routes
+by a :class:`_Decision` after each visit; a join is a barrier that runs once per
+pass, after all its groups, where version 1 defers; and a box runs a whole
+inner system as one node, on the outer run's meter.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from __future__ import annotations
 import dataclasses
 import operator
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Annotated, Any, Protocol, TypedDict, cast
 
 from langgraph.config import get_config
@@ -35,9 +37,13 @@ from xmas import tools as _tools
 from xmas.agent import Agent
 from xmas.budget import RunMeter
 from xmas.check import step_maps
+from xmas.edges import ANY_ERROR, Edge, EdgeKind
 from xmas.errors import BadFormat, EmptyResponse, ErrorKind, classify
-from xmas.graph import END, back_edges, join_nodes, terminal_agent
+from xmas.graph import END, START, back_edges, join_nodes, terminal_agent
+from xmas.health import Health, summarize
 from xmas.llms.meta import SupportsMeta, supports_meta
+from xmas.nodes import Step
+from xmas.predicates import Context, Predicate, parse_predicate
 from xmas.prompts import safe_format
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
 from xmas.spec import SPEC_VERSION_2
@@ -50,7 +56,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.check import SystemInfo
     from xmas.llms.meta import CallMeta
     from xmas.mas import MAS
-    from xmas.nodes import Step
 
 
 CONTINUE_MARKER = "<continue>"
@@ -73,6 +78,10 @@ The second stop condition, and the one that holds when a prompt emits the marker
 unconditionally. Matches the seed's ``stop_condition_max_retries``. The graph-wide
 ``max_steps`` still caps total super-steps on top of this.
 """
+
+
+_RUN_ENDS = frozenset({ErrorKind.BUDGET, ErrorKind.STOPPED})
+"""Error kinds that end the run itself: never routed, and no failed record, since no node failed."""
 
 
 def _merge_counts(current: dict[str, int], incoming: dict[str, int]) -> dict[str, int]:
@@ -121,12 +130,15 @@ class MASState(TypedDict, total=False):
             compilation serves every candidate an optimizer proposes.
         records: Accumulated per-agent records, in completion order.
         visits: How often each agent has run, which is what bounds a retry loop.
+        routes: Where each deciding node's latest visit sent the run (version
+            2), keyed by node; absent until a node decides.
     """
 
     values: Annotated[dict[str, Any], _merge_values]
     prompts: dict[str, str]
     records: Annotated[list[AgentRecord], operator.add]
     visits: Annotated[dict[str, int], _merge_counts]
+    routes: Annotated[dict[str, list[str]], _merge_values]
 
 
 class CompiledGraph(Protocol):
@@ -173,7 +185,7 @@ def _current_meter(mas: MAS) -> RunMeter | None:
     except RuntimeError:  # outside a run
         return None
     meter = (config.get("configurable") or {}).get(_RUN_KEY)
-    if not isinstance(meter, RunMeter) or meter.owner is not mas:
+    if not isinstance(meter, RunMeter) or not meter.owns(mas):
         return None
     return meter
 
@@ -255,16 +267,27 @@ def _plain_body(agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float]
     return body
 
 
-def _wrap(mas: MAS, name: str, body: _NodeBody) -> Callable[[MASState], dict[str, Any]]:
+def _wrap(
+    mas: MAS, name: str, body: _NodeBody, decision: _Decision | None = None
+) -> Callable[[MASState], dict[str, Any]]:
     """Turn a node's body into the node LangGraph runs.
 
     The node times the body, sets ``latency_s`` on its record, keeps the record
-    on the run's meter, and writes the body's values into the state.
+    on the run's meter, and writes the body's values into the state. A node
+    with a decision then writes where it goes in ``routes``.
+
+    A version 2 body that raises gets a failed record (:func:`_failed_record`),
+    unless the error ends the run (:data:`_RUN_ENDS`). When an error route
+    matches the error's kind, the visit writes nothing and takes the route;
+    otherwise the record is kept on the meter for the failed run's trace and
+    the error goes on. Version 1 raises as it always did.
 
     Args:
         mas: The system, whose run meter the node reads.
         name: The node's name.
         body: What the node does in one visit.
+        decision: The node's routing, for a version 2 node with conditional or
+            error edges.
 
     Returns:
         A function mapping the incoming state to this node's state updates.
@@ -275,11 +298,30 @@ def _wrap(mas: MAS, name: str, body: _NodeBody) -> Callable[[MASState], dict[str
         if meter is not None:
             meter.start()  # the run's wall clock starts with its first agent, not with the batch
         started = time.perf_counter()
-        record, writes = body(state, meter)
+        route: list[str] | None = None
+        try:
+            record, writes = body(state, meter)
+        except Exception as error:
+            kind = _kind_of(error)
+            if mas.version != SPEC_VERSION_2 or kind in _RUN_ENDS:
+                raise
+            target = None if decision is None else decision.on_error(kind)
+            record = _failed_record(mas, name, error, kind, time.perf_counter() - started, target)
+            if meter is not None:
+                meter.keep(record, mas)
+            if target is None:
+                raise
+            return {"records": [record], "visits": {name: 1}, "routes": {name: [target]}}
+        if decision is not None:
+            route, capped = decision.route(_context(mas, name, state, record, writes, meter))
+            record = dataclasses.replace(record, route=tuple(route), capped=capped)
         record = dataclasses.replace(record, latency_s=time.perf_counter() - started)
         if meter is not None:
-            meter.keep(record)
-        return {"values": writes, "records": [record], "visits": {name: 1}}
+            meter.keep(record, mas)
+        update: dict[str, Any] = {"values": writes, "records": [record], "visits": {name: 1}}
+        if route is not None:
+            update["routes"] = {name: route}
+        return update
 
     return node
 
@@ -481,7 +523,7 @@ def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
             rendered_prompt="",
             inputs=inputs,
             outputs=outputs,
-            raw_response=next(iter(outputs.values())) if len(outputs) == 1 else render_value(writes, JSON),
+            raw_response=_raw(outputs, writes),
             kind="step",
         )
         return record, writes
@@ -489,32 +531,286 @@ def _step_body(mas: MAS, step: Step, types: dict[str, ValueType]) -> _NodeBody:
     return body
 
 
-def _compile_v2(mas: MAS) -> CompiledGraph:
-    """Compile a version 2 system: agents and steps, and a barrier join wherever several edges arrive.
+def _raw(outputs: dict[str, str], writes: dict[str, Any]) -> str:
+    """Return a node's raw response: its one rendered write, or all its writes as one JSON object."""
+    return next(iter(outputs.values())) if len(outputs) == 1 else render_value(writes, JSON)
 
-    A barrier (``add_edge([...], node)``) runs its node once, after every
-    source has run; nothing is deferred. Phase 2a has no conditional edges, so
-    every edge in ``mas.graph`` is plain and each join in ``mas.info.joins``
-    waits for its predecessors, each a group of one.
+
+def _box_body(box: Any, types: dict[str, ValueType]) -> _NodeBody:
+    """Build what a box does in one visit: run its inner system from the mapped values.
+
+    The inner system runs on the outer run's meter, which adopts it, so its
+    calls count against the outer budget. Its failure raises out of the box, so
+    the box's own error edges route by the inner error's kind.
+
+    Args:
+        box: The box, with ``name``, ``system``, ``reads`` ({inner input: outer
+            value}) and ``writes`` ({inner value: outer value}).
+        types: The type of every outer value.
+
+    Returns:
+        The box's body, for :func:`_wrap`.
+    """
+    inner: MAS = box.system
+
+    def body(state: MASState, meter: RunMeter | None) -> tuple[AgentRecord, dict[str, Any]]:
+        if meter is None:  # the graph was invoked outside a run: the inner system counts on its own meter
+            meter = RunMeter(inner.budget, owner=inner)
+        meter.check_boundary()
+        meter.adopt(inner)
+        values = state.get("values") or {}
+        given = {inside: values[outside] for inside, outside in box.reads.items() if outside in values}
+        trace, produced = _run_values(inner, given, inner.prompts(), meter)
+        writes = {outside: produced.get(inside) for inside, outside in box.writes.items()}
+        outputs = {name: render_value(value, types[name]) for name, value in writes.items()}
+        costs = [record.cost_usd for record in trace.records if record.cost_usd is not None]
+        tokens = [record.tokens for record in trace.records if record.tokens is not None]
+        record = AgentRecord(
+            agent=box.name,
+            step=-1,
+            prompt="",
+            rendered_prompt="",
+            inputs={outside: render_value(values.get(outside), types[outside]) for outside in box.reads.values()},
+            outputs=outputs,
+            usage=trace.usage,
+            raw_response=_raw(outputs, writes),
+            cost_usd=sum(costs) if costs else None,
+            tokens=sum(tokens[1:], tokens[0]) if tokens else None,
+            kind="box",
+            inner=trace,
+        )
+        return record, writes
+
+    return body
+
+
+@dataclasses.dataclass(frozen=True)
+class _Decision:
+    """Where a version 2 node with conditional or error edges goes after a visit.
+
+    Attributes:
+        plain: Targets taken after every visit that did not fail.
+        choices: The ordered when-group: ``when``, ``while`` and ``switch``
+            edges, each with its predicate (a switch compares its path with its
+            case). The first that holds is taken.
+        otherwise: The ``else`` target, taken when no choice is.
+        errors: The error edges, in order.
+    """
+
+    plain: tuple[str, ...]
+    choices: tuple[tuple[Edge, Predicate], ...]
+    otherwise: str | None
+    errors: tuple[Edge, ...]
+
+    @classmethod
+    def of(cls, edges: list[Edge]) -> _Decision:
+        """Build the decision of one node from its out-edges, in declared order."""
+        choices = []
+        for edge in edges:
+            if edge.kind is EdgeKind.SWITCH:
+                path = ("path", tuple(str(edge.switch).split(".")))
+                compare = ("cmp", "==", path, ("lit", edge.case))
+                choices.append((edge, Predicate(f"{edge.switch} == {edge.case!r}", compare)))
+            elif edge.kind in (EdgeKind.WHEN, EdgeKind.WHILE):
+                choices.append((edge, parse_predicate(str(edge.when))))
+        return cls(
+            plain=tuple(edge.target for edge in edges if edge.kind is EdgeKind.PLAIN),
+            choices=tuple(choices),
+            otherwise=next((edge.target for edge in edges if edge.kind is EdgeKind.ELSE), None),
+            errors=tuple(edge for edge in edges if edge.kind is EdgeKind.ERROR),
+        )
+
+    def route(self, ctx: Context) -> tuple[list[str], bool]:
+        """Return the targets after a visit that did not fail, and whether a ``while`` cap was hit.
+
+        A ``while`` edge that holds while its target has run ``max_visits``
+        times is skipped and marks the visit capped; the loop's exit is then
+        the ``else`` target, since the other choices were written for the case
+        where the loop's condition does not hold.
+        """
+        exit_ = [*self.plain, *([self.otherwise] if self.otherwise else [])]
+        for edge, predicate in self.choices:
+            if not predicate.evaluate(ctx):
+                continue
+            if edge.kind is EdgeKind.WHILE and ctx.visits.get(edge.target, 0) >= cast("int", edge.max_visits):
+                return exit_, True
+            return [*self.plain, edge.target], False
+        return exit_, False
+
+    def on_error(self, kind: ErrorKind) -> str | None:
+        """Return the target of the first error edge routing ``kind``; :data:`_RUN_ENDS` are never routed."""
+        if kind in _RUN_ENDS:
+            return None
+        for edge in self.errors:
+            if ANY_ERROR in edge.errors or kind.value in edge.errors:
+                return edge.target
+        return None
+
+
+def _context(
+    mas: MAS, name: str, state: MASState, record: AgentRecord, writes: dict[str, Any], meter: RunMeter | None
+) -> Context:
+    """Return what a node's predicates see: its fresh writes, its visit counted, the spend so far."""
+    visits = dict(state.get("visits") or {})
+    visits[name] = visits.get(name, 0) + 1
+    if meter is not None:
+        cost: float | None = meter.cost_usd
+    else:
+        cost = sum(r.cost_usd for r in [*(state.get("records") or []), record] if r.cost_usd is not None)
+
+    def call(function: str, args: tuple[Any, ...]) -> bool:
+        spec, source = mas.resolve_callable(Step(function, function))
+        produced = _tools.run_step(spec, source, dict(zip(spec.reads, args, strict=True)))
+        return cast("bool", next(iter(produced.values())))
+
+    return Context(
+        values={**(state.get("values") or {}), **writes},
+        visits=visits,
+        node=name,
+        cost_usd=cost,
+        elapsed_s=None if meter is None else meter.elapsed_s,
+        call=call,
+    )
+
+
+def _failed_record(
+    mas: MAS, name: str, error: BaseException, kind: ErrorKind, latency_s: float, target: str | None
+) -> AgentRecord:
+    """Return the record of a version 2 visit that failed: no outputs, the paid attempts' cost, the route taken."""
+    meta: CallMeta | None = getattr(error, "meta", None)  # EmptyResponse and BadFormat carry their attempts
+    paid = {**(meta.record_fields() if meta is not None else {}), "error_kind": kind}
+    return AgentRecord(
+        agent=name,
+        step=-1,
+        prompt="",
+        rendered_prompt="",
+        inputs={},
+        outputs={},
+        latency_s=latency_s,
+        kind="agent" if name in mas.agents else "step" if name in mas.steps else "box",
+        error=f"{type(error).__name__}: {error}",
+        route=None if target is None else (target,),
+        **paid,
+    )
+
+
+def _out_edges(mas: MAS) -> dict[str, list[Edge]]:
+    """Return each node's out-edges: the declared ones in order, then the implicit start and end wiring."""
+    out: dict[str, list[Edge]] = {}
+    for edge in mas.edges:
+        out.setdefault(edge.source, []).append(edge)
+    declared = {(edge.source, edge.target) for edge in mas.edges}
+    for source, target in mas.graph.edges:
+        if (source, target) not in declared:
+            out.setdefault(source, []).append(Edge(source, target))
+    return out
+
+
+def _relay(state: MASState) -> dict[str, Any]:  # noqa: ARG001 (a node's signature)
+    """Pass a group's arrival on to a join's barrier; writes nothing."""
+    return {}
+
+
+def _add_joins(
+    builder: StateGraph[MASState, Any, MASState, MASState],
+    joins: Mapping[str, Any],
+    decisions: Mapping[str, _Decision],
+    out: Mapping[str, list[Edge]],
+) -> tuple[set[tuple[str, str]], dict[tuple[str, str], str]]:
+    """Add one barrier per join: it waits for each of the join's groups once per pass.
+
+    A group that is one plain edge from a real node without error edges waits
+    on that node itself. Any other group (several alternatives, a conditional
+    edge, the start, or the success route of a node with error edges) gets a
+    relay node ``__in__.<join>.<k>`` its sources route to (LangGraph reserves
+    ``:`` in node names). A merge needs nothing: its edges stay plain, and it
+    runs on whichever arrives.
+
+    Args:
+        builder: The graph being built.
+        joins: ``mas.info.joins``: a ``Join`` (``kind``, ``groups``) per node,
+            or the predecessors of a phase 2a barrier, each a group of one.
+        decisions: The nodes with a decision.
+        out: Each node's out-edges.
+
+    Returns:
+        The (source, join) pairs the barrier waits on directly, and the relay
+        each other (source, join) pair goes to.
+    """
+    kinds = {(edge.source, edge.target): edge.kind for edges in out.values() for edge in edges}
+    direct: set[tuple[str, str]] = set()
+    relays: dict[tuple[str, str], str] = {}
+    for node, join in joins.items():
+        if getattr(join, "kind", "join") != "join":
+            continue
+        groups = getattr(join, "groups", None) or tuple((source,) for source in join)
+        starts = []
+        for index, group in enumerate(groups):
+            source = group[0]
+            plain = len(group) == 1 and source != START and kinds.get((source, node)) is EdgeKind.PLAIN
+            if plain and (source not in decisions or not decisions[source].errors):
+                direct.add((source, node))
+                starts.append(source)
+                continue
+            relay = f"__in__.{node}.{index}"
+            builder.add_node(relay, _relay)
+            relays.update(((member, node), relay) for member in group)
+            starts.append(relay)
+        builder.add_edge(starts, node)
+    return direct, relays
+
+
+def _router(name: str, targets: dict[str, str]) -> Callable[[MASState], list[str]]:
+    """Build the router of a deciding node: it reads the route its wrapper wrote, mapped to relays."""
+
+    def route(state: MASState) -> list[str]:
+        chosen = (state.get("routes") or {}).get(name, [])
+        return [targets[target] for target in chosen if target in targets]
+
+    return route
+
+
+def _compile_v2(mas: MAS) -> CompiledGraph:
+    """Compile a version 2 system: agents, steps and boxes, decisions, merges and joins.
+
+    A node with conditional or error edges gets a :class:`_Decision`; its
+    wrapper evaluates it after each visit and writes ``routes[node]``, which
+    the node's conditional edge only reads. A join is a barrier
+    (:func:`_add_joins`) that runs its node once per pass; nothing is
+    deferred. Every other edge is plain.
     """
     builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(MASState)
     info = cast("SystemInfo", mas.info)  # check_system set it when the system was built
     types = info.types
+    out = _out_edges(mas)
+    decisions = {
+        source: _Decision.of(edges) for source, edges in out.items() if any(e.kind is not EdgeKind.PLAIN for e in edges)
+    }
+    bodies: dict[str, _NodeBody] = {}
     counters: dict[int, Callable[[str], float]] = {}
     for agent in mas.agents.values():
         llm = mas.resolve_llm(agent)
         if id(llm) not in counters:
             counters[id(llm)] = get_token_counter(llm)
-        body = _agent_body(mas, agent, llm, counters[id(llm)], types)
-        builder.add_node(agent.name, _wrap(mas, agent.name, body))  # type: ignore[call-overload]
+        bodies[agent.name] = _agent_body(mas, agent, llm, counters[id(llm)], types)
     for step in mas.steps.values():
-        builder.add_node(step.name, _wrap(mas, step.name, _step_body(mas, step, types)))  # type: ignore[call-overload]
+        bodies[step.name] = _step_body(mas, step, types)
+    for box in getattr(mas, "boxes", {}).values():
+        bodies[box.name] = _box_body(box, types)
+    for name, body in bodies.items():
+        builder.add_node(name, _wrap(mas, name, body, decisions.get(name)))  # type: ignore[arg-type]
 
-    for target in mas.graph.nodes:
-        if target in info.joins:
-            builder.add_edge(list(info.joins[target]), target)
-        else:
-            for source in mas.graph.predecessors(target):
+    direct, relays = _add_joins(builder, info.joins, decisions, out)
+    for source, edges in out.items():
+        targets = {
+            edge.target: relays.get((source, edge.target), edge.target)
+            for edge in edges
+            if (source, edge.target) not in direct
+        }
+        if source in decisions and targets:
+            builder.add_conditional_edges(source, _router(source, targets), sorted(set(targets.values())))
+        elif source not in decisions:
+            for target in targets.values():
                 builder.add_edge(source, target)
     return builder.compile()
 
@@ -525,7 +821,7 @@ def _v2_output(mas: MAS, records: list[AgentRecord]) -> str:
     A terminal with several writes gives them as one JSON object.
     """
     terminals = set(mas.graph.predecessors(END))
-    ran = [record for record in records if record.agent in terminals]
+    ran = [record for record in records if record.agent in terminals and record.error is None]
     if not ran:
         return ""
     outputs = ran[-1].outputs
@@ -600,9 +896,9 @@ def compile_mas(mas: MAS) -> CompiledGraph:
         # typing.TypedDict class does not satisfy under mypy, even though passing a
         # TypedDict schema is the documented usage. Runtime behaviour is covered by
         # the join-semantics and quickstart tests.
-        builder.add_node(  # type: ignore[call-overload]
+        builder.add_node(
             name,
-            _make_node(mas, agent, counters[id(llm)]),
+            _make_node(mas, agent, counters[id(llm)]),  # type: ignore[arg-type]
             defer=name in joins,
         )
 
@@ -620,18 +916,26 @@ def compile_mas(mas: MAS) -> CompiledGraph:
     return builder.compile()
 
 
-def _to_trace(mas: MAS, query: str, result: dict[str, Any], meter: RunMeter | None = None) -> Trace:  # noqa: ARG001 (meter: for phase 2b's health)
-    """Assemble a trace from a finished run's state.
+def _health(mas: MAS, records: tuple[AgentRecord, ...], meter: RunMeter | None) -> Health:
+    """Summarize a run's health with the system's settings and its ``while`` edges."""
+    loops = [(edge.source, edge.target) for edge in mas.edges if edge.kind is EdgeKind.WHILE]
+    return summarize(records, meter=meter, settings=getattr(mas, "health", None), while_edges=loops)
+
+
+def _to_trace(mas: MAS, query: str, result: dict[str, Any], meter: RunMeter | None = None) -> Trace:
+    """Assemble a trace from a finished run's state, its health summarized.
 
     A version 2 trace's output is the rendered write of the terminal that ran.
+    Without a meter the health has no budget entry.
     """
     records: list[AgentRecord] = list(result.get("records") or [])
     numbered = tuple(dataclasses.replace(record, step=index) for index, record in enumerate(records))
+    health = _health(mas, numbered, meter)
     if mas.version == SPEC_VERSION_2:
-        return Trace(query=query, output=_v2_output(mas, records), records=numbered)
+        return Trace(query=query, output=_v2_output(mas, records), records=numbered, health=health)
     values: dict[str, Any] = result.get("values") or {}
     output_var = mas.agents[terminal_agent(mas.graph)].output
-    return Trace(query=query, output=str(values.get(output_var) or ""), records=numbered)
+    return Trace(query=query, output=str(values.get(output_var) or ""), records=numbered, health=health)
 
 
 def _kind_of(error: BaseException) -> ErrorKind:
@@ -645,8 +949,10 @@ def _kind_of(error: BaseException) -> ErrorKind:
     return classify(error)
 
 
-def _failed_trace(mas: MAS, query: str, error: BaseException, meter: RunMeter) -> Trace:  # noqa: ARG001 (mas: same shape as _to_trace)
-    """Assemble a failed run's trace from the records its meter kept.
+def _failed_trace(mas: MAS, query: str, error: BaseException, meter: RunMeter) -> Trace:
+    """Assemble a failed run's trace from the records its meter kept, its health summarized.
+
+    A version 2 run's records include the failed visit's own.
 
     Args:
         mas: The system that ran.
@@ -665,12 +971,37 @@ def _failed_trace(mas: MAS, query: str, error: BaseException, meter: RunMeter) -
         records=numbered,
         error=f"{type(error).__name__}: {error}",
         error_kind=_kind_of(error),
+        health=_health(mas, numbered, meter),
     )
 
 
 def _initial_state(query: str, prompts: dict[str, str]) -> MASState:
     """Build the state a run starts from."""
     return MASState(values={"query": query}, prompts=dict(prompts), records=[], visits={})
+
+
+def _run_values(
+    mas: MAS, values: dict[str, Any], prompts: dict[str, str], meter: RunMeter
+) -> tuple[Trace, dict[str, Any]]:
+    """Run a version 2 system from given values on a given meter, as a box runs its inner system.
+
+    Args:
+        mas: The system to run.
+        values: Its inputs, by name.
+        prompts: Prompt text per agent name.
+        meter: The meter to count on; it owns or has adopted ``mas``.
+
+    Returns:
+        The run's trace (its query is the inputs as one JSON object; its health
+        has no budget entry, which belongs to the meter's owner), and the
+        run's final values.
+
+    Raises:
+        Exception: Whatever ended the run; nothing is caught.
+    """
+    state = MASState(values=dict(values), prompts=dict(prompts), records=[], visits={})
+    result: dict[str, Any] = mas.compiled.invoke(state, config=_run_config(mas, meter))
+    return _to_trace(mas, render_value(values, JSON), result), dict(result.get("values") or {})
 
 
 def _run_config(mas: MAS, meter: RunMeter) -> dict[str, Any]:
