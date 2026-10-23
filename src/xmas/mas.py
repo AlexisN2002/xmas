@@ -249,7 +249,7 @@ class MAS(BasePredictor):
         self.inputs = {name: kind if isinstance(kind, ValueType) else parse_type(kind) for name, kind in given.items()}
         self.merges = {}
         for value, entry in (state or {}).items():
-            if dict(entry) != {"merge": MERGE_LAST}:
+            if entry != {"merge": MERGE_LAST}:
                 raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
             self.merges[value] = MERGE_LAST
         self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
