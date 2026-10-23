@@ -13,7 +13,7 @@ from xmas import MAS, Agent, Box, Budget, ErrorKind, TokenUsage
 from xmas.edges import Edge, EdgeKind
 from xmas.llms.meta import CallMeta
 
-from .test_v2_values import MetaLLM
+from .test_steps import MetaLLM
 
 
 class FlakyLLM(MetaLLM):

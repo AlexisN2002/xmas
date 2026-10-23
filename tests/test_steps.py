@@ -367,7 +367,7 @@ def test_optional_text_parameter_and_json_null() -> None:
     mas = MAS([writer], [("writer", "tidy")], steps=[Step("tidy", "tidy")], tools=[tidy], llm=MetaLLM([" cats "]))
     assert mas.run("q").output == "CATS"
 
-    # a json null is a value and renders as null (a value not there yet renders empty: test_v2_operators)
+    # a json null is a value and renders as null (a value not there yet renders empty: test_operators)
     judge = Agent("judge", "Judge {query}", output="verdict", output_type="json")
     reader = Agent("reader", "Read {verdict}", output="note", inputs=["verdict"])
     llm = MetaLLM(["null", "noted"])

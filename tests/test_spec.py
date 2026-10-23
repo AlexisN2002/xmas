@@ -1,7 +1,7 @@
 """Spec version 2: the worked example round-trips, the check names every problem, describe is plain data.
 
 These run on construction, serialization and ``describe()`` alone; running a
-version 2 system is the engine's part and is tested in ``test_v2_values.py``.
+version 2 system is the engine's part and is tested in ``test_steps.py``.
 """
 
 from __future__ import annotations

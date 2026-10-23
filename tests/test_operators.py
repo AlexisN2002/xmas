@@ -18,7 +18,7 @@ from xmas.nodes import Step
 from xmas.tools import tool
 
 from .conftest import MockLLM
-from .test_v2_values import MetaLLM
+from .test_steps import MetaLLM
 
 # ----------------------------------------------------------------- callables
 
