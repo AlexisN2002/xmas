@@ -17,6 +17,7 @@ system, not a special case.
 Version 2 puts the whole workflow in one graph: agents, code steps, conditions and loops,
 and answers with a fixed JSON shape. Pictures, documents and people are planned next.
 xmas checks the wiring before the first call and draws the picture from the graph that runs.
+A system made only of agents and plain edges is a version 1 system, and works as before.
 
 ### Key Features
 
@@ -44,14 +45,14 @@ design.
 | Records with cost, time and tokens, budgets, health signals | built |
 | `describe()`, the system as plain data for drawing | built |
 | YAML files for version 1 systems, plain-data specs for version 2 | built |
-| CANTANTE, topology search, `frozen` nodes | built |
+| Optimizers: CANTANTE, topology search, `frozen` nodes | built |
 | `for each` chains and `first of` races | planned |
 | Images, audio, documents, tables and files as values | planned |
-| Several named inputs and outputs per run | planned |
+| `run_state`: start a run from several named values and read several outputs | planned |
 | People in the graph, and Stop | planned |
 | The `.mas` bundle, its commands and `verify()` | planned |
 | Learning from human picks | planned |
-| The experiment layer | planned |
+| The experiment layer: one config for a reproducible run, like promptolution's `ExperimentConfig` | planned |
 
 ## 🔧 Installation
 
@@ -70,13 +71,17 @@ uv sync
 cp .env.example .env   # then set XMAS_BASE_URL and XMAS_API_KEY
 ```
 
+xmas reads the two variables from the environment and never opens `.env` itself.
+Export them, or start Python with `uv run --env-file .env python`.
+
 Tools served over MCP need `uv sync --extra mcp`.
 
 ## 💡 Your first system in minutes
 
 Two agents: an intern drafts an answer, and the boss turns it into the final one.
-`{query}` and `{draft}` name what each agent reads; the intern's `output` is what the boss
-receives.
+The question you pass in is the value `query`, which an agent reads unless `inputs=`
+says otherwise. `{query}` and `{draft}` mark where each value goes in a prompt. The
+intern's `output`, `draft`, is what the boss receives.
 
 ```python
 from xmas import MAS, APILLM, Agent
@@ -94,11 +99,11 @@ boss = Agent(
 mas = MAS([intern, boss], edges=[("intern", "boss")], llm=llm)
 
 print(mas("Why is the sky blue?"))  # the boss's answer
-print(mas.last_trace["intern"][0].outputs)  # who really did the work
+print(mas.last_trace["intern"][0].outputs)  # {'draft': ...}: who really did the work
 ```
 
-Each agent can run on its own model: give it `model="..."` and pass the models by name
-through `MAS(..., llms={...})`.
+The model name must be one your endpoint serves. Each agent can run on its own model:
+give it `model="..."` and pass the models by name through `MAS(..., llms={...})`.
 
 ## Code between agents: steps
 
@@ -147,8 +152,8 @@ The same function can also be a tool: `Agent(..., tools=["count_words"])` lets t
 model call it while it answers. As a step, the graph decides when it runs; as a tool,
 the model does. An MCP tool from `MCPTools` works in both places too.
 
-In Python, an agent's reads are `inputs` and its write is `output`. A spec calls them
-`reads` and `writes`.
+In Python, an agent's reads are `inputs` and its write is `output`. The saved spec (see
+Save and share) calls them `reads` and `writes`.
 
 ## Answers with a shape
 
@@ -371,7 +376,8 @@ print(sorted({(flag.signal, flag.node) for flag in trace.health.flags}))
 
 The signals are `retried`, `bad_format`, `error_routed`, `empty`, `stuck` (the same
 output as the node's last visit), `unfilled` (a prompt placeholder with no value), `leak`
-(chat-template tokens or reasoning tags in an output), `long` and `short`.
+(chat-template tokens or reasoning tags in an output), and `long` and `short` (over
+three times, or under a third of, the node's median length).
 `trace.health.loops` counts each `while` edge, and `trace.health.budget` shows each limit
 next to what the run spent. `MAS(..., health=HealthSettings(length_factor=4))` tunes them.
 A healthy run's `trace.to_dict()` has no `health` key.
@@ -399,7 +405,8 @@ cost cannot be checked.
 ## Drawing a system
 
 `mas.describe()` returns the system as plain data. Each node has its kind, model, typed
-reads and writes, and whether it is frozen. Each edge has its kind and condition:
+reads and writes, and whether it is frozen. Each edge has its kind and condition. The
+start and end wiring that xmas adds itself is marked `implicit`:
 
 ```python
 picture = mas.describe()
@@ -418,7 +425,8 @@ from the graph that runs, never from a hand-drawn copy.
 ## A system inside a system
 
 A box runs a whole system as one node of another. Its `reads` map the inner inputs to
-outer values, and its `writes` map inner values back out:
+outer values, and its `writes` map inner values back out. The inner system names its one
+input `page` with `inputs=`; without it, a system's input is `query`:
 
 ```python
 from xmas import Box
@@ -473,6 +481,9 @@ The spec's `edges` read like this in YAML, and `from_dict` accepts them in this 
 - judge -> sorry: else
 - count -> sorry: {on error: [timeout, outage]}
 ```
+
+A whole spec written to a YAML file, by hand or with `yaml.safe_dump(spec)`, loads with
+`MAS.from_yaml(path, llm=llm, tools=[...])`.
 
 `callables` records where each function lives and what it reads and writes. Models
 appear by name only. Each agent's prompt sits under `prompts` for now; in the planned
@@ -605,9 +616,9 @@ and before a release.
 
 ### Beyond text
 
-Values today are `text` and `json`. Planned next are `image`, `audio`, `document`,
-`table`, `file` and `list of` each. The check already knows these words and refuses
-them with a message. Large values travel by reference. Each model states what it
+Values today are `text` and `json`, and the check refuses any other type word with a
+message. Planned next are `image`, `audio`, `document`, `table`, `file` and `list of`
+each. Large values travel by reference. Each model states what it
 accepts, and an agent that reads an image on a model that cannot see fails when the
 system is built. Conversions, such as a document to text, are visible steps.
 

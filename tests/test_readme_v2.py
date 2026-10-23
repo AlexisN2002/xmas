@@ -572,12 +572,9 @@ def test_health_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> Non
 
 
 def test_health_signal_names_and_a_healthy_run() -> None:
-    from xmas.health import _record_signals
-
-    named = ("retried", "bad_format", "error_routed", "empty", "stuck", "unfilled", "leak", "long", "short")
-    assert tuple(re.findall(r'found\.append\(\("(\w+)"', inspect.getsource(_record_signals))) == named
-    for name in named:
-        assert f"`{name}`" in README
+    named = ["retried", "bad_format", "error_routed", "empty", "stuck", "unfilled", "leak", "long", "short"]
+    sentence = README.split("The signals are ", 1)[1].split("`trace.health.loops`", 1)[0]
+    assert re.findall(r"`(\w+)`", sentence) == named
 
     healthy = looping_system(scripted(), counter=count_words)
     trace = healthy.run(QUERY)
@@ -753,6 +750,9 @@ def test_version_2_save_block_runs_as_written(capsys: pytest.CaptureFixture[str]
     )
     assert from_yaml_edges.describe()["id"] == mas.describe()["id"]
     assert "http" not in yaml.safe_dump(spec) and "api_key" not in yaml.safe_dump(spec)
+    (tmp_path / "spec.yaml").write_text(yaml.safe_dump(spec), encoding="utf-8")
+    from_file = MAS.from_yaml(tmp_path / "spec.yaml", llm=llm, tools=[count_words, publish, apologize])
+    assert (from_file.version, from_file.describe()["id"]) == (2, mas.describe()["id"])
     with pytest.raises(ValueError, match=r"\.mas bundle .*to_dict\(\) gives its spec"):
         mas.to_yaml(tmp_path / "team.yaml")
 

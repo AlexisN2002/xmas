@@ -29,3 +29,5 @@ xmas reads its settings from the environment and never from a file in the reposi
 | `XMAS_API_KEY` | API key for that endpoint |
 
 Copy `.env.example` to `.env` and fill in your own values. `.env` is gitignored.
+xmas never opens `.env` itself: export the two variables, or run with
+`uv run --env-file .env`.
