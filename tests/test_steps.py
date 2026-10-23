@@ -95,7 +95,7 @@ def test_a_step_spends_no_model_call() -> None:
 
 def test_a_system_whose_inputs_are_not_a_query_does_not_run_on_one() -> None:
     boxed, _ = planned_note(inputs={"query": TEXT, "style": TEXT})
-    with pytest.raises(ValueError, match="runs as a box, or with run_state in phase 3"):
+    with pytest.raises(ValueError, match=r"only runs on one text query; use it as a box\."):
         boxed.run("cats")
 
 

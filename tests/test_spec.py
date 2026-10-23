@@ -251,7 +251,7 @@ COUNT, PUBLISH, APOLOGY = STEPS
         ),
         pytest.param(
             {"inputs": {"query": "text", "photo": "image"}},
-            [r"input 'photo' has type 'image', which arrives in phase 3"],
+            [r"input 'photo' has type 'image'; image values are not available yet"],
             id="image",
         ),
         pytest.param(

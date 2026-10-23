@@ -106,7 +106,7 @@ def _value_problems(name: str, vtype: ValueType) -> Iterator[str]:
     elif name.startswith("__"):
         yield "starts with '__'; such names belong to xmas"
     if vtype not in AVAILABLE:
-        yield f"has type {str(vtype)!r}, which arrives in phase 3"
+        yield f"has type {str(vtype)!r}; {vtype} values are not available yet"
 
 
 def _contains(system: MAS, target: MAS, seen: set[int]) -> bool:

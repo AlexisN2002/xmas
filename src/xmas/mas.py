@@ -316,8 +316,8 @@ class MAS(BasePredictor):
         if self.inputs != _QUERY_ONLY:
             declared = {name: str(vtype) for name, vtype in self.inputs.items()}
             raise ValueError(
-                f"This system's inputs are {declared}, not {{'query': 'text'}}, so run(query) cannot fill them; "
-                "it runs as a box, or with run_state in phase 3."
+                f"This system's inputs are {declared}, not {{'query': 'text'}}, and run(query) only runs on one "
+                "text query; use it as a box."
             )
 
     def run(self, query: str) -> Trace:
