@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from xmas import MAS, Agent, Budget, ErrorKind
+from xmas import END, MAS, Agent, Budget, ErrorKind
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BudgetExceeded
 from xmas.nodes import Step
@@ -40,6 +40,8 @@ def apology_text(query: str) -> str:
     """Apologize for a query."""
     return f"Sorry, no short answer about {query}."
 
+
+OK = '{"fits": true, "action": "publish"}'
 
 VERDICT = {
     "fits": {"type": "bool", "means": "the draft makes one claim in under 300 words"},
@@ -269,6 +271,15 @@ def test_on_error_routes_by_kind() -> None:
     assert trace.health is not None
     assert [f.signal for f in trace.health.flags] == ["bad_format", "error_routed"]
 
+    # the same system with a judge that answers well: a node whose only out-edge is an error edge
+    # ends the run when it succeeds, so its answer is the output
+    good = MAS([judge, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=MetaLLM([OK]))
+    assert sorted(good.graph.predecessors(END)) == ["judge", "sorry"]
+    assert good.to_dict()["edges"] == [{"judge -> sorry": {"on error": ["bad_format"]}}]  # the END wiring is implicit
+    trace = good.run("cats")
+    assert trace.error is None and [r.agent for r in trace.records] == ["judge"]
+    assert trace.output == OK and trace["judge"][0].route == (END,)
+
     # a budget refusal is never routed, not even by `any`, and no edge may name it
     for kind in ("budget", "stopped"):
         with pytest.raises(ValueError, match=kind):
@@ -283,3 +294,92 @@ def test_on_error_routes_by_kind() -> None:
     trace = mas.run("cats")
     assert trace.error_kind == ErrorKind.BUDGET and trace.records == ()
     assert trace.error is not None and trace.error.startswith(BudgetExceeded.__name__)
+
+
+def test_a_failing_decision_is_a_failed_visit() -> None:
+    """A predicate's callable that raises or answers a non-bool fails the visit, which keeps its paid record."""
+
+    @tool
+    def long_enough(draft: str) -> bool:
+        """Say whether a draft is long enough."""
+        return "yes"  # type: ignore[return-value]  # a non-bool: the predicate refuses it
+
+    writer = Agent("writer", "Write {query}", output="draft", inputs=["query"])
+    done = Agent("done", "Done {draft}", output="final", inputs=["draft"])
+    again = Agent("again", "Again {query}", output="final", inputs=["query"])
+
+    def build(*error_edges: Edge) -> MAS:
+        edges = [
+            Edge("writer", "done", EdgeKind.WHEN, when="long_enough(draft)"),
+            Edge("writer", "again", EdgeKind.ELSE),
+            *error_edges,
+        ]
+        state = {"final": {"merge": "last"}}
+        return MAS([writer, done, again], edges, state=state, tools=[long_enough], llm=MetaLLM(["a draft"] * 3))
+
+    unrouted = build().run("cats")
+    assert unrouted.error is not None and "returned str, not bool" in unrouted.error
+    (failed,) = unrouted.records
+    assert failed.agent == "writer" and failed.route is None and failed.error is not None
+    assert failed.cost_usd == pytest.approx(0.01) and unrouted.cost_usd == pytest.approx(0.01)
+
+    sorry = Agent("sorry", "Sorry {query}", output="final", inputs=["query"])
+    mas = MAS(
+        [writer, done, again, sorry],
+        [
+            Edge("writer", "done", EdgeKind.WHEN, when="long_enough(draft)"),
+            Edge("writer", "again", EdgeKind.ELSE),
+            Edge("writer", "sorry", EdgeKind.ERROR, errors=("any",)),
+        ],
+        state={"final": {"merge": "last"}},
+        tools=[long_enough],
+        llm=MetaLLM(["a draft", "We are sorry."]),
+    )
+    routed = mas.run("cats")
+    assert routed.error is None and routed.output == "We are sorry."
+    assert [(r.agent, r.route, r.outputs) for r in routed.records] == [
+        ("writer", ("sorry",), {}),
+        ("sorry", None, {"final": "We are sorry."}),
+    ]
+    assert routed.cost_usd == pytest.approx(0.02)
+
+    # a callable called with the wrong number of arguments is refused when the system is built
+    with pytest.raises(ValueError, match=r"calls 'long_enough' with 2 arguments, but it takes 1 \(draft\)"):
+        MAS(
+            [writer, done, again],
+            [
+                Edge("writer", "done", EdgeKind.WHEN, when="long_enough(draft, query)"),
+                Edge("writer", "again", EdgeKind.ELSE),
+            ],
+            state={"final": {"merge": "last"}},
+            tools=[long_enough],
+            llm=MetaLLM([]),
+        )
+
+
+def test_a_falsy_switch_case_is_a_case() -> None:
+    """A switch case of 0, false or "" is a case like any other, and 0 is not false."""
+
+    @tool(writes={"score": "json"})
+    def score_of(query: str) -> dict[str, Any]:
+        """Score a query: its length minus four, or false for an empty one."""
+        return {"n": len(query) - 4 if query else False}
+
+    def agent(name: str) -> Agent:
+        return Agent(name, f"{name}: {{query}}", output="label", inputs=["query"])
+
+    mas = MAS(
+        [agent("zero"), agent("no"), agent("other")],
+        [
+            Edge("score", "zero", EdgeKind.SWITCH, switch="score.n", case=0),
+            Edge("score", "no", EdgeKind.SWITCH, switch="score.n", case=False),
+            Edge("score", "other", EdgeKind.ELSE),
+        ],
+        steps=[Step("score", "score_of")],
+        state={"label": {"merge": "last"}},
+        tools=[score_of],
+        llm=MockLLM(lambda p: p.split(":")[0]),
+    )
+    assert [mas.run(query).output for query in ("cats", "", "kittens")] == ["zero", "no", "other"]
+    restored = MAS.from_dict(dict(mas.to_dict()), llm=MockLLM(lambda p: p), tools=[score_of])
+    assert [edge.case for edge in restored.edges] == [0, False, None]

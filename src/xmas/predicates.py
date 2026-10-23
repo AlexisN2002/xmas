@@ -124,6 +124,10 @@ class Predicate:
         """Return the registered callables the predicate calls; built-ins are not listed."""
         return frozenset(node[1] for node in _walk(self.tree) if node[0] == "call")
 
+    def calls(self) -> frozenset[tuple[str, int]]:
+        """Return each call of a registered callable as ``(name, number of arguments)``."""
+        return frozenset((node[1], len(node[2])) for node in _walk(self.tree) if node[0] == "call")
+
     def evaluate(self, ctx: Context) -> bool:
         """Return whether the predicate holds in ``ctx``.
 
@@ -437,9 +441,11 @@ def _compare(op: str, left: Any, right: Any) -> bool:
 
 
 def _equal(left: Any, right: Any) -> bool:
-    """Compare like JSON: a bool never equals a number, and lists compare item by item."""
+    """Compare like JSON: a bool never equals a number, and lists and objects compare item by item."""
     if isinstance(left, bool) != isinstance(right, bool):
         return False
     if isinstance(left, list | tuple) and isinstance(right, list | tuple):
         return len(left) == len(right) and all(_equal(a, b) for a, b in zip(left, right, strict=True))
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_equal(left[key], right[key]) for key in left)
     return bool(left == right)

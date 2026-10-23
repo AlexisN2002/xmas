@@ -71,7 +71,7 @@ class Edge:
     when: str | None = None
     max_visits: int | None = None
     switch: str | None = None
-    case: str | None = None
+    case: str | int | float | bool | None = None
     errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -91,7 +91,9 @@ class Edge:
             "errors": kind is EdgeKind.ERROR,
         }
         for name, needed in needs.items():
-            if bool(getattr(self, name)) != needed:
+            value = getattr(self, name)
+            given = value is not None if name in ("case", "max_visits") else bool(value)  # case 0 is a case
+            if given != needed:
                 state = "needs" if needed else "takes no"
                 raise ValueError(f"Edge {self.label}: a {kind.value} edge {state} {name!r}.")
         if self.max_visits is not None and self.max_visits < 1:
@@ -102,7 +104,9 @@ class Edge:
         """The edge as a spec names it, ``"a -> b"``."""
         return f"{self.source} {ARROW} {self.target}"
 
-    def as_tuple(self) -> tuple[str, str, str, str | None, int | None, str | None, str | None, tuple[str, ...]]:
+    def as_tuple(
+        self,
+    ) -> tuple[str, str, str, str | None, int | None, str | None, str | int | float | bool | None, tuple[str, ...]]:
         """Return every field as plain data, in field order (for cache keys)."""
         return (
             self.source,

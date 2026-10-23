@@ -119,6 +119,7 @@ def summarize(
     meter: RunMeter | None = None,
     settings: HealthSettings | None = None,
     while_edges: Iterable[tuple[str, str]] | None = None,
+    values: Iterable[str] | None = None,
 ) -> Health:
     """Read a run's records for the health signals.
 
@@ -132,13 +133,17 @@ def summarize(
         while_edges: The system's ``while`` edges as ``(source, target)``. When
             ``None`` they are read from the records: a route to a node that first
             ran before the deciding node first ran goes back, so it is a loop.
+        values: The system's value names (its inputs and every write). A
+            placeholder that names none of them is literal prompt text, which
+            renders as written, so it is not ``unfilled``. When ``None`` every
+            placeholder outside a record's inputs counts.
 
     Returns:
         The flags, loops and budget use.
     """
     settings = settings or HealthSettings()
     return Health(
-        flags=_flags(records, settings),
+        flags=_flags(records, settings, None if values is None else frozenset(values)),
         loops=_loops(records, while_edges),
         budget=_budget_use(budget, meter),
     )
@@ -150,11 +155,11 @@ def _text(record: AgentRecord) -> str:
 
 
 def _failed(record: AgentRecord) -> bool:
-    """Whether the record is of a visit that failed and was routed."""
+    """Whether the record is of a visit that failed."""
     return record.error is not None
 
 
-def _flags(records: Sequence[AgentRecord], settings: HealthSettings) -> tuple[Flag, ...]:
+def _flags(records: Sequence[AgentRecord], settings: HealthSettings, values: frozenset[str] | None) -> tuple[Flag, ...]:
     """Return every record's flags, in record order and :data:`SIGNALS` order within a record."""
     leaks = [re.compile(pattern) for pattern in (*DEFAULT_LEAKS, *settings.leak)]
     lengths: dict[str, list[int]] = {}
@@ -165,7 +170,7 @@ def _flags(records: Sequence[AgentRecord], settings: HealthSettings) -> tuple[Fl
     previous: dict[str, AgentRecord] = {}
     flags: list[Flag] = []
     for record in records:
-        found = _record_signals(record, previous.get(record.agent), leaks, medians.get(record.agent), settings)
+        found = _record_signals(record, previous.get(record.agent), leaks, medians.get(record.agent), settings, values)
         flags.extend(Flag(signal, record.agent, record.step, detail) for signal, detail in found)
         previous[record.agent] = record
     return tuple(flags)
@@ -177,6 +182,7 @@ def _record_signals(
     leaks: list[re.Pattern[str]],
     median: float | None,
     settings: HealthSettings,
+    values: frozenset[str] | None,
 ) -> list[tuple[str, str]]:
     """Return ``(signal, detail)`` for each signal one record shows."""
     found: list[tuple[str, str]] = []
@@ -185,15 +191,17 @@ def _record_signals(
     if record.error_kind == ErrorKind.BAD_FORMAT:
         found.append(("bad_format", "the answer did not match its form after the retry"))
     if _failed(record):
-        kind = "unknown" if record.error_kind is None else record.error_kind.value
-        found.append(("error_routed", f"{kind}: {record.error}"))
+        if record.route:  # an unrouted failure ended the run, and the trace's error says so
+            kind = "unknown" if record.error_kind is None else record.error_kind.value
+            found.append(("error_routed", f"{kind}: {record.error}"))
         return found
     text = _text(record)
     if not text.strip():
         found.append(("empty", "the output is empty"))
     elif before is not None and not _failed(before) and _text(before) == text:
         found.append(("stuck", f"the same output as step {before.step}"))
-    missing = sorted(extract_placeholders(record.prompt) - set(record.inputs))
+    placeholders = extract_placeholders(record.prompt)
+    missing = sorted((placeholders if values is None else placeholders & values) - set(record.inputs))
     if missing:
         found.append(("unfilled", f"placeholders without a value: {', '.join(missing)}"))
     for pattern in leaks:

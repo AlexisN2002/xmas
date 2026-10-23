@@ -309,7 +309,8 @@ class APILLM(promptolution.APILLM):
             requested calls in order, and the turn's metadata.
 
         Raises:
-            EmptyResponse: If no attempt's response had a choice.
+            EmptyResponse: If no attempt's response had a choice, or the model
+                was cut or refused before it wrote any text or call.
         """
         kwargs: dict[str, Any] = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
         kwargs.update(self._call_kwargs)
@@ -463,7 +464,9 @@ class APILLM(promptolution.APILLM):
 
         Raises:
             EmptyResponse: After the last attempt, with the kind of the last
-                finish reason and the paid attempts' meta.
+                finish reason and the paid attempts' meta; at once, with kind
+                ``length_cut`` or ``refusal``, when the model was cut or refused
+                before it wrote any text or call, as a plain answer is.
         """
         paid: CallMeta | None = None
         for attempt in range(self.max_retries + 1):
@@ -471,6 +474,13 @@ class APILLM(promptolution.APILLM):
             meta = meta_from_completion(completion, latency, self.price)
             paid = meta if paid is None else paid.combine(meta)
             if completion.choices:
+                message = completion.choices[0].message
+                if message.content is None and not message.tool_calls and meta.error_kind is not None:
+                    raise EmptyResponse(
+                        f"Empty content from model (finish_reason={meta.finish_reason}, refused={meta.refused})",
+                        kind=meta.error_kind,
+                        meta=paid,
+                    )
                 return completion, paid
             if attempt < self.max_retries:
                 time.sleep(self.retry_base_delay_s * (2**attempt))

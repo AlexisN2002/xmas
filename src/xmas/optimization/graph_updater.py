@@ -361,11 +361,17 @@ class GraphUpdater:
         return fed[0] if fed else None
 
     def weakest_agent(self, mas: MAS, credit: dict[str, list[float]]) -> str | None:
-        """Return the agent with the least credit, or None when there is none to go on."""
+        """Return the agent with the least credit, or None when there is none to go on.
+
+        Only an agent a candidate may rewire counts: a frozen agent, or one at a
+        conditional edge (:meth:`fixed_of`), is never the target.
+        """
+        fixed = self.fixed_of(mas)
+        held = frozenset() if fixed is None else fixed.nodes
         scored = {
             name: [value for value in values if not math.isnan(value)]
             for name, values in credit.items()
-            if name in mas.agents
+            if name in mas.agents and name not in held
         }
         usable = {name: values for name, values in scored.items() if values}
         if not usable:

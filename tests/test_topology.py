@@ -407,6 +407,11 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
         assert {("count", "judge"), ("publish", "final"), ("apology", "final")} <= set(proposer.edges_of(candidate))
         assert candidate.steps == branched.steps
 
+    # Credit never steers a topology candidate to the frozen judge, which no candidate may rewire.
+    credit = {"judge": [-1.0], "writer": [0.5], "planner": [0.2]}
+    assert updater(seed=2, budget=budget).weakest_agent(mas, credit) == "planner"
+    assert updater(seed=2, budget=budget).weakest_agent(mas, {"judge": [-1.0]}) is None
+
     # A prompt optimizer never picks the frozen judge, not even when it earned least.
     prompts = PromptUpdater(object, None)  # type: ignore[arg-type]
     assert prompts.target_agent(mas, {}) == "planner"

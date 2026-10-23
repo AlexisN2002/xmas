@@ -18,11 +18,12 @@ import pytest
 from xmas import MAS, Agent, Budget, ErrorKind, TokenUsage, ToolCall
 from xmas import runtime as engine
 from xmas.budget import RunMeter
-from xmas.errors import BadFormat
+from xmas.edges import Edge, EdgeKind
+from xmas.errors import BadFormat, EmptyResponse, XmasError
 from xmas.llms.meta import CallMeta
 from xmas.nodes import Step
 from xmas.schemas import RETRY_NOTE
-from xmas.tools import Tool, index_tools, tool
+from xmas.tools import Tool, ToolSource, index_tools, tool
 from xmas.trace import Rejected
 from xmas.values import JSON, TEXT
 
@@ -128,7 +129,7 @@ def test_a_step_runs_between_agents_with_typed_values() -> None:
     assert step.inputs == {"plan": plan_text}
     assert step.outputs == {"counts": '{"points": 2, "words": 4}'}
     assert step.raw_response == '{"points": 2, "words": 4}'
-    assert step.model is None and step.cost_usd is None and step.latency_s is not None
+    assert step.model is None and step.cost_usd == 0.0 and step.latency_s is not None  # a step makes no call
     assert writer.inputs == {"plan": plan_text, "counts": '{"points": 2, "words": 4}'}
     assert trace.output == "A note."
     assert trace.to_dict()["records"][1]["kind"] == "step"
@@ -297,3 +298,81 @@ def test_answer_form_retries_once_then_bad_format(case: str) -> None:
         again = MetaLLM(turns=[("Sure.", []), ("Sure!", [])])
         _, error = invoke(judge_mas(again, tools=[shout]), "this")
         assert isinstance(error, BadFormat) and error.problems == (PROSE, PROSE)
+
+
+def test_a_trace_costs_what_the_meter_paid() -> None:
+    """A step costs 0; a failed visit's record holds every paid call of the visit, retries and tool turns included."""
+    loud = Agent("writer", "Write {query}", output="draft")
+    mas = MAS(
+        [loud],
+        [("writer", "shout")],
+        steps=[Step("shout", "shout", {"text": "draft"})],
+        tools=[shout],
+        llm=MetaLLM(["a draft"]),
+    )
+    trace = mas.run("cats")
+    assert [(r.agent, r.cost_usd) for r in trace.records] == [("writer", 0.01), ("shout", 0.0)]
+    assert trace.cost_usd == pytest.approx(0.01) and trace.output == "A DRAFT!"
+
+    class CutRetry(MetaLLM):
+        """Answers outside the form, then is cut on the retry."""
+
+        def generate_with_meta(self, prompt: str, system_prompt: str = "") -> tuple[str, CallMeta]:
+            if "did not match" in prompt:
+                self.calls.append(prompt)
+                raise EmptyResponse("Empty content from model", kind=ErrorKind.LENGTH_CUT, meta=META)
+            return super().generate_with_meta(prompt, system_prompt)
+
+    class Refusing(ToolSource):
+        """Offers shout, and refuses every call of it."""
+
+        def tools(self) -> list[Tool]:
+            return [Tool("shout", "Shout.", {"type": "object", "properties": {"text": {"type": "string"}}})]
+
+        def call(self, name: str, arguments: dict[str, Any]) -> str:
+            raise XmasError("forbidden (403)", status=403)
+
+    sorry = Agent("sorry", "Sorry about {query}", output="said")
+    judge = Agent("judge", "Judge {query}", output="verdict", output_type="json", schema={"fits": {"type": "bool"}})
+    caller = Agent("judge", "Judge {query}", output="verdict", tools=["shout"])
+    cases = [
+        (judge, CutRetry(["Sure.", "We are sorry."]), (), ErrorKind.LENGTH_CUT, 0.02),
+        (
+            caller,
+            MetaLLM(["We are sorry."], turns=[("", [req("shout", '{"text": "hi"}')])]),
+            [Refusing()],
+            ErrorKind.REFUSAL,
+            0.01,
+        ),
+    ]
+    for agent, llm, tools, kind, paid in cases:
+        meter, _ = invoke(
+            MAS([agent, sorry], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("any",))], llm=llm, tools=tools), "cats"
+        )
+        failed, apology = meter.records
+        assert (failed.agent, failed.error_kind, failed.route) == ("judge", kind, ("sorry",))
+        calls = round(paid / 0.01)
+        assert failed.cost_usd == pytest.approx(paid) and failed.tokens == TokenUsage(10 * calls, 2 * calls)
+        assert apology.cost_usd == pytest.approx(0.01) and meter.cost_usd == pytest.approx(paid + 0.01)
+
+
+def test_optional_text_parameter_and_json_null() -> None:
+    @tool
+    def tidy(draft: str | None = None) -> str:
+        """Tidy a draft."""
+        return (draft or "").strip().upper()
+
+    assert tidy.reads == {"draft": TEXT}  # str | None reads text, so a text value may feed it
+    writer = Agent("writer", "Write {query}", output="draft")
+    mas = MAS([writer], [("writer", "tidy")], steps=[Step("tidy", "tidy")], tools=[tidy], llm=MetaLLM([" cats "]))
+    assert mas.run("q").output == "CATS"
+
+    # a json null is a value and renders as null (a value not there yet renders empty: test_v2_operators)
+    judge = Agent("judge", "Judge {query}", output="verdict", output_type="json")
+    reader = Agent("reader", "Read {verdict}", output="note", inputs=["verdict"])
+    llm = MetaLLM(["null", "noted"])
+    trace = MAS([judge, reader], [("judge", "reader")], llm=llm, inputs={"query": "text"}).run("q")
+    assert trace["judge"][0].outputs == {"verdict": "null"}
+    assert trace["reader"][0].inputs == {"verdict": "null"} and llm.calls[1] == "Read null"
+    alone = MAS([judge], llm=MetaLLM(["null"]), inputs={"query": "text"}).run("q")
+    assert alone.output == "null" and alone.health is not None and alone.health.flags == ()

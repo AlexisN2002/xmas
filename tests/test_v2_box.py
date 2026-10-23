@@ -114,3 +114,40 @@ def test_box_maps_in_and_out_and_nests_records() -> None:
     assert failed_box.kind == "box" and failed_box.error_kind == ErrorKind.TIMEOUT
     assert failed_box.error == "TimeoutError: the model took too long" and failed_box.route == ("apology",)
     assert [r.agent for r in routed.records] == ["writer", "shorten", "apology"]
+    assert failed_box.inner is not None and failed_box.inner.error == "TimeoutError: the model took too long"
+    assert [(r.agent, r.error_kind) for r in failed_box.inner.records] == [("cutter", ErrorKind.TIMEOUT)]
+
+
+def test_a_failed_box_keeps_its_inner_trace_and_cost() -> None:
+    """The inner system's paid calls before its failure stay in the box's failed record, and in the trace's cost."""
+    llm = FlakyLLM(["A draft.", "Cut.", "TIMEOUT", "Sorry."])
+    inner = MAS(
+        [
+            Agent("cutter", "Cut {page}", output="short", inputs=["page"]),
+            Agent("polish", "Polish {short}", output="final", inputs=["short"]),
+        ],
+        [("cutter", "polish")],
+        inputs={"page": "text"},
+        llm=llm,
+    )
+    outer = MAS(
+        [Agent("writer", "Write {query}", output="draft"), Agent("apology", "Sorry {query}", output="post")],
+        [("writer", "shorten"), Edge("shorten", "apology", EdgeKind.ERROR, errors=("timeout",))],
+        boxes=[Box("shorten", inner, reads={"page": "draft"}, writes={"final": "post"})],
+        state={"post": {"merge": "last"}},
+        llm=llm,
+    )
+    for _ in range(2):  # a second run on the same inner system shows only its own records
+        llm.answers = ["A draft.", "Cut.", "TIMEOUT", "Sorry."]
+        trace = outer.run("cats")
+        assert trace.error is None and trace.output == "Sorry."
+        (box,) = trace["shorten"]
+        assert box.inner is not None and [r.agent for r in box.inner.records] == ["cutter", "polish"]
+        assert box.inner.records[1].error_kind == ErrorKind.TIMEOUT and box.inner.error_kind == ErrorKind.TIMEOUT
+        assert box.cost_usd == pytest.approx(0.01) and box.tokens == TokenUsage(10, 2)
+        assert trace.cost_usd == pytest.approx(0.03)  # writer, cutter and apology: what the meter paid
+        assert [(path, r.agent) for path, r in trace.walk()][1:4] == [
+            ((), "shorten"),
+            (("shorten",), "cutter"),
+            (("shorten",), "polish"),
+        ]

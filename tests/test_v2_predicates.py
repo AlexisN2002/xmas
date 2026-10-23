@@ -14,6 +14,9 @@ VALUES: dict[str, Any] = {
     "draft": "A short draft.",
     "count": 0,
     "nothing": None,
+    "flags": {"a": True, "b": [False]},
+    "ones": {"a": 1, "b": [0]},
+    "same": {"b": [False], "a": True},
 }
 
 
@@ -37,6 +40,7 @@ EVALUATE = [
     ("verdict.missing == null and nothing == null and verdict.deep.deeper == null", True, {"verdict", "nothing"}),
     ("count or nothing or verdict.fits or verdict.missing", False, {"count", "nothing", "verdict"}),
     ("true == 1 or false == 0 or [1, 'a'] != [1, 'a']", False, set()),
+    ("flags != ones and flags == same", True, {"flags", "ones", "same"}),  # a bool never equals a number, nested too
     ("is_long(draft) and not is_long('short')", True, {"draft"}),
     ("verdict.score > -1.5 and verdict.action < 'z' and (count == 0 or count == 1)", True, {"verdict", "count"}),
 ]

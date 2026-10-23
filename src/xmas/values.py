@@ -92,9 +92,10 @@ def parse_type(text: str) -> ValueType:
 def type_of_hint(hint: Any) -> ValueType:
     """Return the value type of a callable's parameter or return value.
 
-    ``str`` is text and anything else is json. A JSON-schema mapping, as a remote
-    tool describes its parameters, is text for ``{"type": "string"}`` and json
-    otherwise.
+    ``str`` is text and anything else is json, so a ``str | None`` return is
+    json (``None`` is a json value). A JSON-schema mapping, as a tool describes
+    its parameters, is text for ``{"type": "string"}`` and for a string that
+    may be null (a ``str | None`` parameter), and json otherwise.
 
     Args:
         hint: A Python type hint (``Annotated`` is unwrapped) or a JSON-schema
@@ -104,23 +105,29 @@ def type_of_hint(hint: Any) -> ValueType:
         :data:`TEXT` or :data:`JSON`.
     """
     if isinstance(hint, dict):
-        return TEXT if hint.get("type") == "string" else JSON
+        kinds: set[Any] = set()
+        for option in hint.get("anyOf") or [hint]:
+            kind = option.get("type") if isinstance(option, dict) else None
+            kinds.update(kind if isinstance(kind, list) else [kind])
+        return TEXT if "string" in kinds and kinds <= {"string", "null"} else JSON
     if typing.get_origin(hint) is typing.Annotated:
         hint = typing.get_args(hint)[0]
     return TEXT if hint is str else JSON
 
 
-def render_value(value: Any, vtype: ValueType) -> str:
+def render_value(value: Any, vtype: ValueType, *, present: bool = True) -> str:
     """Render a value as the text a prompt, a record or a trace output shows.
 
-    A missing value (``None``) renders as ``""``; text renders as itself; json
-    and lists render as one line of ``json.dumps(value, ensure_ascii=False)``
-    with the keys in the order the value has them, so ``0``, ``false`` and
-    ``[]`` show as JSON.
+    Text renders as itself; json and lists render as one line of
+    ``json.dumps(value, ensure_ascii=False)`` with the keys in the order the
+    value has them, so ``0``, ``false``, ``[]`` and a json ``null`` show as
+    JSON. A missing value renders as ``""``: the caller says so with
+    ``present=False``, or passes ``None`` for a text value.
 
     Args:
-        value: The value, or ``None`` when it is missing.
+        value: The value.
         vtype: Its type.
+        present: Whether the value is there at all; ``False`` renders ``""``.
 
     Returns:
         The text.
@@ -128,7 +135,7 @@ def render_value(value: Any, vtype: ValueType) -> str:
     Raises:
         ValueError: If ``vtype`` is not in :data:`AVAILABLE` and not a list.
     """
-    if value is None:
+    if not present or (value is None and vtype == TEXT):
         return ""
     if vtype == TEXT:
         return value if isinstance(value, str) else str(value)

@@ -38,7 +38,7 @@ RECORDS = (
     rec("w", 8, "f" * 3),  # the median divided by 3: not short
     rec("w", 9, "g" * 2),  # just under: short
     rec("pub", 10, " \n", prompt="Publish {draft} for {reader}", inputs={"draft": ""}),
-    rec("count", 11, None, error_kind=ErrorKind.BAD_FORMAT, error="count: the answer was not JSON"),
+    rec("count", 11, None, error_kind=ErrorKind.BAD_FORMAT, error="count: the answer was not JSON", route=("sorry",)),
     rec("few", 12, "x"),  # two samples: under min_samples, no median
     rec("few", 13, "y" * 100),
     rec("leaky", 14, "Done <|im_end|>"),
@@ -94,6 +94,18 @@ def test_signals() -> None:
     assert summarize(secret).flags == ()
     assert [flag.detail for flag in summarize(secret, settings=HealthSettings(leak=("SECRET",))).flags] == [
         "the output holds 'SECRET'"
+    ]
+
+    # an unrouted failure ended the run: no error_routed flag (the trace's error says it)
+    unrouted = rec("fetch", 0, None, error_kind=ErrorKind.OUTAGE, error="ConnectionError: the server is down")
+    assert summarize([unrouted]).flags == ()
+
+    # unfilled counts only placeholders that name a value of the system; a literal {answer} is prompt text
+    prompt = 'Reply as {"answer": ...} with {answer} in {query}'
+    literal = [rec("solver", 0, "42", prompt=prompt, inputs={"query": "q"})]
+    assert summarize(literal, values={"query", "out"}).flags == ()
+    assert [(flag.signal, flag.detail) for flag in summarize(literal, values={"query", "answer"}).flags] == [
+        ("unfilled", "placeholders without a value: answer")
     ]
 
     healthy = summarize([rec("w", 0, "a draft", prompt="Write {query}", inputs={"query": "cats"}), rec("j", 1, "ok")])

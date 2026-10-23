@@ -10,10 +10,10 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from xmas.errors import BudgetExceeded
-from xmas.trace import AgentRecord
+from xmas.trace import AgentRecord, Trace
 
 if TYPE_CHECKING:
     from xmas.llms.meta import CallMeta
@@ -184,3 +184,48 @@ class RunMeter:
         """
         with self._lock:
             self.records_of(self.owner if system is None else system).append(record)
+
+
+class VisitMeter:
+    """One node visit's share of a run's meter.
+
+    Every call counts on the run's meter as before; the visit also keeps the
+    metadata of its own finished calls, so a visit that fails after paid
+    attempts still records what they cost. A box's visit keeps the trace of its
+    inner system when that fails.
+
+    Attributes:
+        run: The run's meter.
+        metas: The metadata of the visit's finished calls, in order; ``None``
+            for a call whose model gives none.
+        inner: The inner system's trace of a box whose inner system failed.
+    """
+
+    def __init__(self, run: RunMeter) -> None:
+        """Start a visit with no call made."""
+        self.run = run
+        self.metas: list[CallMeta | None] = []
+        self.inner: Trace | None = None
+
+    def before_call(self) -> None:
+        """Count a call that is about to start on the run's meter, or refuse it (:meth:`RunMeter.before_call`)."""
+        self.run.before_call()
+
+    def check_boundary(self) -> None:
+        """Check the run's wall and cost limits (:meth:`RunMeter.check_boundary`)."""
+        self.run.check_boundary()
+
+    def after_call(self, meta: CallMeta | None) -> None:
+        """Count a finished call on the run's meter and keep its metadata for the visit."""
+        self.run.after_call(meta)
+        self.metas.append(meta)
+
+    @property
+    def meta(self) -> CallMeta | None:
+        """The visit's calls combined, or ``None`` when it made none or a model gave none."""
+        if not self.metas or any(meta is None for meta in self.metas):
+            return None
+        first, *rest = cast("list[CallMeta]", self.metas)
+        for meta in rest:
+            first = first.combine(meta)
+        return first

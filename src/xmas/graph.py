@@ -56,7 +56,10 @@ def _reachable(graph: nx.DiGraph[str], source: str, *, forward: bool) -> set[str
 
 
 def build_graph(
-    agents: list[str], edges: list[tuple[str, str]], back: Collection[tuple[str, str]] = ()
+    agents: list[str],
+    edges: list[tuple[str, str]],
+    back: Collection[tuple[str, str]] = (),
+    errors: Collection[tuple[str, str]] = (),
 ) -> nx.DiGraph[str]:
     """Build the topology for a set of agents and the edges between them.
 
@@ -64,7 +67,9 @@ def build_graph(
     no outgoing edge to :data:`END`, so the caller writes only the edges that
     carry meaning. An edge in ``back`` (a version 2 ``while`` edge) closes a
     loop and does not count as incoming: the loop's first node is still wired
-    from :data:`START`.
+    from :data:`START`. An edge in ``errors`` (a version 2 ``on error`` edge)
+    is taken only when a visit fails, so a node whose out-edges are all error
+    edges is wired to :data:`END` as well: a visit that succeeds ends there.
 
     Args:
         agents: Node names, agents and steps alike, which become the
@@ -72,6 +77,7 @@ def build_graph(
         edges: Directed ``(source, target)`` pairs between agent names. Sentinels
             may be named explicitly to override the implicit wiring.
         back: Those of ``edges`` that close a loop.
+        errors: Those of ``edges`` that only a failed visit takes.
 
     Returns:
         The topology, including both sentinels.
@@ -102,7 +108,7 @@ def build_graph(
     for agent in agents:
         if not any((source, agent) not in back for source in graph.predecessors(agent)):
             graph.add_edge(START, agent)
-        if graph.out_degree(agent) == 0:
+        if not any((agent, target) not in errors for target in graph.successors(agent)):
             graph.add_edge(agent, END)
 
     return graph
@@ -320,11 +326,17 @@ class RouteGraph:
             route = (edge.source, _FAIL if edge.kind is EdgeKind.ERROR else _CHOOSE, edge.target)
             graph.add_edge(head, route, kind="route")
             graph.add_edge(route, edge.target, kind="plain")
-        sources = {edge.source for edge in edges}
+        sources = {edge.source for edge in edges if edge.kind is not EdgeKind.ERROR}
         for name in self.nodes:
             if graph.in_degree(name) == 0:
                 graph.add_edge(START, name, kind="plain")
-            if name not in sources:
+            if name in sources:
+                continue
+            if name in failing:  # only error edges: a visit that succeeds ends the run
+                ok = (name, _FAIL, _OK)
+                graph.add_edge(name, ok, kind="route")
+                graph.add_edge(ok, END, kind="plain")
+            else:
                 graph.add_edge(name, END, kind="plain")
         if not nx.is_directed_acyclic_graph(graph):
             raise ValueError(f"{LOOP_REFUSAL}: the edges other than while edges form a cycle")

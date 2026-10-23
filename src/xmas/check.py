@@ -170,8 +170,11 @@ def _edge_problems(edges: tuple[Edge, ...], endpoints: set[str]) -> tuple[list[s
                 f"node {source!r} has {deciding[source]} when, while or switch edges and {elses[source]} else edges; "
                 "a deciding node needs at least one of the first and exactly one else"
             )
-    cases = Counter((e.source, e.case) for e in edges if e.kind is EdgeKind.SWITCH)
-    problems.extend(f"node {source!r} switches to case {case!r} twice" for (source, case), n in cases.items() if n > 1)
+    # a bool never equals a number, as predicates compare: case false and case 0 are two cases
+    cases = Counter((e.source, isinstance(e.case, bool), e.case) for e in edges if e.kind is EdgeKind.SWITCH)
+    problems.extend(
+        f"node {source!r} switches to case {case!r} twice" for (source, _, case), n in cases.items() if n > 1
+    )
     return problems, parsed, len(pairs) == len(edges)
 
 
@@ -272,7 +275,8 @@ def check_system(mas: MAS) -> SystemInfo:
     joins: dict[str, Join] = {}
     if buildable:
         loops = [(edge.source, edge.target) for edge in mas.edges if edge.kind is EdgeKind.WHILE]
-        graph = build_graph(list(nodes), [(edge.source, edge.target) for edge in mas.edges], back=loops)
+        errors = [(edge.source, edge.target) for edge in mas.edges if edge.kind is EdgeKind.ERROR]
+        graph = build_graph(list(nodes), [(edge.source, edge.target) for edge in mas.edges], back=loops, errors=errors)
         try:
             validate_graph(graph)
         except ValueError as exc:
@@ -353,6 +357,15 @@ def check_system(mas: MAS) -> SystemInfo:
                                 )
                 for function in sorted(predicate.functions() - registered):
                     problems.append(f"edge {edge.label} calls {function!r}, which is no registered callable")
+                for function, count in sorted(predicate.calls()):
+                    if function not in registered:
+                        continue
+                    takes = list(mas._callables()[function][0].reads)
+                    if count != len(takes):
+                        problems.append(
+                            f"edge {edge.label} calls {function!r} with {count} argument{'s' * (count != 1)}, "
+                            f"but it takes {len(takes)} ({', '.join(takes) or 'none'})"
+                        )
 
     for value, names in writers.items():
         count = len(names) + (value in mas.inputs)

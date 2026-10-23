@@ -52,7 +52,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from promptolution.llms.base_llm import BaseLLM
 
     from xmas.agent import Agent
-    from xmas.budget import RunMeter
+    from xmas.budget import RunMeter, VisitMeter
     from xmas.llms.meta import CallMeta, SupportsMeta
 
 DEDUPE_TOOL_CALLS = True
@@ -253,7 +253,8 @@ class LocalTools(ToolSource):
 
         Raises:
             XmasError: If the tool is unknown, the arguments are invalid, or the
-                function raised.
+                function raised. ``BudgetExceeded`` and ``Stopped`` raised by the
+                function pass through unwrapped, since they end the run.
         """
         spec = self.by_name.get(name)
         if spec is None:
@@ -261,6 +262,8 @@ class LocalTools(ToolSource):
         kwargs = spec.validate(arguments)
         try:
             result = spec(**kwargs)
+        except (BudgetExceeded, Stopped):
+            raise
         except Exception as exc:
             raise XmasError(f"{type(exc).__name__}: {exc}") from exc
         return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
@@ -511,7 +514,7 @@ def run_tool_loop(
     max_rounds: int,
     system_prompt: str,
     count_tokens: Callable[[str], float],
-    meter: RunMeter | None = None,
+    meter: RunMeter | VisitMeter | None = None,
     check: Callable[[str], str | None] | None = None,
 ) -> tuple[str, tuple[ToolCall, ...], TokenUsage, CallMeta | None]:
     """Answer one rendered prompt, letting the model call tools.

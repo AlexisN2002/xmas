@@ -275,7 +275,8 @@ class MAS(BasePredictor):
             # The check builds and checks the topology itself, so that a bad edge
             # is one problem in the list rather than the first and only error.
             self.info = check_system(self)
-            self.graph = build_graph(names, pairs, back=self.while_edges)
+            errors = [(edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.ERROR]
+            self.graph = build_graph(names, pairs, back=self.while_edges, errors=errors)
             return
         for agent in agents:  # fail at construction, not mid-run
             if agent.tools:

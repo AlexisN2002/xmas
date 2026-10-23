@@ -18,7 +18,7 @@ from pydantic import Field
 
 import xmas.tools
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
-from xmas.errors import XmasError, classify
+from xmas.errors import Stopped, XmasError, classify
 from xmas.llms.api_llm import APILLM
 from xmas.llms.call_log import CallLog
 from xmas.optimization.graph_updater import GraphUpdater
@@ -713,6 +713,28 @@ def test_api_llm_records_a_failed_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(RuntimeError, match="down"):
         llm.get_tool_response([{"role": "user", "content": "hi"}], [add])
     assert log.records[-1].ok is False
+
+
+def test_a_cut_tool_turn_fails_as_a_cut_plain_answer_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    cut = completion(None)
+    cut.choices[0].finish_reason = "length"
+    llm, sent, log = api_llm(monkeypatch, [cut])
+    trace = MAS(agents=[coder(["add"])], llm=llm, tools=[add]).run("q")
+    assert trace.error_kind == ErrorKind.LENGTH_CUT and trace.output == ""
+    assert trace.error is not None and trace.error.startswith("EmptyResponse: Empty content from model")
+    assert len(sent) == 1 and log.records[-1].ok is False  # sent once: the same request would be cut again
+
+
+def test_stopped_in_a_local_tool_stops_the_run() -> None:
+    @tool
+    def slow(text: str) -> str:
+        """Work slowly, until Stop is pressed."""
+        raise Stopped("stop pressed")
+
+    llm = ToolMockLLM([("", [req("slow", '{"text": "x"}')]), ("finished anyway", [])])
+    trace = MAS(agents=[coder(["slow"])], llm=llm, tools=[slow]).run("q")
+    assert trace.error_kind == ErrorKind.STOPPED and trace.output == ""
+    assert trace.error == "Stopped: stop pressed"
 
 
 def test_api_llm_tool_turn_records_carry_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
