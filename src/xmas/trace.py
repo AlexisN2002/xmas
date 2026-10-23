@@ -5,17 +5,16 @@ is modelled as data rather than as a log: every field is a plain value, the whol
 structure round-trips through :meth:`Trace.to_dict`, and nothing in it is
 formatted for human reading.
 
-The plain-data form stays readable by v1 readers: every v1 key is always emitted,
-in v1 order, and a newer key appears only when its value is set. Enum values are
-emitted as plain strings, so both ``json.dumps`` and ``yaml.safe_dump`` accept the
-dicts.
+In the plain-data form a record's first ten keys are always emitted, in order,
+and every later key only when its value is set. Enum values are emitted as plain
+strings, so both ``json.dumps`` and ``yaml.safe_dump`` accept the dicts.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any, cast
 
 from xmas.errors import ErrorKind, RunStatus, status_for
 
@@ -91,12 +90,7 @@ class ToolCall:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form."""
-        return {
-            "tool": self.tool,
-            "arguments": dict(self.arguments),
-            "result": self.result,
-            "failed": self.failed,
-        }
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -113,7 +107,7 @@ class Rejected:
 
     def to_dict(self) -> dict[str, str]:
         """Return the plain-data form."""
-        return {"raw_response": self.raw_response, "error": self.error}
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -178,7 +172,7 @@ class AgentRecord:
     inner: Trace | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the plain-data form: the ten v1 keys, then each newer field that is set.
+        """Return the plain-data form: the first ten fields, then each later field that is set.
 
         ``kind`` is set when it is not ``"agent"``, ``rejected`` when it is not
         empty and ``capped`` when it is true.
@@ -195,7 +189,7 @@ class AgentRecord:
             "model": self.model,
             "raw_response": self.raw_response,
         }
-        newer = {
+        later = {
             "latency_s": self.latency_s,
             "cost_usd": self.cost_usd,
             "tokens": None if self.tokens is None else self.tokens.to_dict(),
@@ -209,7 +203,7 @@ class AgentRecord:
             "capped": self.capped or None,
             "inner": None if self.inner is None else self.inner.to_dict(),
         }
-        data.update((key, value) for key, value in newer.items() if value is not None)
+        data.update((key, value) for key, value in later.items() if value is not None)
         return data
 
 
@@ -265,19 +259,12 @@ class Trace:
     @property
     def agents(self) -> tuple[str, ...]:
         """Names of the agents that ran, in first-execution order."""
-        names: list[str] = []
-        for record in self.records:
-            if record.agent not in names:
-                names.append(record.agent)
-        return tuple(names)
+        return tuple(dict.fromkeys(record.agent for record in self.records))
 
     @property
     def usage(self) -> TokenUsage:
         """Token usage summed over every record."""
-        total = TokenUsage()
-        for record in self.records:
-            total = total + record.usage
-        return total
+        return sum((record.usage for record in self.records), TokenUsage())
 
     @property
     def failed(self) -> bool:
@@ -291,20 +278,17 @@ class Trace:
 
     @property
     def cost_usd(self) -> float | None:
-        """The records' costs summed, or ``None`` when there is no record or any record's cost is unknown."""
-        if not self.records:  # nothing ran, or nothing finished: unknown, not 0
-            return None
-        total = 0.0
-        for record in self.records:
-            if record.cost_usd is None:
-                return None
-            total += record.cost_usd
-        return total
+        """The records' costs summed, or ``None`` when there is no record or any record's cost is unknown.
+
+        A cost is never guessed as ``0``: nothing that ran, or one unknown part, makes the sum unknown.
+        """
+        costs = [record.cost_usd for record in self.records]
+        return None if not costs or None in costs else sum(cast("list[float]", costs))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form, suitable for JSON or YAML.
 
-        The four v1 keys come first. ``"status"`` follows only for a failed run,
+        ``query``, ``output``, ``records`` and ``error`` come first. ``"status"`` follows only for a failed run,
         so it is never ``"ok"``, ``"error_kind"`` only when it is known, and
         ``"health"`` only when it reports something. A reader that finds no
         ``"status"`` reads ``"ok"`` when ``error`` is null and ``"failed"``
