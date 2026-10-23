@@ -6,8 +6,9 @@ data (``dict`` with ``str`` keys, ``list``, ``str``, ``int``, ``float``,
 version 1 state of strings stays a valid version 2 state of text.
 
 :func:`parse_type` reads every type word of the format, but only the types in
-:data:`AVAILABLE` run today; the others arrive in phase 3 and need no format
-change. This is a leaf module: it imports no other xmas module.
+:data:`AVAILABLE` run: :func:`xmas.check.check_system` refuses the others before
+a value of theirs is rendered or checked. This is a leaf module: it imports no
+other xmas module.
 """
 
 from __future__ import annotations
@@ -22,17 +23,13 @@ KINDS = ("text", "json", "image", "audio", "document", "table", "file")
 """Every value kind of the format; ``list of <kind>`` builds on them."""
 
 _LIST = "list"
-_LIST_PREFIX = "list of "
+LIST_PREFIX = "list of "
+"""How a list type starts, in value types and in answer forms alike."""
 
 
 @dataclass(frozen=True)
 class ValueType:
-    """The type of one value.
-
-    Attributes:
-        kind: One of :data:`KINDS`, or ``"list"`` for a list.
-        item: The type of a list's items; ``None`` for every other kind.
-    """
+    """The type of one value: ``kind`` is one of :data:`KINDS`, or ``"list"`` with ``item`` its items' type."""
 
     kind: str
     item: ValueType | None = None
@@ -49,7 +46,7 @@ class ValueType:
 
     def __str__(self) -> str:
         """Return the type as the spec writes it, such as ``list of text``."""
-        return f"{_LIST_PREFIX}{self.item}" if self.item is not None else self.kind
+        return f"{LIST_PREFIX}{self.item}" if self.item is not None else self.kind
 
 
 TEXT = ValueType("text")
@@ -59,8 +56,8 @@ JSON = ValueType("json")
 """Plain JSON data."""
 
 AVAILABLE = frozenset({TEXT, JSON})
-"""The value types a system may use today. A set of :class:`ValueType`, so
-``list of text`` is not in it: lists, like images, arrive in phase 3."""
+"""The value types a system may use. A set of :class:`ValueType`, so ``list of
+text`` is not in it."""
 
 _BUILT_INS = ("visits", "cost", "elapsed", "exists", "len", "true", "false", "null", "and", "or", "not", "in")
 
@@ -70,39 +67,23 @@ starting with ``__`` belong to xmas as well."""
 
 
 def parse_type(text: str) -> ValueType:
-    """Read a type as the spec writes it.
-
-    Args:
-        text: A kind, such as ``"json"``, or ``"list of <type>"``.
-
-    Returns:
-        The type.
-
-    Raises:
-        ValueError: If the text names no type.
-    """
+    """Read a type as the spec writes it, such as ``"json"`` or ``"list of text"``; ValueError if it names none."""
     if not isinstance(text, str):
         raise ValueError(f"A value type is a string such as 'text', not {text!r}.")
     words = text.strip()
-    if words.startswith(_LIST_PREFIX):
-        return ValueType(_LIST, parse_type(words[len(_LIST_PREFIX) :]))
+    if words.startswith(LIST_PREFIX):
+        return ValueType(_LIST, parse_type(words[len(LIST_PREFIX) :]))
     return ValueType(words)
 
 
 def type_of_hint(hint: Any) -> ValueType:
     """Return the value type of a callable's parameter or return value.
 
-    ``str`` is text and anything else is json, so a ``str | None`` return is
-    json (``None`` is a json value). A JSON-schema mapping, as a tool describes
-    its parameters, is text for ``{"type": "string"}`` and for a string that
-    may be null (a ``str | None`` parameter), and json otherwise.
-
-    Args:
-        hint: A Python type hint (``Annotated`` is unwrapped) or a JSON-schema
-            mapping.
-
-    Returns:
-        :data:`TEXT` or :data:`JSON`.
+    ``str`` (``Annotated`` unwrapped) is text and anything else is json, so a
+    ``str | None`` return is json (``None`` is a json value). A JSON-schema
+    mapping, as a tool describes its parameters, is text for
+    ``{"type": "string"}`` and for a string that may be null (a ``str | None``
+    parameter), and json otherwise.
     """
     if isinstance(hint, dict):
         kinds: set[Any] = set()
@@ -118,56 +99,24 @@ def type_of_hint(hint: Any) -> ValueType:
 def render_value(value: Any, vtype: ValueType, *, present: bool = True) -> str:
     """Render a value as the text a prompt, a record or a trace output shows.
 
-    Text renders as itself; json and lists render as one line of
+    Text renders as itself; json renders as one line of
     ``json.dumps(value, ensure_ascii=False)`` with the keys in the order the
     value has them, so ``0``, ``false``, ``[]`` and a json ``null`` show as
     JSON. A missing value renders as ``""``: the caller says so with
     ``present=False``, or passes ``None`` for a text value.
-
-    Args:
-        value: The value.
-        vtype: Its type.
-        present: Whether the value is there at all; ``False`` renders ``""``.
-
-    Returns:
-        The text.
-
-    Raises:
-        ValueError: If ``vtype`` is not in :data:`AVAILABLE` and not a list.
     """
     if not present or (value is None and vtype == TEXT):
         return ""
     if vtype == TEXT:
         return value if isinstance(value, str) else str(value)
-    if vtype.kind in (JSON.kind, _LIST):
-        return json.dumps(value, ensure_ascii=False)
-    raise ValueError(f"type {str(vtype)!r} arrives in phase 3")
+    return json.dumps(value, ensure_ascii=False)
 
 
 def check_value(value: Any, vtype: ValueType) -> str | None:
-    """Say what is wrong with a value for its type.
-
-    Args:
-        value: The value a node wrote.
-        vtype: The type the system declares for it.
-
-    Returns:
-        ``None`` when the value fits, else one line naming the problem, such as
-        ``"expected text, got int"`` or ``"not JSON at counts.words: set"``.
-    """
+    """Return ``None`` when a value fits its type, else one line such as ``"not JSON at counts.words: set"``."""
     if vtype == TEXT:
         return None if isinstance(value, str) else f"expected text, got {type(value).__name__}"
-    if vtype == JSON:
-        return _json_problem(value, "")
-    if vtype.item is not None:
-        if not isinstance(value, list):
-            return f"expected {vtype}, got {type(value).__name__}"
-        for index, item in enumerate(value):
-            problem = check_value(item, vtype.item)
-            if problem is not None:
-                return f"item {index}: {problem}"
-        return None
-    return f"type {str(vtype)!r} arrives in phase 3"
+    return _json_problem(value, "")
 
 
 def _json_problem(value: Any, path: str) -> str | None:

@@ -43,6 +43,7 @@ BUILTINS = frozenset({"exists", "len", "visits", "cost", "elapsed"})
 """Names that are built-ins, never values or registered callables."""
 
 _KEYWORDS = frozenset({"and", "or", "not", "in", "true", "false", "null"})
+_LITERALS = {"true": True, "false": False, "null": None}
 _COMPARISONS = frozenset({"==", "!=", "<", "<=", ">", ">=", "in", "not in"})
 _TOKEN = re.compile(
     r"""(?P<space>\s+)
@@ -60,11 +61,9 @@ class PredicateError(ValueError):
 
     A ``ValueError``, like every other refusal of a system's shape, because
     ``check_system`` parses each predicate when the system is built; evaluation
-    raises it only for a call no registered callable answers.
-
-    Attributes:
-        position: The zero-based character position of the problem, or ``None``
-            when it is not about one place in the text.
+    raises it only for a call no registered callable answers. ``position`` is
+    the zero-based character position of the problem, or ``None`` when it is
+    not about one place in the text.
     """
 
     def __init__(self, message: str, position: int | None = None) -> None:
@@ -77,15 +76,11 @@ class PredicateError(ValueError):
 class Context:
     """What a predicate can see when it is evaluated.
 
-    Attributes:
-        values: The run's values, by name; json values are plain JSON data.
-        visits: How often each node has run, the deciding node's current visit
-            counted.
-        node: The deciding node, which bare ``visits`` refers to.
-        cost_usd: USD spent so far, or ``None`` when unknown.
-        elapsed_s: Wall seconds so far, or ``None`` when unknown.
-        call: Calls a registered callable by name with its arguments and returns
-            its bool, or ``None`` when no callable is registered.
+    ``visits`` counts each node's runs, the deciding node's current visit
+    included; ``node`` is the deciding node, which bare ``visits`` refers to;
+    ``cost_usd`` and ``elapsed_s`` are ``None`` when unknown; ``call`` calls a
+    registered callable by name and returns its bool, or is ``None`` when no
+    callable is registered.
     """
 
     values: Mapping[str, Any]
@@ -98,15 +93,13 @@ class Context:
 
 @dataclass(frozen=True)
 class Predicate:
-    """A parsed predicate.
+    """A parsed predicate: its ``text`` and its syntax ``tree``.
 
-    Attributes:
-        text: The text it was parsed from.
-        tree: The syntax tree, as nested tuples: ``("lit", value)``,
-            ``("path", names)``, ``("call", name, args)``, ``("exists", names)``,
-            ``("len", arg)``, ``("visits", node or None)``, ``("cost",)``,
-            ``("elapsed",)``, ``("not", arg)``, ``("and", args)``,
-            ``("or", args)`` and ``("cmp", op, left, right)``.
+    The tree is nested tuples: ``("lit", value)``, ``("path", names)``,
+    ``("call", name, args)``, ``("exists", names)``, ``("len", arg)``,
+    ``("visits", node or None)``, ``("cost",)``, ``("elapsed",)``,
+    ``("not", arg)``, ``("and", args)``, ``("or", args)`` and
+    ``("cmp", op, left, right)``.
     """
 
     text: str
@@ -129,18 +122,7 @@ class Predicate:
         return frozenset((node[1], len(node[2])) for node in _walk(self.tree) if node[0] == "call")
 
     def evaluate(self, ctx: Context) -> bool:
-        """Return whether the predicate holds in ``ctx``.
-
-        Args:
-            ctx: The values, visits, spend and callables to evaluate against.
-
-        Returns:
-            The predicate's truth value.
-
-        Raises:
-            PredicateError: If a called function is not registered or its
-                result is not a bool.
-        """
+        """Return whether the predicate holds in ``ctx``; a call that is not registered or returns no bool raises."""
         return bool(_eval(self.tree, ctx))
 
     def __str__(self) -> str:
@@ -149,18 +131,7 @@ class Predicate:
 
 
 def parse_predicate(text: str) -> Predicate:
-    """Parse a predicate.
-
-    Args:
-        text: The predicate, at most 500 characters.
-
-    Returns:
-        The parsed predicate.
-
-    Raises:
-        PredicateError: If the text is empty, too long, too deep, holds a
-            character outside the grammar, or does not parse.
-    """
+    """Parse a predicate, raising :class:`PredicateError` with the position of the first problem."""
     if len(text) > MAX_LENGTH:
         raise PredicateError(f"predicate is {len(text)} characters long, {MAX_LENGTH} at most")
     parser = _Parser(text, _tokenize(text))
@@ -259,10 +230,8 @@ class _Parser:
     def atom(self) -> tuple[Any, ...]:
         """Parse a literal, a list, a call, a path or a bracketed expression."""
         kind, value, position = self.take()
-        if kind == "number":
-            return ("lit", float(value) if "." in value else int(value))
-        if kind == "string":
-            return ("lit", value[1:-1])
+        if (literal := _literal(kind, value)) is not _MISSING:
+            return ("lit", literal)
         if value == "(":
             self.enter(position)
             inner = self.expr()
@@ -274,11 +243,7 @@ class _Parser:
             items = self.literals()
             self.depth -= 1
             return ("lit", items)
-        if kind != "name":
-            raise PredicateError(f"unexpected {value!r}", position)
-        if value in ("true", "false", "null"):
-            return ("lit", {"true": True, "false": False, "null": None}[value])
-        if value in _KEYWORDS:
+        if kind != "name" or value in _KEYWORDS:
             raise PredicateError(f"unexpected {value!r}", position)
         if value.startswith("__"):
             raise PredicateError(f"names starting '__' belong to xmas: {value!r}", position)
@@ -299,14 +264,9 @@ class _Parser:
             if items:
                 self.take(",")
             kind, value, position = self.take()
-            if kind == "number":
-                items.append(float(value) if "." in value else int(value))
-            elif kind == "string":
-                items.append(value[1:-1])
-            elif value in ("true", "false", "null"):
-                items.append({"true": True, "false": False, "null": None}[value])
-            else:
+            if (literal := _literal(kind, value)) is _MISSING:
                 raise PredicateError(f"a list holds literals only, got {value!r}", position)
+            items.append(literal)
         self.take("]")
         return items
 
@@ -345,6 +305,15 @@ class _Parser:
         if name == "visits":
             return ("visits", args[0][1][0])
         return ("call", name, tuple(args))
+
+
+def _literal(kind: str, value: str) -> Any:
+    """Return the value of a number, string, ``true``, ``false`` or ``null`` token, else ``_MISSING``."""
+    if kind == "number":
+        return float(value) if "." in value else int(value)
+    if kind == "string":
+        return value[1:-1]
+    return _LITERALS.get(value, _MISSING) if kind == "name" else _MISSING
 
 
 def _walk(tree: tuple[Any, ...]) -> list[tuple[Any, ...]]:

@@ -28,6 +28,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, create_model
 
 from xmas.errors import ErrorKind
+from xmas.values import LIST_PREFIX
 
 RETRY_NOTE = "Your previous answer did not match the required format: {problem}\nAnswer again with only the JSON."
 """Appended to the prompt of the one retry; ``{problem}`` is the first problem."""
@@ -35,19 +36,13 @@ RETRY_NOTE = "Your previous answer did not match the required format: {problem}\
 _BASE: dict[str, Any] = {"text": str, "bool": bool, "int": int, "number": float, "json": Any}
 _WORDS = {"text": "text", "bool": "true or false", "int": "integer", "number": "number", "json": "any JSON"}
 _OBJECT = "object"
-_LIST_PREFIX = "list of "
 _KEYS = frozenset({"type", "means", "optional", "one of", "fields"})
 _FENCE = re.compile(r"\A```[\w-]*[ \t]*\n(.*)\n[ \t]*```\Z", re.S)
 _ANY_JSON: TypeAdapter[Any] = TypeAdapter(Any)
 
 
 class FormError(ValueError):
-    """An answer does not match its form.
-
-    Attributes:
-        problem: One line naming every problem, such as
-            ``"action: Input should be 'post' or 'hold'; checks.0.reason: Field required"``.
-    """
+    """An answer does not match its form; ``problem`` names every problem on one line."""
 
     kind = ErrorKind.BAD_FORMAT
 
@@ -58,38 +53,22 @@ class FormError(ValueError):
 
 
 class AnswerForm:
-    """A compiled answer form; build it with :func:`compile_form`.
-
-    Attributes:
-        fields: The form as given (a plain copy), or ``None`` for any JSON.
-    """
+    """A compiled answer form; ``fields`` is a plain copy of the form, or ``None`` for any JSON."""
 
     fields: dict[str, dict[str, Any]] | None
 
     def __init__(self, fields: Mapping[str, Mapping[str, Any]] | None) -> None:
-        """Check the form and build its pydantic model.
-
-        Raises:
-            ValueError: If the form breaks the dialect; the message names the field.
-        """
+        """Check the form, naming the field that breaks the dialect, and build its pydantic model."""
         self.fields = None if fields is None else _plain(fields, "")
         self._model = None if self.fields is None else _model(self.fields, "answer")
 
     def parse(self, text: str) -> Any:
-        """Read an answer.
+        """Read an answer, raising :class:`FormError` when it does not match.
 
         Whitespace and at most one surrounding Markdown code fence are stripped;
         the rest must be JSON matching the form. Without a form any JSON passes.
-
-        Args:
-            text: The model's answer.
-
-        Returns:
-            The value: for a form, an object with the form's fields first (an
-            optional field left out is ``None``), then any extra fields.
-
-        Raises:
-            FormError: If the answer is not JSON or does not match the form.
+        A form's object has the form's fields first (an optional field left out
+        is ``None``), then any extra fields.
         """
         body = text.strip()
         if match := _FENCE.match(body):
@@ -131,11 +110,7 @@ class AnswerForm:
         return () if self.fields is None else tuple(_paths(self.fields, ""))
 
     def choices(self, path: str) -> tuple[Any, ...] | None:
-        """Return a field's ``one of`` values, or ``None`` when it has none or is not in the form.
-
-        Args:
-            path: A path from :meth:`paths`.
-        """
+        """Return the ``one of`` values of a field path, or ``None`` when it has none or is not in the form."""
         fields = self.fields
         spec: dict[str, Any] | None = None
         for name in path.split("."):
@@ -151,18 +126,7 @@ class AnswerForm:
 
 
 def compile_form(fields: Mapping[str, Mapping[str, Any]] | None) -> AnswerForm:
-    """Compile an answer form.
-
-    Args:
-        fields: The form in the README's dialect; ``None`` accepts any JSON and
-            ``{}`` any JSON object.
-
-    Returns:
-        The compiled form.
-
-    Raises:
-        ValueError: If the form breaks the dialect; the message names the field.
-    """
+    """Compile an answer form; ``None`` accepts any JSON and ``{}`` any JSON object."""
     return AnswerForm(fields)
 
 
@@ -209,8 +173,8 @@ def _plain(fields: Mapping[Any, Any], where: str) -> dict[str, dict[str, Any]]:
 
 def _item_kind(kind: Any) -> str | None:
     """Return the base type under any ``list of`` words, or ``None`` if unknown."""
-    while isinstance(kind, str) and kind.startswith(_LIST_PREFIX):
-        kind = kind[len(_LIST_PREFIX) :].strip()
+    while isinstance(kind, str) and kind.startswith(LIST_PREFIX):
+        kind = kind[len(LIST_PREFIX) :].strip()
     return kind if isinstance(kind, str) and (kind in _BASE or kind == _OBJECT) else None
 
 
@@ -227,8 +191,8 @@ def _model(fields: dict[str, dict[str, Any]], name: str) -> type[BaseModel]:
 
 def _annotation(spec: dict[str, Any], kind: str, name: str) -> Any:
     """Return the Python type of a field whose (remaining) type words are ``kind``."""
-    if kind.startswith(_LIST_PREFIX):
-        return list[_annotation(spec, kind[len(_LIST_PREFIX) :].strip(), name)]  # type: ignore[misc]
+    if kind.startswith(LIST_PREFIX):
+        return list[_annotation(spec, kind[len(LIST_PREFIX) :].strip(), name)]  # type: ignore[misc]
     if "one of" in spec:
         return Literal[tuple(spec["one of"])]
     if kind == _OBJECT:
@@ -238,8 +202,8 @@ def _annotation(spec: dict[str, Any], kind: str, name: str) -> Any:
 
 def _phrase(spec: dict[str, Any], kind: str) -> str:
     """Return the words for a field's type, such as ``list of text`` or ``one of "a", "b"``."""
-    if kind.startswith(_LIST_PREFIX):
-        return _LIST_PREFIX + _phrase(spec, kind[len(_LIST_PREFIX) :].strip())
+    if kind.startswith(LIST_PREFIX):
+        return LIST_PREFIX + _phrase(spec, kind[len(LIST_PREFIX) :].strip())
     if "one of" in spec:
         return "one of " + ", ".join(json.dumps(choice, ensure_ascii=False) for choice in spec["one of"])
     return _OBJECT if kind == _OBJECT else _WORDS[kind]
