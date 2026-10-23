@@ -36,13 +36,14 @@ from xmas.agent import Agent
 from xmas.budget import RunMeter, VisitMeter
 from xmas.check import step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
-from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, classify
-from xmas.graph import END, Join, back_edges, join_nodes
+from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, classify
+from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
 from xmas.llms.meta import SupportsMeta, supports_meta
 from xmas.nodes import Box, Step
 from xmas.predicates import Context, Predicate, parse_predicate
 from xmas.prompts import safe_format
+from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
 from xmas.tools import run_step, run_tool_loop
 from xmas.trace import AgentRecord, Rejected, TokenUsage, ToolCall, Trace
@@ -60,9 +61,6 @@ CONTINUE_MARKER = "<continue>"
 
 _RUN_KEY = "xmas_run"
 """Key of the run's :class:`~xmas.budget.RunMeter` in ``config["configurable"]``."""
-
-_RUN_ENDS = frozenset({ErrorKind.BUDGET, ErrorKind.STOPPED})
-"""Error kinds that end the run itself: never routed, and no failed record, since no node failed."""
 
 
 class MASState(TypedDict):
@@ -132,7 +130,7 @@ def _wrap(
     values; a node with a decision also writes where it goes in ``routes``.
 
     In version 2 a visit that raises gets a failed record (:func:`_failed_record`)
-    holding every paid call, unless the error ends the run (:data:`_RUN_ENDS`).
+    holding every paid call, unless the error ends the run (:data:`~xmas.errors.RUN_ENDS`).
     When an error edge routes the error's kind, the visit writes nothing and
     takes it; otherwise the error goes on. Version 1 raises.
     """
@@ -151,7 +149,7 @@ def _wrap(
                 update["routes"] = {name: route}
         except Exception as error:
             kind = _kind_of(error)
-            if mas.version != 2 or kind in _RUN_ENDS:
+            if mas.version != 2 or kind in RUN_ENDS:
                 raise
             target = None if decision is None else decision.on_error(kind)
             record = _failed_record(mas, name, error, kind, time.perf_counter() - started, target, visit)
@@ -531,7 +529,7 @@ def _add_joins(
 
     A group without a relay (one plain edge from a node without error edges)
     is waited on at its node. Any other group gets the no-op relay node its
-    :class:`~xmas.graph.Join` names, which its sources route to. A merge needs
+    :class:`~xmas.routes.Join` names, which its sources route to. A merge needs
     nothing: its edges stay plain, and it runs on whichever arrives.
 
     Returns the (source, join) pairs the barrier waits on directly, and the

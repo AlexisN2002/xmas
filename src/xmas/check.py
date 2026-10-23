@@ -24,8 +24,6 @@ from xmas.graph import (
     END,
     SENTINELS,
     START,
-    Join,
-    RouteGraph,
     agent_names,
     ancestors,
     back_edges,
@@ -37,6 +35,7 @@ from xmas.graph import (
 from xmas.nodes import Box
 from xmas.predicates import Predicate, PredicateError, parse_predicate
 from xmas.prompts import extract_placeholders
+from xmas.routes import Join, RouteGraph
 from xmas.schemas import compile_form
 from xmas.values import AVAILABLE, JSON, RESERVED, ValueType, parse_type
 
