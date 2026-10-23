@@ -33,11 +33,11 @@ from xmas.graph import (
     validate_graph,
 )
 from xmas.nodes import Box
-from xmas.predicates import Predicate, PredicateError, parse_predicate
+from xmas.predicates import BUILTINS, KEYWORDS, Predicate, PredicateError, parse_predicate
 from xmas.prompts import extract_placeholders
 from xmas.routes import Join, RouteGraph
 from xmas.schemas import compile_form
-from xmas.values import AVAILABLE, JSON, RESERVED, ValueType, parse_type
+from xmas.values import JSON, KINDS, LIST_PREFIX, TEXT, ValueType, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
@@ -51,6 +51,13 @@ MERGE_LAST = "last"
 
 ROUTED_ERRORS = frozenset(kind.value for kind in ErrorKind if kind not in RUN_ENDS)
 """The error kinds an ``on error`` edge may route; a run always stops on the others."""
+
+AVAILABLE = frozenset({TEXT, JSON})
+"""The value types a system may use; ``list of text`` is not one of them."""
+
+RESERVED = frozenset({*KINDS, *LIST_PREFIX.split(), *BUILTINS, *KEYWORDS})
+"""Names no value may take: the type words and the words of predicates. Names
+starting with ``__`` belong to xmas as well."""
 
 
 @dataclass(frozen=True)

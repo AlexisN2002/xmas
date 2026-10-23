@@ -5,9 +5,9 @@ data (``dict`` with ``str`` keys, ``list``, ``str``, ``int``, ``float``,
 ``bool``, ``None``). The type lives in the system, never on the value, so a
 version 1 state of strings stays a valid version 2 state of text.
 
-:func:`parse_type` reads every type word of the format, but only the types in
-:data:`AVAILABLE` run: :func:`xmas.check.check_system` refuses the others before
-a value of theirs is rendered or checked. This is a leaf module: it imports no
+:func:`parse_type` reads every type word of the format, but only text and json
+run: :func:`xmas.check.check_system` refuses the others before a value of
+theirs is rendered or checked. This is a leaf module: it imports no
 other xmas module.
 """
 
@@ -54,16 +54,6 @@ TEXT = ValueType("text")
 
 JSON = ValueType("json")
 """Plain JSON data."""
-
-AVAILABLE = frozenset({TEXT, JSON})
-"""The value types a system may use. A set of :class:`ValueType`, so ``list of
-text`` is not in it."""
-
-_BUILT_INS = ("visits", "cost", "elapsed", "exists", "len", "true", "false", "null", "and", "or", "not", "in")
-
-RESERVED = frozenset({*KINDS, _LIST, "of", *_BUILT_INS})
-"""Names no value may take: the type words and the predicate built-ins. Names
-starting with ``__`` belong to xmas as well."""
 
 
 def parse_type(text: str) -> ValueType:

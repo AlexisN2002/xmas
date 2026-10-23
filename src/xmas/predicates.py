@@ -42,7 +42,9 @@ MAX_DEPTH = 32
 BUILTINS = frozenset({"exists", "len", "visits", "cost", "elapsed"})
 """Names that are built-ins, never values or registered callables."""
 
-_KEYWORDS = frozenset({"and", "or", "not", "in", "true", "false", "null"})
+KEYWORDS = frozenset({"and", "or", "not", "in", "true", "false", "null"})
+"""The words of the grammar itself."""
+
 _LITERALS = {"true": True, "false": False, "null": None}
 _COMPARISONS = frozenset({"==", "!=", "<", "<=", ">", ">=", "in", "not in"})
 _TOKEN = re.compile(
@@ -243,7 +245,7 @@ class _Parser:
             items = self.literals()
             self.depth -= 1
             return ("lit", items)
-        if kind != "name" or value in _KEYWORDS:
+        if kind != "name" or value in KEYWORDS:
             raise PredicateError(f"unexpected {value!r}", position)
         if value.startswith("__"):
             raise PredicateError(f"names starting '__' belong to xmas: {value!r}", position)
@@ -276,7 +278,7 @@ class _Parser:
         while self.peek() == ".":
             self.take()
             kind, value, position = self.take()
-            if kind != "name" or value in _KEYWORDS:
+            if kind != "name" or value in KEYWORDS:
                 raise PredicateError(f"expected a name after '.', got {value!r}", position)
             names.append(value)
         return tuple(names)
