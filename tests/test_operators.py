@@ -126,7 +126,7 @@ def test_a_merge_inside_a_loop_joins_a_parallel_chain_that_runs_once() -> None:
     assert [(r.route, r.capped) for r in trace["m"]] == [(("w",), False)] * 2 + [(("fin",), True)]
     assert trace["fin"][0].inputs == {"three": "S3", "note": "M"}
     assert trace.output == "Fin"
-    assert "__in__.fin.1" not in names  # a relay runs, but leaves no record
+    assert set(names) == {a.name for a in agents} | {"c"}  # a relay runs, but leaves no record
 
 
 def fetch_and_join() -> MAS:
@@ -397,10 +397,10 @@ def test_each_fan_in_shape_is_a_merge_or_a_join(shape: str) -> None:
         return
     assert not refusals
     assert {n: j.kind if j.kind == "merge" else f"join, {len(j.groups)} groups" for n, j in joins.items()} == expected
-    relays = {name: join.relays for name, join in joins.items() if join.kind == "join"}
-    assert relays == {
-        "parallel diamond": {"j": (None, None)},
-        "on-error fallback into a join": {"j": ("__in__.j.0", None)},  # p1's ok route or fb
-        "loop exit joins a parallel chain": {"fin": ("__in__.fin.0", None)},  # m's else route
-        "parallel join with an inner diamond": {"j": (None, None)},
+    relayed = {name: tuple(r is not None for r in join.relays) for name, join in joins.items() if join.kind == "join"}
+    assert relayed == {
+        "parallel diamond": {"j": (False, False)},
+        "on-error fallback into a join": {"j": (True, False)},  # p1's ok route or fb
+        "loop exit joins a parallel chain": {"fin": (True, False)},  # m's else route
+        "parallel join with an inner diamond": {"j": (False, False)},
     }.get(shape, {})
