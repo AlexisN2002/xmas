@@ -35,7 +35,7 @@ from dataclasses import dataclass
 
 import networkx as nx
 
-from xmas.graph import END, SENTINELS, START, back_edges, build_graph, terminal_agent, validate_graph
+from xmas.graph import END, START, back_edges, build_graph, terminal_agent, validate_graph
 
 Edges = list[tuple[str, str]]
 """An agent-level edge set: the edges a ``MAS`` is constructed from."""
@@ -96,20 +96,16 @@ class TopologyBudget:
 class Fixed:
     """What a mutation of a version 2 system leaves where it is.
 
-    The edge set a version 2 system hands the operators holds every edge
-    between nodes as a pair, conditional ones included. Passing a ``Fixed``
-    (rather than ``None``) also switches the validity rules to version 2's: the
-    candidate keeps the parent's ends instead of having exactly one, the cycles
-    a ``while`` edge closes are not counted, and runnability is left to the
-    system's own check.
+    Passing one (rather than ``None``) also switches on version 2's validity
+    rules: the candidate keeps the parent's ends, the cycles a ``while`` edge
+    closes are not counted, and runnability is left to the system's own check.
 
     Attributes:
-        nodes: Frozen nodes and the endpoints of conditional edges. No operator
-            adds, removes or moves an edge touching one, or removes the node.
-        code: Steps and boxes. Their plain edges may move, but they are never
-            removed: only agents are invented and dropped.
-        terminals: The nodes the parent ends in. A candidate ends in the same
-            ones, so what reaches the end of a run stays the parent's.
+        nodes: Frozen nodes and conditional-edge endpoints. No operator adds,
+            removes or moves an edge touching one, or removes the node.
+        code: Steps and boxes. Their plain edges may move, but only agents are
+            invented and dropped.
+        terminals: The nodes the parent ends in, and so every candidate.
         conditional: The conditional edges, as pairs.
     """
 
@@ -121,20 +117,6 @@ class Fixed:
     def holds(self, edge: tuple[str, str]) -> bool:
         """Whether an edge touches a fixed node, so that no operator may change it."""
         return edge[0] in self.nodes or edge[1] in self.nodes
-
-
-def agent_edges(graph: nx.DiGraph[str]) -> Edges:
-    """Return the edges between agents, dropping the sentinel wiring.
-
-    Args:
-        graph: A MAS topology.
-
-    Returns:
-        The agent-to-agent edges, sorted so that a candidate is reproducible.
-    """
-    return sorted(
-        (source, target) for source, target in graph.edges if source not in SENTINELS and target not in SENTINELS
-    )
 
 
 def terminals(names: list[str], edges: Edges) -> list[str]:
@@ -237,17 +219,7 @@ def is_buildable(names: list[str], edges: Edges, entry: str | None = None) -> bo
 
 
 def within_budget(names: list[str], edges: Edges, budget: TopologyBudget, fixed: Fixed | None = None) -> bool:
-    """Check a candidate against the budget's numeric bounds only.
-
-    Args:
-        names: The candidate's node names.
-        edges: Its node-level edge set.
-        budget: The bounds.
-        fixed: What a version 2 parent holds still; ``None`` for version 1.
-
-    Returns:
-        Whether the candidate is inside the budget.
-    """
+    """Check a candidate against the budget's numeric bounds only; ``fixed`` is a version 2 parent's."""
     if not budget.min_agents <= len(names) <= budget.max_agents:
         return False
     if not budget.floor(len(names)) <= len(edges) <= budget.max_edges:
@@ -275,19 +247,9 @@ def is_valid(
 
     The single predicate the sampler, the operators and the search loop all use,
     so that "legal topology" means one thing across the package. A version 2
-    candidate is checked against the budget here and by
+    candidate (``fixed`` given) is checked against the budget here and by
     :func:`~xmas.check.check_system` when it is built, which knows its
     conditional edges, joins and reads.
-
-    Args:
-        names: The candidate's node names.
-        edges: Its node-level edge set.
-        budget: The bounds.
-        entry: Preferred entry agent.
-        fixed: What a version 2 parent holds still; ``None`` for version 1.
-
-    Returns:
-        Whether the candidate is legal.
     """
     return within_budget(names, edges, budget, fixed) and (fixed is not None or is_buildable(names, edges, entry))
 
@@ -427,7 +389,7 @@ def mutate(
         operations: How many operators to apply in one mutation step.
         entry: The parent's entry agent, preferred for the child when the child's
             entry is inside a cycle and has to be named.
-        fixed: What a version 2 parent holds still; ``None`` for version 1.
+        fixed: What a version 2 parent holds still.
 
     Returns:
         The mutated names and edges, or the parent's unchanged.
@@ -504,8 +466,7 @@ def crossover(
         budget: The bounds the child must stay inside.
         rng: Source of randomness.
         entry: Preferred entry agent for the child.
-        fixed: What the first parent, a version 2 system, holds still; ``None``
-            for version 1.
+        fixed: What the first parent, a version 2 system, holds still.
 
     Returns:
         The child's names and edges, falling back to the first parent when no
