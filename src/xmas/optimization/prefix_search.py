@@ -11,7 +11,7 @@ from __future__ import annotations
 from xmas.mas import MAS
 from xmas.optimization.attribution import Attributor
 from xmas.optimization.optimizer import MASOptimizer
-from xmas.optimization.updaters import movable_agents
+from xmas.optimization.updaters import movable_agents, weakest
 from xmas.tasks.base import MASTask
 
 # Fixed phrases tried against an agent's prompt. Not a method, a fixture.
@@ -86,45 +86,17 @@ class PrefixSearchOptimizer(MASOptimizer):
         self.step = 0
 
     def target_agent(self) -> str:
-        """Return the agent to vary this step.
-
-        Returns:
-            The least-credited agent when credit is available, otherwise the next
-            agent in round-robin order, which keeps the sweep deterministic. A
-            frozen agent is never chosen.
-
-        Raises:
-            ValueError: If every agent is frozen.
-        """
+        """Return the least-credited agent not frozen, else the next one round-robin, so the sweep is deterministic."""
         names = movable_agents(self.mas)
-        scored = {name: values for name, values in self.credit.items() if name in names and values}
-        if scored:
-            return min(scored, key=lambda name: sum(scored[name]) / len(scored[name]))
-        return names[self.step % len(names)]
+        return weakest(names, self.credit) or names[self.step % len(names)]
 
     def propose(self) -> list[MAS]:
-        """Return one candidate per prefix, plus the incumbent.
-
-        The incumbent is included so that a step which finds nothing better keeps
-        it rather than being forced to accept a worse candidate.
-
-        Returns:
-            The candidates.
-        """
+        """Return one candidate per prefix, plus the incumbent, so a step that finds nothing better keeps it."""
         agent = self.target_agent()
         self.step += 1
         base = self.mas.agents[agent].prompt
         return [self.mas, *(self.mas.copy(prompts={agent: f"{prefix} {base}".strip()}) for prefix in self.prefixes)]
 
     def select(self, candidates: list[MAS], scores: list[float]) -> MAS:
-        """Return the highest-scoring candidate.
-
-        Args:
-            candidates: The evaluated systems.
-            scores: Their scores.
-
-        Returns:
-            The best one. Ties go to the earliest, and the incumbent is first, so
-            a tie keeps the current system rather than drifting for no gain.
-        """
+        """Return the highest-scoring candidate; a tie keeps the incumbent, which comes first."""
         return candidates[scores.index(max(scores))]

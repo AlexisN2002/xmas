@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import random
 from collections.abc import Iterable, Sequence
 
@@ -13,6 +12,7 @@ from xmas.graph import SENTINELS, START, ancestors, build_graph
 from xmas.mas import MAS
 from xmas.optimization.synthesis import LLMPromptSynthesizer, MechanicalSynthesizer, Rewrite
 from xmas.optimization.topology import Edges, Fixed, TopologyBudget, crossover, mas_edges, mutate, terminals
+from xmas.optimization.updaters import weakest
 from xmas.spec import SPEC_VERSION_2
 
 NEW_AGENT_PROMPT = "You are {name}. Do your part of the task and pass on your result."
@@ -362,22 +362,13 @@ class GraphUpdater:
         return fed[0] if fed else None
 
     def weakest_agent(self, mas: MAS, credit: dict[str, list[float]]) -> str | None:
-        """Return the agent with the least credit, or None when there is none to go on.
+        """Return the least-credited agent a candidate may rewire, or ``None`` when there is none to go on.
 
-        Only an agent a candidate may rewire counts: a frozen agent, or one at a
-        conditional edge (:meth:`fixed_of`), is never the target.
+        A frozen agent, or one at a conditional edge (:meth:`fixed_of`), is never the target.
         """
         fixed = self.fixed_of(mas)
         held = frozenset() if fixed is None else fixed.nodes
-        scored = {
-            name: [value for value in values if not math.isnan(value)]
-            for name, values in credit.items()
-            if name in mas.agents and name not in held
-        }
-        usable = {name: values for name, values in scored.items() if values}
-        if not usable:
-            return None
-        return min(usable, key=lambda name: sum(usable[name]) / len(usable[name]))
+        return weakest([name for name in mas.agents if name not in held], credit)
 
     def touches(self, agent: str | None, before: Edges, after: Edges) -> bool:
         """Whether a candidate changed the edges around one agent.
