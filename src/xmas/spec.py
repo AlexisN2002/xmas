@@ -10,7 +10,9 @@ forms of :mod:`xmas.edges`, ``frozen`` nodes and ``health`` settings, and keeps
 its prompts in a top-level ``prompts`` section. It may declare ``outputs``; a
 node may run ``for each`` item of a list and ``retry`` on some error kinds; an
 agent may read values under placeholders of other names and share a prompt
-with other agents under a ``prompt`` name.
+with other agents under a ``prompt`` name. Its ``models`` section says, per
+bound model name, which kinds beyond text the model ``accepts`` and
+``produces``; never a URL, a key or a model parameter.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ V2_KEYS: dict[str, Any] = {
     "state": dict,
     "frozen": list,
     "health": dict,
+    "models": dict,
     "callables": dict,
     "default_model": str,
     "prompts": dict,
@@ -63,6 +66,7 @@ _ENTRIES: dict[str, tuple[str, frozenset[str], dict[str, Any]]] = {
 }
 _CALLABLE = {"kind": str, "import": str, "server": str, "reads": dict, "writes": dict}
 _HEALTH = {"length_factor": (int, float), "min_samples": int, "leak": list}
+_MODEL_KEYS = ("accepts", "produces")
 _WORDS = {
     int: "an integer",
     (int, float): "a number",
@@ -152,6 +156,9 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
         if entry["kind"] not in ("python", "mcp"):
             raise ValueError(f"Callable {name!r} needs 'kind' to be 'python' or 'mcp', not {entry['kind']!r}.")
     _check_fields(data.get("health", {}), "Spec 'health'", _HEALTH)
+    for name, entry in data.get("models", {}).items():  # other keys are refused, with why, where the MAS reads them
+        if not isinstance(entry, dict) or any(not isinstance(entry.get(key, []), list) for key in _MODEL_KEYS):
+            raise ValueError(f"Spec 'models' entry {name!r} must map accepts and produces to lists, got {entry!r}.")
 
     prompts = data.get("prompts", {})
     if not all(isinstance(text, str) for text in prompts.values()):

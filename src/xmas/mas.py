@@ -33,6 +33,7 @@ from xmas.graph import (
     validate_graph,
 )
 from xmas.health import HealthSettings
+from xmas.media import TEXT_ONLY, Capabilities
 from xmas.nodes import Box, Step
 from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import validate_spec, validate_spec_v2
@@ -83,6 +84,8 @@ class MAS(BasePredictor):
         retry: ``{node: {error kind: attempts}}``: how often a failed visit
             runs again on each kind of :data:`~xmas.check.RETRYABLE`.
         prompt_names: ``{agent: prompt name}`` for agents that share one prompt.
+        models: ``{model name: Capabilities}``: what each bound model takes and
+            gives besides text, as declared; empty when none is (and in version 1).
         version: 1 or 2.
         info: What the version 2 check learned (types, writers, joins); ``None``
             in version 1.
@@ -113,6 +116,7 @@ class MAS(BasePredictor):
     outputs: dict[str, ValueType]
     retry: dict[str, dict[str, int]]
     prompt_names: dict[str, str]
+    models: dict[str, Capabilities]
     version: int
     info: SystemInfo | None
     graph: nx.DiGraph[str]
@@ -142,6 +146,7 @@ class MAS(BasePredictor):
         outputs: Mapping[str, str | ValueType] | None = None,
         retry: Mapping[str, Mapping[str, int]] | None = None,
         prompt_names: Mapping[str, str] | None = None,
+        models: Mapping[str, Mapping[str, Any] | Capabilities] | None = None,
     ) -> None:
         """Initialize a MAS.
 
@@ -173,7 +178,8 @@ class MAS(BasePredictor):
             version: 1 or 2. Defaults to 2 when steps, boxes, conditional
                 edges, a non-text agent, an agent reading a value under
                 another name, ``inputs``, ``state``, ``frozen``, ``each``,
-                ``outputs``, ``retry`` or ``prompt_names`` are used, else 1.
+                ``outputs``, ``retry``, ``prompt_names`` or ``models`` are
+                used, else 1.
             boxes: Nodes that run a whole version 2 system.
             frozen: Names of nodes no optimizer may change.
             health: Thresholds of the health signals; ``None`` keeps the
@@ -186,6 +192,12 @@ class MAS(BasePredictor):
             retry: ``{node: {error kind: attempts}}`` for agents and steps.
             prompt_names: ``{agent: prompt name}``: the agents that share one
                 prompt, which must hold the same text.
+            models: ``{model name: {"accepts": [...], "produces": [...]}}``
+                or :class:`~xmas.media.Capabilities`, keyed by ``llms`` names
+                or ``default_model``: the kinds beyond text a model reads,
+                such as ``image``, and answers with. A model not named here
+                states its own through ``accepts`` and ``produces``
+                attributes, else reads and writes text only.
 
         Raises:
             ValueError: If the system is not runnable. A version 2 system
@@ -199,6 +211,10 @@ class MAS(BasePredictor):
         self.outputs = {name: t if isinstance(t, ValueType) else parse_type(t) for name, t in (outputs or {}).items()}
         self.retry = {name: dict(rules) for name, rules in (retry or {}).items()}
         self.prompt_names = dict(prompt_names or {})
+        self.models = {
+            name: entry if isinstance(entry, Capabilities) else Capabilities.parse(entry, f"models entry {name!r}")
+            for name, entry in (models or {}).items()
+        }
         self.version = self._infer_version(version, agents, steps, boxes, inputs, state)
         if not agents and (self.version == 1 or not (steps or boxes)):
             raise ValueError(
@@ -247,6 +263,7 @@ class MAS(BasePredictor):
         """Return the version asked for, else 2 when a version 2 feature is used, else 1."""
         uses_v2 = (
             bool(steps or boxes or self.frozen or self.each or self.outputs or self.retry or self.prompt_names)
+            or bool(self.models)
             or inputs is not None
             or state is not None
             or any(edge.kind is not EdgeKind.PLAIN for edge in self.edges)
@@ -257,7 +274,7 @@ class MAS(BasePredictor):
             raise ValueError(f"version must be 1 or 2, not {inferred!r}.")
         if inferred == 1 and uses_v2:
             raise ValueError(
-                "Steps, boxes, inputs, outputs, state, frozen, for each, retry, shared prompts, read maps, "
+                "Steps, boxes, inputs, outputs, state, frozen, models, for each, retry, shared prompts, read maps, "
                 "conditional edges and typed writes need version 2."
             )
         return inferred
@@ -331,6 +348,22 @@ class MAS(BasePredictor):
     def while_edges(self) -> tuple[tuple[str, str], ...]:
         """The ``(source, target)`` of every ``while`` edge, in declared order: the loops of a version 2 run."""
         return tuple((edge.source, edge.target) for edge in self.edges if edge.kind is EdgeKind.WHILE)
+
+    def capabilities(self, agent: Agent) -> Capabilities:
+        """Return what an agent's model takes and gives besides text.
+
+        The first found wins: the ``models`` entry of the model's name (the
+        agent's binding, else ``default_model``), the model object's own
+        ``accepts`` and ``produces``, else text only.
+        """
+        name = agent.model if agent.model is not None else self.default_model
+        if name is not None and name in self.models:
+            return self.models[name]
+        llm = self.llms.get(agent.model) if agent.model is not None else self.llm
+        stated = [getattr(llm, key, ()) for key in ("accepts", "produces")]
+        if all(isinstance(words, list | tuple) and all(isinstance(w, str) for w in words) for words in stated):
+            return Capabilities(*(tuple(words) for words in stated))
+        return TEXT_ONLY
 
     def resolve_llm(self, agent: Agent) -> BaseLLM:
         """Return the agent's bound model, or the MAS default; ``ValueError`` when there is neither."""
@@ -521,6 +554,7 @@ class MAS(BasePredictor):
             "outputs": dict(self.outputs),
             "retry": {name: dict(rules) for name, rules in self.retry.items()},
             "prompt_names": dict(self.prompt_names),
+            "models": dict(self.models),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -551,6 +585,7 @@ class MAS(BasePredictor):
             "state": {value: {"merge": rule} for value, rule in self.merges.items()},
             "frozen": sorted(self.frozen),
             "health": _health_spec(self.health),
+            "models": {name: capabilities.to_spec() for name, capabilities in self.models.items()},
             "callables": self._callable_specs(),
             "default_model": self.default_model,
             "prompts": self._prompt_section(),
@@ -697,6 +732,7 @@ class MAS(BasePredictor):
             outputs=spec.get("outputs"),
             retry={item["name"]: item["retry"] for item in entries if "retry" in item},
             prompt_names={item["name"]: item["prompt"] for item in spec.get("agents", []) if "prompt" in item},
+            models=spec.get("models"),
         )
         mas._check_callables(spec.get("callables", {}))
         return mas
@@ -767,7 +803,8 @@ class MAS(BasePredictor):
         another name its ``"placeholders"`` map, a node that retries its
         ``"retry"``. Declared ``"outputs"`` and the chains, as ``"groups"``,
         appear only when there are any; a chain node's reads and writes have
-        their types for one item.
+        their types for one item. Declared ``"models"`` appear when there
+        are any, outside the ``id``: they change no compiled graph.
         """
         declared = {(edge.source, edge.target): edge for edge in self.edges}
         loops = back_edges(self.graph) if self.info is None else set()
@@ -795,6 +832,8 @@ class MAS(BasePredictor):
                 for head, chain in chains.items()
             ]
         canonical = json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if self.models:
+            description["models"] = {name: capabilities.to_spec() for name, capabilities in self.models.items()}
         description["id"] = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return description
 
@@ -875,7 +914,8 @@ class MAS(BasePredictor):
         steps, edges, answer types and forms, inputs, merges, outputs, read
         maps, chain forms with ``at once`` and ``key``, retries and boxes (each
         with its inner structure, indented); frozen nodes, health settings,
-        prompt names and item budgets change no compiled graph and stay out.
+        prompt names, item budgets and models change no compiled graph and
+        stay out.
         """
         lines = [
             f"{agent.name} {','.join(agent.inputs)} -> {agent.output} model={agent.model} tools={','.join(agent.tools)}"
@@ -983,7 +1023,7 @@ class _ChainSystem(MAS):
     END: else`` inside. It declares the chain's writes as its outputs, so
     several of its nodes may end it. Models, tools and callables resolve
     through the outer system, so a subclass's ``resolve_llm`` serves the
-    chain's agents too.
+    chain's agents too, and the outer ``models`` entries hold for them.
     """
 
     def __init__(
@@ -1009,6 +1049,7 @@ class _ChainSystem(MAS):
             health=outer.health,
             outputs=written,
             retry={name: rules for name, rules in outer.retry.items() if name in shape.nodes},
+            models={name: entry for name, entry in outer.models.items() if name in {*outer.llms, outer.default_model}},
         )
 
     def _callables(self) -> ToolIndex:
