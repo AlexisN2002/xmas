@@ -1,7 +1,8 @@
-"""The ``xmas`` command: make, check, show, run, compare and verify ``.mas`` bundles.
+"""The ``xmas`` command: make, check, show, run, compare and verify ``.mas`` bundles, and read the run log.
 
 ``xmas init``, ``check``, ``show``, ``run``, ``diff`` and ``verify`` each take a
-bundle, a folder or a zip. Exit status 0 means ok, 1 a problem (or, with
+bundle, a folder or a zip; ``xmas runs`` and ``xmas trace`` read the run log
+(:func:`~xmas.store.open_store`). Exit status 0 means ok, 1 a problem (or, with
 ``--strict``, a failed verify), 2 a usage error or a bundle that is not there.
 Model endpoints and keys come from the configuration (:mod:`xmas.config`) and
 are never printed. A bundle's python callables are imported only with
@@ -29,6 +30,7 @@ from xmas.bundle import LOCK, Lock, compare, read
 from xmas.config import Config, Unconfigured, config_path
 from xmas.examples import parse_examples
 from xmas.mas import MAS
+from xmas.store import open_store
 from xmas.values import TEXT, ValueType, media_kind, plain
 from xmas.verify import VerifyWarning
 
@@ -55,7 +57,9 @@ class _UsageError(Exception):
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="xmas", description="Make, check, run and verify .mas bundles.")
+    parser = argparse.ArgumentParser(
+        prog="xmas", description="Make, check, run and verify .mas bundles; read the run log."
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="write a new bundle to edit")
     init.add_argument("bundle", help="the new bundle, name.mas")
@@ -84,6 +88,14 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--json", action="store_true")
     for command in (check, show, run, verify):
         command.add_argument("--trust", action="store_true", help="import the code the bundle names")
+    runs = commands.add_parser("runs", help="the runs in the run log, oldest first")
+    runs.add_argument("--json", action="store_true")
+    runs.add_argument("--status", help="only the runs with this status, such as ok, failed or paused")
+    runs.add_argument("--system", metavar="ID", help="only the runs of the system with this describe() id")
+    runs.add_argument("--limit", type=int, metavar="N", help="only the latest N runs")
+    trace = commands.add_parser("trace", help="one run's records, from the run log")
+    trace.add_argument("run_id")
+    trace.add_argument("--json", action="store_true", help="the whole trace as JSON")
     return parser
 
 
@@ -291,6 +303,52 @@ def _verify(args: argparse.Namespace) -> int:
     report = mas.verify(args.level, budget=args.budget, only=args.only)
     print(json.dumps(report.to_dict(), indent=2) if args.json else str(report))
     return 1 if args.strict and not report.ok else 0
+
+
+def _cost(totals: Mapping[str, Any] | None) -> float | None:
+    return None if not totals or totals["uncosted_calls"] else float(totals["cost_usd"])
+
+
+def _runs(args: argparse.Namespace) -> int:
+    store = open_store()
+    rows = store.runs(args.status, args.system, args.limit)
+    if args.json:
+        keys = ("run_id", "status", "system_id", "created_at", "ended_at")
+        print(json.dumps([{**{key: getattr(row, key) for key in keys}, "cost_usd": _cost(row.totals)} for row in rows]))
+        return 0
+    for row in rows:
+        cost = _cost(row.totals)
+        shown = "cost unknown" if cost is None else f"{cost:.4f} USD"
+        print(f"{row.run_id}  {row.status:<11}  {row.system_id}  {row.created_at[:19]}  {shown}")
+    if not rows:
+        print(f"no runs in {store!r}", file=sys.stderr)
+    return 0
+
+
+def _trace(args: argparse.Namespace) -> int:
+    store = open_store()
+    try:
+        trace = store.trace(args.run_id)
+    except KeyError:
+        raise ValueError(f"no run {args.run_id!r} in {store!r}") from None
+    if args.json:
+        print(json.dumps(trace.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+    rows = [("step", "node", "kind", "item", "cost_usd", "latency_s", "finish")]
+    for record in trace.records:
+        item = "" if record.item is None else str(record.item) if record.item_key is None else record.item_key
+        cost = "" if record.cost_usd is None else f"{record.cost_usd:.4f}"
+        latency = "" if record.latency_s is None else f"{record.latency_s:.2f}"
+        finish = record.error_kind or record.finish_reason or ("error" if record.error else "")
+        rows.append((str(record.step), record.agent, record.kind, item, cost, latency, str(finish)))
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip())
+    cost = "cost unknown" if trace.cost_usd is None else f"{trace.cost_usd:.4f} USD"
+    print(f"{trace.status}: {len(trace.records)} records, {cost}", file=sys.stderr)
+    if trace.failed:
+        print(f"{trace.error_kind or 'error'}: {trace.error}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

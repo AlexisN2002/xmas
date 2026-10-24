@@ -958,3 +958,37 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     assert not any("sk-secret" in text for text in seen)
     scripts = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert scripts["scripts"] == {"xmas": "xmas.cli:main"}
+
+
+def test_the_run_log_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    def out(code: int, *args: str) -> str:
+        assert main(list(args)) == code, args
+        captured = capsys.readouterr()
+        return captured.out + captured.err
+
+    assert "no runs in Store(" in out(0, "runs") and json.loads(out(0, "runs", "--json")) == []
+    mas = deck()
+    first = mas.run_state({"plan": PLAN, "house": "plain"})
+    broken = MAS([Agent("b", "Answer {query}", "answer")], llm=MockLLM(answers=[RuntimeError("boom")]))
+    broken.run("q")
+    MAS([Agent("a", "Answer {query}", "answer")], llm=MockLLM()).run("q")  # a model that reports no cost
+    lines = out(0, "runs").splitlines()
+    assert len(lines) == 3 and lines[0].startswith(f"{first.run_id}  ok  ") and lines[0].endswith("  0.2500 USD")
+    assert f"  {mas.describe()['id']}  " in lines[0] and lines[2].endswith("cost unknown")
+    failed = json.loads(out(0, "runs", "--json", "--status", "failed"))
+    assert [row["status"] for row in failed] == ["failed"] and failed[0]["cost_usd"] == 0.0
+    mine = json.loads(out(0, "runs", "--json", "--system", mas.describe()["id"]))
+    assert [row["run_id"] for row in mine] == [first.run_id] and mine[0]["cost_usd"] == pytest.approx(0.25)
+    assert out(0, "runs", "--limit", "2").startswith(failed[0]["run_id"])
+
+    table = out(0, "trace", str(first.run_id)).splitlines()
+    assert table[0].split() == ["step", "node", "kind", "item", "cost_usd", "latency_s", "finish"]
+    assert table[-1] == f"ok: {len(first.records)} records, 0.2500 USD"
+    assert table[6].split()[:5] == ["5", "drafter", "agent", "intro", "0.0100"]
+    whole = json.loads(out(0, "trace", "--json", str(first.run_id)))
+    assert whole["records"] == first.to_dict()["records"] and whole["outputs"] == first.to_dict()["outputs"]
+    assert out(0, "trace", failed[0]["run_id"]).splitlines()[1:] == [
+        "failed: 0 records, cost unknown",
+        "unknown: RuntimeError: boom",
+    ]
+    assert "xmas trace: no run 'nope' in Store(" in out(1, "trace", "nope")
