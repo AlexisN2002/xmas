@@ -43,6 +43,7 @@ from xmas.health import HealthSettings
 from xmas.human import Asker, Human
 from xmas.media import TEXT_ONLY, Capabilities
 from xmas.nodes import Box, Step
+from xmas.predicates import parse_predicate
 from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import validate_spec, validate_spec_v2
 from xmas.store import Store, open_store
@@ -740,9 +741,10 @@ class MAS(BasePredictor):
         return prompts
 
     def _callable_specs(self) -> dict[str, dict[str, Any]]:
-        """Return the ``callables`` section: every callable a node uses, steps' first; a server by its name."""
+        """Return the ``callables`` section: every callable a node or an edge condition uses, steps' first."""
         index = self._callables()
         used = [step.uses for step in self.steps.values()] + [t for agent in self.agents.values() for t in agent.tools]
+        used += sorted({name for edge in self.edges if edge.when for name, _ in parse_predicate(edge.when).calls()})
         specs: dict[str, dict[str, Any]] = {}
         for name in dict.fromkeys(used):
             item, source = index[name]

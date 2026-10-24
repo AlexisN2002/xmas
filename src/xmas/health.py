@@ -189,45 +189,31 @@ def _record_signals(
     settings: HealthSettings,
     values: frozenset[str] | None,
 ) -> list[tuple[str, str]]:
-    """Return ``(signal, detail)`` for each signal one record shows."""
-    found: list[tuple[str, str]] = []
-    if record.rejected:
-        found.append(("retried", f"{len(record.rejected)} answer(s) rejected: {record.rejected[0].error}"))
-    if record.error_kind == ErrorKind.BAD_FORMAT:
-        found.append(("bad_format", "the answer did not match its form after the retry"))
-    if record.error is not None:
-        kind = "unknown" if record.error_kind is None else record.error_kind.value
-        if record.route:
-            found.append(("error_routed", f"{kind}: {record.error}"))
-        elif record.item is not None:  # elsewhere an unrouted failure ended the run, and the trace's error says so
-            found.append(("item_failed", f"{_item_name(record)} failed: {kind}: {record.error}"))
-        return found
-    text = _text(record)
-    if not text.strip():
-        found.append(("empty", "the output is empty"))
-    elif before is not None and before.error is None and _text(before) == text:
-        found.append(("stuck", f"the same output as step {before.step}"))
+    """Return ``(signal, detail)`` for each signal one record shows, in the order of the table."""
+    ok, text = record.error is None, _text(record)
+    failure = f"{getattr(record.error_kind, 'value', 'unknown')}: {record.error}"
+    same = before.step if before is not None and before.error is None and _text(before) == text else None
     placeholders = extract_placeholders(record.prompt)
     missing = sorted((placeholders if values is None else placeholders & values) - set(record.inputs))
-    if missing:
-        found.append(("unfilled", f"placeholders without a value: {', '.join(missing)}"))
-    for pattern in leaks:
-        match = pattern.search(text)
-        if match:
-            found.append(("leak", f"the output holds {match.group()!r}"))
-            break
-    if median:
-        size = len(text)
-        if size > settings.length_factor * median:
-            found.append(("long", f"{size} characters, the node's median is {median:g}"))
-        elif size < median / settings.length_factor:
-            found.append(("short", f"{size} characters, the node's median is {median:g}"))
-    return found
-
-
-def _route(record: AgentRecord) -> tuple[str, ...]:
-    """Return the targets a record's decision routed to; empty when it made none."""
-    return record.route or ()
+    leak = next((match.group() for pattern in leaks if (match := pattern.search(text))), None)
+    size, factor, median = len(text), settings.length_factor, median or 0
+    lengths = f"{size} characters, the node's median is {median:g}"
+    signals: dict[str, object] = {
+        "retried": record.rejected and f"{len(record.rejected)} answer(s) rejected: {record.rejected[0].error}",
+        "bad_format": record.error_kind == ErrorKind.BAD_FORMAT and "the answer did not match its form after the retry",
+        "error_routed": not ok and record.route and failure,
+        # elsewhere an unrouted failure ended the run, and the trace's error says so
+        "item_failed": not (ok or record.route)
+        and record.item is not None
+        and f"{_item_name(record)} failed: {failure}",
+        "empty": ok and not text.strip() and "the output is empty",
+        "stuck": ok and bool(text.strip()) and same is not None and f"the same output as step {same}",
+        "unfilled": ok and missing and f"placeholders without a value: {', '.join(missing)}",
+        "leak": ok and leak and f"the output holds {leak!r}",
+        "long": ok and median and size > factor * median and lengths,
+        "short": ok and median and size < median / factor and lengths,
+    }
+    return [(signal, detail) for signal, detail in signals.items() if isinstance(detail, str) and detail]
 
 
 def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]]) -> dict[str, dict[str, Any]]:
@@ -235,8 +221,8 @@ def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]
     loops: dict[str, dict[str, Any]] = {}
     for source, target in dict.fromkeys(while_edges):
         mine = [record for record in records if record.agent == source]
-        taken = sum(target in _route(record) for record in mine)
-        cap_hit = any(record.capped and target not in _route(record) for record in mine)
+        taken = sum(target in (record.route or ()) for record in mine)
+        cap_hit = any(record.capped and target not in (record.route or ()) for record in mine)
         if taken or cap_hit:
             loops[f"{source} -> {target}"] = {"taken": taken, "cap_hit": cap_hit}
     return loops

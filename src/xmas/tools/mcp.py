@@ -102,16 +102,9 @@ class MCPTools(ToolSource):
         return list(self.cached)
 
     def call(self, name: str, arguments: dict[str, Any]) -> str:
-        """Run one tool on the server and return the text the model sees.
+        """Run one tool on the server and return the text the model sees (:func:`result_text`).
 
         Thread safe; at most ``max_concurrent`` calls are in flight.
-
-        Args:
-            name: The tool.
-            arguments: The decoded arguments object.
-
-        Returns:
-            The rendered result (see :func:`result_text`).
 
         Raises:
             XmasError: The tool failed (fed back to the model), or the server
@@ -168,13 +161,8 @@ def result_text(result: CallToolResult) -> str:
     serving-xmas answers with either an Envelope (``exit_code``, ``stdout``, ...)
     or an error body (``{"error", "status", "message"}``); any other MCP server
     answers with plain content, whose non-text blocks are named, never inlined.
-
-    Args:
-        result: The call's result.
-
-    Returns:
-        ``stdout`` (plus truncation and file-name notes) for a successful
-        Envelope, or the joined text of any other successful result.
+    The text is ``stdout`` (plus truncation and file-name notes) for a
+    successful Envelope, or the joined text of any other successful result.
 
     Raises:
         XmasError: The tool failed or was called wrongly; or, with ``status``

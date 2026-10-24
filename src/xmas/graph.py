@@ -152,10 +152,6 @@ def back_edges(graph: nx.DiGraph[str]) -> set[tuple[str, str]]:
     return found
 
 
-LOOP_REFUSAL = "a loop needs a while edge"
-"""Why a version 2 system with a cycle of other edges is refused."""
-
-
 def forward_graph(graph: nx.DiGraph[str], back: Collection[tuple[str, str]]) -> nx.DiGraph[str]:
     """Return a copy of the topology without its loop-closing edges: one pass of a version 2 run."""
     forward = graph.copy()
@@ -167,7 +163,7 @@ def loop_problems(graph: nx.DiGraph[str], back: Collection[tuple[str, str]] = ()
     """Return a problem for each cycle no ``while`` edge (``back``) closes and each ``while`` edge closing no cycle."""
     forward = forward_graph(graph, back)
     problems = [
-        f"{LOOP_REFUSAL}: the edge {source} -> {target} closes a cycle"
+        f"a loop needs a while edge: the edge {source} -> {target} closes a cycle"
         for source, target in sorted(back_edges(forward))
     ]
     for source, target in back:
@@ -198,9 +194,8 @@ def join_nodes(graph: nx.DiGraph[str]) -> set[str]:
 
     A node fed by predecessors at unequal depth would otherwise execute once per
     wave of arriving inputs: in ``A -> C`` together with ``A -> B -> C``, C sees
-    A's write in one step and B's in the next, and runs twice for one query. The
-    seed engine has this defect latent, and every mutated topology triggers it,
-    so the set computed here is what the executor defers on.
+    A's write in one step and B's in the next, and runs twice for one query, so
+    the executor defers on the set computed here.
 
     Back edges are excluded from the count. A node at the top of a retry loop is
     fed both from upstream and from the agent that decided to loop, but those two

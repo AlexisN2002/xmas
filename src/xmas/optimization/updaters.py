@@ -43,10 +43,9 @@ def weakest(names: Sequence[str], credit: Mapping[str, Sequence[float]]) -> str 
 class PromptUpdater:
     """Wraps any promptolution optimizer into a prompt updater for one agent.
 
-    This is where the founding premise pays off. A promptolution optimizer
-    already improves a prompt for a single-prompt predictor, and
-    :class:`AgentPromptView` turns one agent into exactly that, so the optimizer
-    runs unmodified rather than being ported to a multi-agent setting.
+    A promptolution optimizer improves a prompt for a single-prompt predictor,
+    and :class:`AgentPromptView` turns one agent into exactly that, so the
+    optimizer runs unmodified.
 
     Attributes:
         optimizer_cls: The promptolution optimizer class to run.

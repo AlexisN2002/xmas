@@ -19,15 +19,14 @@ if TYPE_CHECKING:  # pragma: no cover
 class EvolutionaryTopologyOptimizer(MASOptimizer):
     """Searches topologies by mutating and recombining the ones that scored well.
 
-    The other half of P4's decomposition. Where
-    :class:`~xmas.optimization.cantante.CantanteOptimizer` holds the graph fixed
-    and improves the prompts, this holds the prompts fixed and improves the graph,
-    through the same three-step loop and against the same task interface. Running
-    both is a matter of alternating them, not of a third framework.
+    Where :class:`~xmas.optimization.cantante.CantanteOptimizer` holds the
+    graph fixed and improves the prompts, this holds the prompts fixed and
+    improves the graph, through the same three-step loop and against the same
+    task interface. Running both is a matter of alternating them.
 
     Recombination needs a population, so one is kept: the systems that survived
-    selection, newest last. A step mutates the incumbent and crosses pairs drawn
-    from that population, which is the seed's shape.
+    selection, best first. A step mutates the incumbent and crosses pairs drawn
+    from that population.
 
     Attributes:
         mas: The current best system.
@@ -74,11 +73,9 @@ class EvolutionaryTopologyOptimizer(MASOptimizer):
     def propose(self) -> list[MAS]:
         """Mutate the incumbent and recombine the survivors.
 
-        Returns:
-            The incumbent first, then the candidates. The incumbent is included
-            so that selection compares against a score measured this step, on
-            whatever data the task handed out, rather than against a remembered
-            one.
+        The incumbent comes first, so selection compares against a score
+        measured this step, on whatever data the task handed out, rather than
+        against a remembered one.
         """
         candidates = self.updater.propose(self.mas, self.credit, self.mutations)
         if self.recombinations > 0 and len(self.population) > 1:
@@ -88,32 +85,15 @@ class EvolutionaryTopologyOptimizer(MASOptimizer):
         return [self.mas, *candidates]
 
     def select(self, candidates: list[MAS], scores: list[float]) -> MAS:
-        """Keep the best candidate and remember the rest as future parents.
-
-        Args:
-            candidates: The evaluated systems, incumbent first.
-            scores: Their scores, aligned to ``candidates``.
-
-        Returns:
-            The chosen system, which is the incumbent unless something beat it.
-        """
-        best = max(range(len(candidates)), key=lambda index: scores[index])
-        winner = candidates[best] if scores[best] > scores[0] else candidates[0]
-
+        """Keep the best candidate, the incumbent unless something beat it, and remember the best as parents."""
+        winner = super().select(candidates, scores)
         ranked = sorted(range(len(candidates)), key=lambda index: -scores[index])
         self.population = [candidates[index] for index in ranked[: self.population_size]]
         self.accepted.append(self.describe(winner) if winner is not candidates[0] else "no change")
         return winner
 
     def describe(self, mas: MAS) -> str:
-        """Render a system's topology in one line, for the run's readout.
-
-        Args:
-            mas: The system to describe.
-
-        Returns:
-            Its agent-level edges, or its lone agent when it has no edges.
-        """
+        """Render a system's topology in one line, its agent-level edges, for the run's readout."""
         edges = self.updater.edges_of(mas)
         if not edges:
             return f"{len(mas.agents)} agents, no edges"

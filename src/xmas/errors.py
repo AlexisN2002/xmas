@@ -83,6 +83,8 @@ class XmasError(RuntimeError):
 
     kind: ErrorKind = ErrorKind.UNKNOWN
     meta: CallMeta | None = None
+    _pickled: tuple[str, ...] = ("message", "status", "retry_after")
+    """The constructor's arguments, as attributes (``message`` is the message), that a pickle keeps."""
 
     def __init__(self, message: str, status: int | None = None, retry_after: float | None = None) -> None:
         """Initialize the error."""
@@ -91,8 +93,8 @@ class XmasError(RuntimeError):
         self.retry_after = retry_after
 
     def __reduce__(self) -> tuple[Any, ...]:
-        """Pickle with the status and the wait, which the message alone would lose."""
-        return type(self), (str(self), self.status, self.retry_after)
+        """Pickle by the constructor's arguments, which the message alone would lose."""
+        return type(self), tuple(str(self) if name == "message" else getattr(self, name) for name in self._pickled)
 
 
 class BudgetExceeded(XmasError):
@@ -108,6 +110,7 @@ class BudgetExceeded(XmasError):
     """
 
     kind = ErrorKind.BUDGET
+    _pickled = ("limit", "spent", "allowed", "calls")
 
     def __init__(
         self, limit: Literal["cost_usd", "wall_s", "calls", "cost_unknown"], spent: float, allowed: float, calls: int
@@ -127,10 +130,6 @@ class BudgetExceeded(XmasError):
         self.allowed = allowed
         self.calls = calls
 
-    def __reduce__(self) -> tuple[type[BudgetExceeded], tuple[str, float, float, int]]:
-        """Pickle by the constructor's arguments, not by the message."""
-        return type(self), (self.limit, self.spent, self.allowed, self.calls)
-
 
 class Stopped(XmasError):
     """A run was stopped on request; a caller's model wrapper raises it to end the run with status ``stopped``.
@@ -142,6 +141,7 @@ class Stopped(XmasError):
     """
 
     kind = ErrorKind.STOPPED
+    _pickled = ("reason", "meta", "text")
 
     def __init__(self, reason: str = "stopped", meta: CallMeta | None = None, text: str = "") -> None:
         """Keep the reason as the message, and the cut call's meta and partial answer."""
@@ -149,10 +149,6 @@ class Stopped(XmasError):
         self.reason = reason
         self.meta = meta
         self.text = text
-
-    def __reduce__(self) -> tuple[type[Stopped], tuple[str, CallMeta | None, str]]:
-        """Pickle with the meta and the partial answer, which the message alone would lose."""
-        return type(self), (self.reason, self.meta, self.text)
 
 
 class RaceLost(Stopped):
@@ -179,15 +175,13 @@ class EmptyResponse(XmasError):
         kind: Why the answer was empty, such as ``LENGTH_CUT`` or ``REFUSAL``.
     """
 
+    _pickled = ("message", "kind", "meta")
+
     def __init__(self, message: str, kind: ErrorKind = ErrorKind.UNKNOWN, meta: CallMeta | None = None) -> None:
         """Keep the message, the kind and the paid attempts' metadata."""
         super().__init__(message)
         self.kind = kind
         self.meta = meta
-
-    def __reduce__(self) -> tuple[type[EmptyResponse], tuple[str, ErrorKind, CallMeta | None]]:
-        """Pickle with the kind and the meta, which the message alone would lose."""
-        return type(self), (str(self), self.kind, self.meta)
 
 
 class BadFormat(XmasError):
@@ -202,6 +196,7 @@ class BadFormat(XmasError):
     """
 
     kind = ErrorKind.BAD_FORMAT
+    _pickled = ("node", "problems", "meta")
 
     def __init__(self, node: str, problems: tuple[str, ...], meta: CallMeta | None = None) -> None:
         """Build the message that names the node and every problem."""
@@ -209,10 +204,6 @@ class BadFormat(XmasError):
         self.node = node
         self.problems = tuple(problems)
         self.meta = meta
-
-    def __reduce__(self) -> tuple[type[BadFormat], tuple[str, tuple[str, ...], CallMeta | None]]:
-        """Pickle by the constructor's arguments, not by the message."""
-        return type(self), (self.node, self.problems, self.meta)
 
 
 MONEY_WORDS = re.compile(

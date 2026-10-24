@@ -28,6 +28,7 @@ This is a leaf module: it imports no other xmas module.
 
 from __future__ import annotations
 
+import operator
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -46,7 +47,8 @@ KEYWORDS = frozenset({"and", "or", "not", "in", "true", "false", "null"})
 """The words of the grammar itself."""
 
 _LITERALS = {"true": True, "false": False, "null": None}
-_COMPARISONS = frozenset({"==", "!=", "<", "<=", ">", ">=", "in", "not in"})
+_ORDER = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
+_COMPARISONS = frozenset({"==", "!=", "in", "not in", *_ORDER})
 _TOKEN = re.compile(
     r"""(?P<space>\s+)
     |(?P<number>-?\d+(?:\.\d+)?)
@@ -172,36 +174,46 @@ class _Parser:
         self.index += 1
         return token
 
-    def enter(self, position: int) -> None:
-        """Count one level of nesting, refusing the 33rd."""
+    def nested(self, position: int, parse: Callable[[], Any]) -> Any:
+        """Run ``parse`` one level of nesting deeper, refusing the 33rd level."""
         self.depth += 1
         if self.depth > MAX_DEPTH:
             raise PredicateError(f"predicate nests deeper than {MAX_DEPTH}", position)
+        parsed = parse()
+        self.depth -= 1
+        return parsed
+
+    def items(self, close: str, item: Callable[[], Any]) -> list[Any]:
+        """Parse ``item (',' item)*`` up to and including ``close``."""
+        found: list[Any] = []
+        while self.peek() not in (close, None):
+            if found:
+                self.take(",")
+            found.append(item())
+        self.take(close)
+        return found
+
+    def joined(self, word: str, part: Callable[[], tuple[Any, ...]]) -> tuple[Any, ...]:
+        """Parse ``part (word part)*``."""
+        parts = [part()]
+        while self.peek() == word:
+            self.take()
+            parts.append(part())
+        return parts[0] if len(parts) == 1 else (word, tuple(parts))
 
     def expr(self) -> tuple[Any, ...]:
         """Parse ``conj ('or' conj)*``."""
-        parts = [self.conj()]
-        while self.peek() == "or":
-            self.take()
-            parts.append(self.conj())
-        return parts[0] if len(parts) == 1 else ("or", tuple(parts))
+        return self.joined("or", self.conj)
 
     def conj(self) -> tuple[Any, ...]:
         """Parse ``neg ('and' neg)*``."""
-        parts = [self.neg()]
-        while self.peek() == "and":
-            self.take()
-            parts.append(self.neg())
-        return parts[0] if len(parts) == 1 else ("and", tuple(parts))
+        return self.joined("and", self.neg)
 
     def neg(self) -> tuple[Any, ...]:
         """Parse ``'not' neg | comp``."""
         if self.peek() != "not":
             return self.comp()
-        self.enter(self.take()[2])
-        inner = self.neg()
-        self.depth -= 1
-        return ("not", inner)
+        return ("not", self.nested(self.take()[2], self.neg))
 
     def comp(self) -> tuple[Any, ...]:
         """Parse ``atom [op atom]``, reading ``not in`` as one operator."""
@@ -221,16 +233,11 @@ class _Parser:
         if (literal := _literal(kind, value)) is not _MISSING:
             return ("lit", literal)
         if value == "(":
-            self.enter(position)
-            inner = self.expr()
+            inner: tuple[Any, ...] = self.nested(position, self.expr)
             self.take(")")
-            self.depth -= 1
             return inner
         if value == "[":
-            self.enter(position)
-            items = self.literals()
-            self.depth -= 1
-            return ("lit", items)
+            return ("lit", self.nested(position, lambda: self.items("]", self.literal)))
         if kind != "name" or value in KEYWORDS:
             raise PredicateError(f"unexpected {value!r}", position)
         if value.startswith("__"):
@@ -245,18 +252,12 @@ class _Parser:
             raise PredicateError(f"{value} needs an argument in brackets", position)
         return ("path", self.path(value))
 
-    def literals(self) -> list[Any]:
-        """Parse the rest of ``'[' literal (',' literal)* ']'``."""
-        items: list[Any] = []
-        while self.peek() not in ("]", None):
-            if items:
-                self.take(",")
-            kind, value, position = self.take()
-            if (literal := _literal(kind, value)) is _MISSING:
-                raise PredicateError(f"a list holds literals only, got {value!r}", position)
-            items.append(literal)
-        self.take("]")
-        return items
+    def literal(self) -> Any:
+        """Parse one literal of a list."""
+        kind, value, position = self.take()
+        if (literal := _literal(kind, value)) is _MISSING:
+            raise PredicateError(f"a list holds literals only, got {value!r}", position)
+        return literal
 
     def path(self, first: str) -> tuple[str, ...]:
         """Parse the rest of ``name ('.' name)*``."""
@@ -271,14 +272,7 @@ class _Parser:
 
     def call(self, name: str, position: int) -> tuple[Any, ...]:
         """Parse ``'(' args ')'`` after ``name``, checking the built-ins' arguments."""
-        self.enter(self.take("(")[2])
-        args: list[tuple[Any, ...]] = []
-        while self.peek() not in (")", None):
-            if args:
-                self.take(",")
-            args.append(self.expr())
-        self.take(")")
-        self.depth -= 1
+        args: list[tuple[Any, ...]] = self.nested(self.take("(")[2], lambda: self.items(")", self.expr))
         if name in ("cost", "elapsed"):
             raise PredicateError(f"{name} takes no arguments", position)
         if name in BUILTINS and len(args) != 1:
@@ -376,25 +370,15 @@ def _compare(op: str, left: Any, right: Any) -> bool:
     if op == "!=":
         return not _equal(left, right)
     if op in ("in", "not in"):
-        if isinstance(right, str):
-            found = isinstance(left, str) and left in right
-        elif isinstance(right, list | tuple):
+        if isinstance(right, list | tuple):
             found = any(_equal(left, item) for item in right)
-        elif isinstance(right, Mapping):
-            found = isinstance(left, str) and left in right
-        else:
-            found = False
+        else:  # a substring of a text, a key of an object
+            found = isinstance(right, str | Mapping) and isinstance(left, str) and left in right
         return found if op == "in" else not found
     numbers = all(isinstance(side, int | float) and not isinstance(side, bool) for side in (left, right))
     if not numbers and not (isinstance(left, str) and isinstance(right, str)):
         return False
-    if op == "<":
-        return bool(left < right)
-    if op == "<=":
-        return bool(left <= right)
-    if op == ">":
-        return bool(left > right)
-    return bool(left >= right)
+    return bool(_ORDER[op](left, right))
 
 
 def _equal(left: Any, right: Any) -> bool:

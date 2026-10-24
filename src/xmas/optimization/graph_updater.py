@@ -23,7 +23,7 @@ class GraphUpdater:
     Three things happen for every candidate, and skipping any one of them makes the search
     look like it is working while it is not:
 
-    1. the edge set is mutated, by the operators ported from the seed;
+    1. the edge set is mutated (:mod:`xmas.optimization.topology`);
     2. every agent's declared inputs are rewired to its new predecessors, because
        an agent that keeps its old inputs never reads the new edge;
     3. the prompts of the agents whose inputs changed are rewritten, because a
@@ -145,16 +145,13 @@ class GraphUpdater:
         pending: list[Rewrite] = []
         for name in inputs:
             parent = mas.agents.get(name)
-            if parent is None:
-                prompt, output = NEW_AGENT_PROMPT.format(name=name), self.output_of(mas, name)
-                agents[name] = Agent(name, prompt, output=output, inputs=inputs[name])
-            elif sorted(parent.inputs) == sorted(inputs[name]):
+            if parent is not None and sorted(parent.inputs) == sorted(inputs[name]):
                 agents[name] = parent.copy()  # its reads stay as they are, renamed ones included
-            else:
-                agents[name] = parent.copy(inputs=inputs[name])
-            if parent is None or sorted(parent.inputs) != sorted(inputs[name]):
-                agent = agents[name]
-                pending.append(Rewrite(agent=name, prompt=agent.prompt, output=agent.output, inputs=inputs[name]))
+                continue
+            if parent is None:
+                parent = Agent(name, NEW_AGENT_PROMPT.format(name=name), output=self.output_of(mas, name))
+            agents[name] = agent = parent.copy(inputs=inputs[name])
+            pending.append(Rewrite(agent=name, prompt=agent.prompt, output=agent.output, inputs=inputs[name]))
 
         for request, written in zip(pending, self.synthesizer.rewrite(pending), strict=True):
             agents[request.agent] = agents[request.agent].copy(prompt=written)

@@ -74,14 +74,7 @@ class ProxyTask(BaseTask):
     """
 
     def __init__(self, agent: str, task: MASTask, board: Board) -> None:
-        """Initialize the proxy.
-
-        Args:
-            agent: The agent whose prompts this proxy scores.
-            task: The real task, whose dataset shape the proxy mirrors so that the
-                inner optimizer subsamples and blocks exactly as it would have.
-            board: The shared board the broker watches. The proxy adds itself to it.
-        """
+        """Speak for ``agent`` on ``board``, mirroring ``task``'s dataset so the inner optimizer subsamples as usual."""
         super().__init__(
             df=task.df,
             x_column=task.x_column,
@@ -106,19 +99,12 @@ class ProxyTask(BaseTask):
         eval_strategy: Any = None,
         block_idx: Any = None,  # noqa: ARG002
     ) -> EvalResult:
-        """Return attributed credit for this agent's candidate prompts.
+        """Return attributed credit, not task reward, for this agent's candidate prompts.
 
-        Args:
-            prompts: The candidate prompts.
-            predictor: Ignored. The broker owns the predictor, because a candidate
-                for one agent is only measurable inside a whole system.
-            system_prompts: Ignored, for the same reason.
-            eval_strategy: ``"evaluated"`` replays cached credit without asking
-                the broker again, matching promptolution's own contract.
-            block_idx: Ignored; the broker decides what gets run.
-
-        Returns:
-            An ``EvalResult`` whose scores are credit, not task reward.
+        The broker owns the predictor, the system prompts and the blocks, since
+        a candidate for one agent is only measurable inside a whole system.
+        ``eval_strategy="evaluated"`` replays cached credit without asking the
+        broker again, matching promptolution's own contract.
 
         Raises:
             RuntimeError: If the broker fails the round, or if two threads

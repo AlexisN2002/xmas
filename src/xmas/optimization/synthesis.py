@@ -5,12 +5,8 @@ starts receiving a variable it has no words for, and a prompt that never mention
 the variable renders without it, so the new edge changes the schedule and nothing
 else. Something has to write the sentence that uses it.
 
-The seed solved this by regenerating every prompt with a meta-model after each
-topology change, and by reading each agent's inputs back out of its prompt text
-by regex. xmas declares inputs on the agent instead, so the regeneration is
-narrower: only the agents whose inputs actually changed are rewritten, and the
-rewrite is told exactly which variables to use rather than defining them by what
-it happens to mention.
+Inputs are declared on the agent, so only the agents whose inputs actually
+changed are rewritten, and the rewrite is told exactly which variables to use.
 """
 
 from __future__ import annotations
@@ -40,10 +36,10 @@ class Rewrite:
 class LLMPromptSynthesizer:
     """Has a meta-model rewrite each prompt around its new inputs.
 
-    This is the seed's approach, narrowed. The model is told the agent's job, what
-    it writes and exactly which variables it now receives, and is asked to keep
-    the job the same. A response that does not come back in ``<prompt>`` tags, or
-    that fails to reference every input, is rejected in favour of the mechanical
+    The model is told the agent's job, what it writes and exactly which
+    variables it now receives, and is asked to keep the job the same. A
+    response that does not come back in ``<prompt>`` tags, or that fails to
+    reference every input, is rejected in favour of the mechanical
     fallback, because a prompt that silently drops a variable would make the
     topology change inert again and look like it had been handled.
 
@@ -78,23 +74,12 @@ It now receives these variables: {inputs}
 """
 
     def __init__(self, llm: BaseLLM) -> None:
-        """Initialize the synthesizer.
-
-        Args:
-            llm: The meta-model that writes the prompts.
-        """
+        """Write prompts with the meta-model ``llm``."""
         self.llm = llm
         self.fallbacks = 0
 
     def rewrite(self, requests: list[Rewrite]) -> list[str]:
-        """Rewrite each agent's prompt around its new inputs.
-
-        Args:
-            requests: The agents to rewrite.
-
-        Returns:
-            One prompt per request, in the order given.
-        """
+        """Rewrite each agent's prompt around its new inputs: one prompt per request, in order."""
         if not requests:
             return []
         responses = self.llm.get_response([rewrite_instruction(self.REWRITE_PROMPT, request) for request in requests])
@@ -119,14 +104,7 @@ class MechanicalSynthesizer:
     """
 
     def rewrite(self, requests: list[Rewrite]) -> list[str]:
-        """Return a mechanically written prompt per request.
-
-        Args:
-            requests: The agents to rewrite.
-
-        Returns:
-            One prompt per request, in the order given.
-        """
+        """Return a mechanically written prompt per request, in order."""
         return [mechanical_prompt(request) for request in requests]
 
 
@@ -137,12 +115,6 @@ def mechanical_prompt(request: Rewrite) -> str:
     breaks: the agent's own instruction is preserved and a labelled block naming
     each input is appended, so the new information reaches the model even though
     nothing wrote prose about it.
-
-    Args:
-        request: The agent to write for.
-
-    Returns:
-        A prompt referencing every input in ``request``.
     """
     body = request.prompt.strip()
     if not missing_inputs(body, request):

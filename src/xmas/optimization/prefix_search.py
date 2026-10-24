@@ -96,7 +96,3 @@ class PrefixSearchOptimizer(MASOptimizer):
         self.step += 1
         base = self.mas.agents[agent].prompt
         return [self.mas, *(self.mas.copy(prompts={agent: f"{prefix} {base}".strip()}) for prefix in self.prefixes)]
-
-    def select(self, candidates: list[MAS], scores: list[float]) -> MAS:
-        """Return the highest-scoring candidate; a tie keeps the incumbent, which comes first."""
-        return candidates[scores.index(max(scores))]

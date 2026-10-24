@@ -24,6 +24,7 @@ into the store) or a :class:`~xmas.media.Ref`; a remote one sends media blocks
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import typing
@@ -152,19 +153,11 @@ class Tool:
         schema["properties"] = {key: value for key, value in properties.items() if key not in params}
         if "required" in schema:
             schema["required"] = [key for key in schema["required"] if key not in params]
-        return Tool(
-            self.name,
-            self.description,
-            schema,
-            self.fn,
-            self.arguments_model,
-            self.writes,
-            {**self.params, **params},
-        )
+        return dataclasses.replace(self, parameters=schema, params={**self.params, **params})
 
     def renamed(self, name: str) -> Tool:
         """Return this tool under another name."""
-        return Tool(name, self.description, self.parameters, self.fn, self.arguments_model, self.writes, self.params)
+        return dataclasses.replace(self, name=name)
 
     def validate(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Return model-supplied arguments as keyword arguments for ``fn``, or raise ``XmasError``.
@@ -320,9 +313,6 @@ def tool(
             ``str``, else json. Several writes need ``fn`` to return a mapping
             with exactly those keys.
 
-    Returns:
-        The :class:`Tool`, or a decorator producing one when ``fn`` is not given.
-
     Raises:
         ValueError: If the function cannot be described (missing hint or
             docstring, unschemable type, bad name).
@@ -433,27 +423,18 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
                 result = json.loads(text)
             except json.JSONDecodeError as exc:
                 raise BadFormat(spec.name, (f"the result is not JSON: {exc}",)) from exc
-    if len(writes) == 1:
-        produced = {next(iter(writes)): result}
-    elif isinstance(result, Mapping) and set(result) == set(writes):
-        produced = dict(result)
-    else:
+    if len(writes) > 1 and not (isinstance(result, Mapping) and set(result) == set(writes)):
         got = sorted(result) if isinstance(result, Mapping) else type(result).__name__
         raise BadFormat(spec.name, (f"expected a mapping with keys {sorted(writes)}, got {got}",))
-    if any(media_kind(vtype) is not None for vtype in writes.values()):
-        media = store()
-        coerced: dict[str, Any] = {}
-        for name, value in produced.items():
-            try:
-                coerced[name] = coerce_media(value, writes[name], store=media)
-            except ValueError as error:  # a returned Path that is no file
-                raise BadFormat(spec.name, (f"{name}: {error}",)) from error
-        produced = coerced
-    problems = [
-        f"{name}: {problem}"
-        for name, value in produced.items()
-        if (problem := check_value(value, writes[name])) is not None
-    ]
+    produced = {next(iter(writes)): result} if len(writes) == 1 else dict(result)
+    media, problems = store(), []
+    for name, value in produced.items():
+        try:
+            produced[name] = coerce_media(value, writes[name], store=media)
+        except ValueError as error:  # a returned Path that is no file
+            raise BadFormat(spec.name, (f"{name}: {error}",)) from error
+        if (problem := check_value(produced[name], writes[name])) is not None:
+            problems.append(f"{name}: {problem}")
     if problems:
         raise BadFormat(spec.name, ("; ".join(problems),))
     return produced
@@ -512,16 +493,9 @@ def run_tool_loop(
         XmasError: If a tool source refused the caller (``status`` 401, 403 or 429).
     """
     from xmas.llms.meta import supports_meta  # here, not at the top: xmas.llms imports this module
-    from xmas.llms.parts import has_media, record_text, to_content
+    from xmas.llms.parts import prompt_messages
 
-    if isinstance(rendered, str):
-        content: str | list[dict[str, Any]] = rendered
-    else:
-        content = to_content(rendered) if has_media(rendered) else record_text(rendered)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": content},
-    ]
+    messages = prompt_messages(rendered, system_prompt)
     specs = [spec for spec, _ in tools.values()]
     calls: list[ToolCall] = []
     usage = TokenUsage()

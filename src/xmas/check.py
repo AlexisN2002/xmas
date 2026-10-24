@@ -4,12 +4,11 @@
 expensively: does each value a node reads exist before the node runs, is each
 value written once (or by alternatives), does each prompt placeholder name a
 read, do the names and types of steps and boxes fit, do the edges decide on
-values that exist, and is every node with several incoming edges a merge or a
+values that exist, is every node with several incoming edges a merge or a
 join, can each agent's model read and write the kinds the agent does, does each
 human node fit its form and its reads, and is each ``first of`` race sound. It
 collects every problem and raises them together, so one edit cycle fixes them
-all. A version 1 system never comes here; it keeps
-``validate_graph`` and ``terminal_agent``.
+all.
 
 A ``for each`` chain is checked twice: inside, as a system of its own that one
 item runs, and outside, collapsed into its head, which reads what the chain
@@ -19,7 +18,7 @@ reads from outside and writes each value the chain writes as a list.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -46,12 +45,13 @@ from xmas.predicates import BUILTINS, KEYWORDS, Predicate, PredicateError, parse
 from xmas.prompts import extract_placeholders
 from xmas.routes import Join, RouteGraph
 from xmas.schemas import compile_form
-from xmas.values import JSON, KINDS, LIST_PREFIX, MEDIA, TEXT, ValueType, fits, media_kind, parse_type
+from xmas.values import JSON, KINDS, LIST_PREFIX, TEXT, ValueType, fits, media_kind, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
 
     from xmas.mas import MAS
+    from xmas.media import Capabilities
     from xmas.tools import Tool
 
 MERGE_LAST = "last"
@@ -60,20 +60,22 @@ MERGE_LAST = "last"
 ROUTED_ERRORS = frozenset(kind.value for kind in ErrorKind if kind not in RUN_ENDS)
 """The error kinds an ``on error`` edge may route; a run always stops on the others."""
 
-AVAILABLE = frozenset({TEXT, JSON, *MEDIA})
-"""The value kinds a system may use: every kind; a ``list of`` them, at any depth, as well."""
-
 SENT = ("image", "audio")
 """The kinds a model reads as content parts, when it accepts them; a ``file`` it reads as its ref's JSON line."""
 
 _CONVERSIONS = {"document": "document_text", "table": "table_rows"}
 """The built-in :mod:`xmas.convert` step that turns each kind a model never reads into text or rows."""
 
+_CANNOT = {"accepts": ("send content parts", "parts"), "produces": ("answer with images", "image")}
+"""What a model object without ``generate_<word>_with_meta`` cannot do, per capability: ``(what, word)``."""
+
 RESERVED_READS = {"error": JSON, "run": JSON}
 """Values xmas fills and no node writes. ``error``, ``{kind, message, node}`` of
 the failure routed to a node, is readable by a node an ``on error`` edge reaches
 and on that node's edges; ``run``, ``{cost_usd, elapsed_s, calls, records}`` so
 far, is readable anywhere but in a box."""
+
+_ERRED_ONLY = "which only a node an on error edge reaches can read"
 
 RESERVED = frozenset({*KINDS, *LIST_PREFIX.split(), *BUILTINS, *KEYWORDS, *RESERVED_READS})
 """Names no value may take: the type words, the words of predicates and the
@@ -160,24 +162,24 @@ def _value_problems(name: str) -> Iterator[str]:
         yield "starts with '__'; such names belong to xmas"
 
 
-def holds_human(system: MAS) -> bool:
-    """Return whether a system, or a box in it at any depth, has a human node: whether its runs may pause."""
-    return bool(system.humans) or any(holds_human(box.system) for box in system.boxes.values())
-
-
-def _holds_chain(system: MAS) -> bool:
-    """Return whether a system, or a box in it at any depth, has a ``for each`` chain."""
-    return bool(system.each) or any(_holds_chain(box.system) for box in system.boxes.values())
-
-
-def _contains(system: MAS, target: MAS, seen: set[int]) -> bool:
-    """Return whether ``target`` is ``system`` or sits in one of its boxes, at any depth."""
-    if system is target:
+def _deep(system: MAS, holds: Callable[[MAS], bool], seen: set[int] | None = None) -> bool:
+    """Return whether ``holds`` is true of ``system`` or of the system of a box in it, at any depth."""
+    if holds(system):
         return True
+    seen = set() if seen is None else seen
     if id(system) in seen:
         return False
     seen.add(id(system))
-    return any(_contains(box.system, target, seen) for box in system.boxes.values())
+    return any(_deep(box.system, holds, seen) for box in system.boxes.values())
+
+
+def _pauses(mas: MAS, name: str) -> bool:
+    """Return whether a node is a human, or a box whose system holds one at any depth."""
+    return name in mas.humans or (name in mas.boxes and _deep(mas.boxes[name].system, lambda s: bool(s.humans)))
+
+
+def _pairs(edges: Sequence[Edge], kind: EdgeKind) -> list[tuple[str, str]]:
+    return [(edge.source, edge.target) for edge in edges if edge.kind is kind]
 
 
 def _edge_problems(edges: tuple[Edge, ...], endpoints: set[str]) -> tuple[list[str], dict[Edge, Predicate], bool]:
@@ -278,7 +280,7 @@ def _node_io(mas: MAS, nodes: dict[str, _Node]) -> tuple[_Reads, _Writes, dict[s
             reads[name] = dict.fromkeys(value for value in node.reads.values() if value not in reserved)
             writes[name] = {node.answer: JSON}
         elif isinstance(node, Box):
-            if _contains(node.system, mas, set()):
+            if _deep(node.system, lambda system: system is mas):
                 problems[name].append(f"box {name!r} contains the system it sits in")
                 continue
             outer_reads, writes[name] = node.types()
@@ -348,9 +350,8 @@ def _writer_types(
 
 def _graph(nodes: list[str], edges: Sequence[Edge]) -> nx.DiGraph[str]:
     """Build the topology of nodes and edges, ``while`` edges closing loops and error edges taken on failure."""
-    loops = [(edge.source, edge.target) for edge in edges if edge.kind is EdgeKind.WHILE]
-    errors = [(edge.source, edge.target) for edge in edges if edge.kind is EdgeKind.ERROR]
-    return build_graph(nodes, [(edge.source, edge.target) for edge in edges], back=loops, errors=errors)
+    plain = [(edge.source, edge.target) for edge in edges]
+    return build_graph(nodes, plain, back=_pairs(edges, EdgeKind.WHILE), errors=_pairs(edges, EdgeKind.ERROR))
 
 
 def _topology(
@@ -360,7 +361,7 @@ def _topology(
 
     Several nodes may feed the end only of a system that declares its outputs.
     """
-    loops = [(edge.source, edge.target) for edge in edges if edge.kind is EdgeKind.WHILE]
+    loops = _pairs(edges, EdgeKind.WHILE)
     graph = _graph(nodes, edges)
     problems: list[str] = []
     try:
@@ -399,18 +400,21 @@ def _read_problems(
     for name, needed in reads.items():
         failed = routes.failed_before(name)
         for value, parameter in needed.items():
-            if value in RESERVED_READS:
-                problem = _reserved_problem(name, value, name in mas.boxes, erred)
-                if problem is not None:
-                    yield problem
-                    continue
-            elif value not in mas.inputs and value not in writers:
-                yield f"{name!r} reads {value!r}, which is neither an input nor written by any node"
+            if (box := name in mas.boxes and value in RESERVED_READS) or (value == "error" and name not in erred):
+                yield (
+                    f"box {name!r} reads {value!r}; a box reads neither 'error' nor 'run', the system inside it does"
+                    if box
+                    else f"{name!r} reads 'error', {_ERRED_ONLY}"
+                )
                 continue
-            elif value not in mas.inputs and not before[name].intersection(writers[value]):
-                yield f"{name!r} reads {value!r}, but its writers {writers[value]} do not run before it"
-            elif value not in mas.inputs and set(writers[value]) <= failed:
-                yield f"{name!r} runs only when {writers[value][0]!r} fails, so it cannot read {value!r}"
+            if value not in RESERVED_READS and value not in mas.inputs:
+                if value not in writers:
+                    yield f"{name!r} reads {value!r}, which is neither an input nor written by any node"
+                    continue
+                if not before[name].intersection(writers[value]):
+                    yield f"{name!r} reads {value!r}, but its writers {writers[value]} do not run before it"
+                elif set(writers[value]) <= failed:
+                    yield f"{name!r} runs only when {writers[value][0]!r} fails, so it cannot read {value!r}"
             if parameter is None or fits(types[value], parameter[1]):
                 continue
             inside, wanted, word = parameter
@@ -430,117 +434,117 @@ def _a(kind: str) -> str:
     return f"{'an' if kind[0] in 'aeiou' else 'a'} {kind}"
 
 
-def _model_words(mas: MAS, agent: Agent) -> tuple[str | None, str]:
-    """Return the name of an agent's model, ``None`` for an unnamed default, and how a message names it."""
-    name = agent.model if agent.model is not None else mas.default_model
-    return name, "the default model" if name is None else f"model {name!r}"
+def _lacking(subject: str, kind: str, attr: str, capabilities: Capabilities, model: str | None, called: str) -> str:
+    """Say that an agent's model does not take (``attr`` accepts) or give (produces) a kind, and how to fix it."""
+    stated: tuple[str, ...] = getattr(capabilities, attr)
+    only = " and ".join(dict.fromkeys(("text", *(word for word in stated if word not in ("text", "json")))))
+    words = ", ".join(f'"{word}"' for word in dict.fromkeys(("text", *stated, kind)))
+    fix = (
+        f"give it {attr} = ({words})"
+        if model is None
+        else f"bind a model that {attr} {kind} (models: {{{model}: {{{attr}: [{kind}]}}}})"
+    )
+    return f"{subject}, but {called} {attr} only {only}; {fix}"
 
 
-def _only(stated: tuple[str, ...]) -> str:
-    """Return what a model takes or gives, such as ``text`` or ``text and audio``."""
-    return " and ".join(dict.fromkeys(("text", *(word for word in stated if word not in ("text", "json")))))
-
-
-def _tuple(stated: tuple[str, ...], kind: str) -> str:
-    """Return the ``accepts`` or ``produces`` attribute a model would need, such as ``("text", "image")``."""
-    return "(" + ", ".join(f'"{word}"' for word in dict.fromkeys(("text", *stated, kind))) + ")"
-
-
-def _capability_problems(mas: MAS, types: Mapping[str, ValueType], members: set[str]) -> Iterator[str]:
-    """Say which agents read or write a kind their model does not take or give, and which steps hand media on badly.
+def _node_problems(
+    mas: MAS, nodes: dict[str, _Node], types: Mapping[str, ValueType], edges: Sequence[Edge], members: set[str]
+) -> Iterator[str]:
+    """Say what is wrong with the media agents and steps handle and with the forms of human nodes.
 
     A model reads an image or audio as a content part, so it must accept the
     kind and be able to send parts; it never reads a document or a table,
     which a conversion step turns into text first. An agent writing an image
-    needs a model that produces one, and no tools. A chain's members are its
-    own check's question.
+    needs a model that produces one, and no tools. A remote tool reads no
+    media. A chain's members are its own check's question.
     """
     bindable = {*mas.llms, mas.default_model}
     yield from (f"models names {name!r}, which no agent binds" for name in mas.models if name not in bindable)
-    sends: dict[str, set[str]] = {}
-    paints: set[str] = set()
-    for name, agent in mas.agents.items():
+    cannot: dict[tuple[str, str], set[str]] = {}
+    for name, node in nodes.items():
         if name in members:
             continue
-        capabilities = mas.capabilities(agent)
-        model, called = _model_words(mas, agent)
-        llm = mas.llms.get(agent.model) if agent.model is not None else mas.llm
-        for value in agent.inputs:
-            kind = media_kind(types[value]) if value in types else None
-            if kind in _CONVERSIONS:
-                yield (
-                    f"agent {name!r} reads {kind} {value!r}; a model reads {_a(kind)} through a conversion step, "
-                    f"such as one using xmas.convert.{_CONVERSIONS[kind]}"
-                )
-            elif kind in SENT and capabilities.takes(kind):
-                if llm is not None and not supports_parts(llm):
-                    sends.setdefault(called, set()).add(kind)
-            elif kind in SENT:
-                fix = (
-                    f"give it accepts = {_tuple(capabilities.accepts, kind)}"
-                    if model is None
-                    else f"bind a model that accepts {kind} (models: {{{model}: {{accepts: [{kind}]}}}})"
-                )
-                yield (
-                    f"agent {name!r} reads {kind} {value!r}, but {called} accepts only "
-                    f"{_only(capabilities.accepts)}; {fix} or convert it first with a step"
-                )
-        written = media_kind(parse_type(agent.output_type))
-        if written is None:
-            continue
-        if written != "image":
-            yield f"agent {name!r} writes {written} {agent.output!r}; a model answers with text, json or image"
-        elif agent.tools:
-            yield f"agent {name!r} writes image and has tools; an image answer takes none"
-        elif not capabilities.gives("image"):
-            fix = (
-                f"give it produces = {_tuple(capabilities.produces, 'image')}"
-                if model is None
-                else f"bind a model that produces image (models: {{{model}: {{produces: [image]}}}})"
-            )
+        if isinstance(node, Agent):
+            yield from _agent_problems(mas, name, node, types, cannot)
+        elif isinstance(node, Step):
+            yield from _step_problems(mas, name, node, types)
+        elif isinstance(node, Human) and node.form in ANSWER_FIELDS:
+            yield from _human_problems(name, node, types, edges)
+    for (called, attr), kinds in cannot.items():
+        what, word = _CANNOT[attr]
+        yield (
+            f"{called} {attr} {' and '.join(sorted(kinds))} but cannot {what}; "
+            f"use APILLM, or give it generate_{word}_with_meta and full_response = True"
+        )
+
+
+def _agent_problems(
+    mas: MAS, name: str, agent: Agent, types: Mapping[str, ValueType], cannot: dict[tuple[str, str], set[str]]
+) -> Iterator[str]:
+    """Say which kinds an agent reads or writes that its model does not take or give; ``cannot`` gathers the rest."""
+    capabilities = mas.capabilities(agent)
+    model = agent.model if agent.model is not None else mas.default_model
+    called = "the default model" if model is None else f"model {model!r}"
+    llm = mas.llms.get(agent.model) if agent.model is not None else mas.llm
+    for value in agent.inputs:
+        kind = media_kind(types[value]) if value in types else None
+        if kind in _CONVERSIONS:
             yield (
-                f"agent {name!r} writes image {agent.output!r}, but {called} produces only "
-                f"{_only(capabilities.produces)}; {fix}"
+                f"agent {name!r} reads {kind} {value!r}; a model reads {_a(kind)} through a conversion step, "
+                f"such as one using xmas.convert.{_CONVERSIONS[kind]}"
             )
-        elif llm is not None and not supports_images(llm):
-            paints.add(called)
-    for called, kinds in sends.items():
-        yield (
-            f"{called} accepts {' and '.join(sorted(kinds))} but cannot send content parts; "
-            "use APILLM, or give it generate_parts_with_meta and full_response = True"
+        elif kind in SENT and not capabilities.takes(kind):
+            subject = f"agent {name!r} reads {kind} {value!r}"
+            yield _lacking(subject, kind, "accepts", capabilities, model, called) + " or convert it first with a step"
+        elif kind in SENT and llm is not None and not supports_parts(llm):
+            cannot.setdefault((called, "accepts"), set()).add(kind)
+    written = media_kind(parse_type(agent.output_type))
+    if written is None:
+        return
+    if written != "image":
+        yield f"agent {name!r} writes {written} {agent.output!r}; a model answers with text, json or image"
+    elif agent.tools:
+        yield f"agent {name!r} writes image and has tools; an image answer takes none"
+    elif not capabilities.gives("image"):
+        yield _lacking(
+            f"agent {name!r} writes image {agent.output!r}", "image", "produces", capabilities, model, called
         )
-    for called in sorted(paints):
-        yield (
-            f"{called} produces image but cannot answer with images; "
-            "use APILLM, or give it generate_image_with_meta and full_response = True"
-        )
-    yield from _remote_media_problems(mas, types, members)
+    elif llm is not None and not supports_images(llm):
+        cannot.setdefault((called, "produces"), set()).add("image")
 
 
-def _remote_media_problems(mas: MAS, types: Mapping[str, ValueType], members: set[str]) -> Iterator[str]:
-    """Say which steps pass a media value to a remote tool, which reads text and json only."""
-    for name, step in mas.steps.items():
-        try:
-            item, _source = mas.resolve_callable(step)
-        except ValueError:  # named by the node's own problems
-            continue
-        if name in members or item.fn is not None:
-            continue
-        for value in step_maps(step, item)[0].values():
-            if value in types and media_kind(types[value]) is not None:
-                yield (
-                    f"step {name!r} passes {media_kind(types[value])} {value!r} to remote tool {step.uses!r}; "
-                    "remote tools read no media"
-                )
+def _step_problems(mas: MAS, name: str, step: Step, types: Mapping[str, ValueType]) -> Iterator[str]:
+    """Say which media values a step passes to a remote tool, which reads text and json only."""
+    try:
+        item, _source = mas.resolve_callable(step)
+    except ValueError:  # named by the node's own problems
+        return
+    for value in step_maps(step, item)[0].values() if item.fn is None else ():
+        kind = media_kind(types[value]) if value in types else None
+        if kind is not None:
+            yield f"step {name!r} passes {kind} {value!r} to remote tool {step.uses!r}; remote tools read no media"
 
 
-def _reserved_problem(name: str, value: str, box: bool, erred: set[str]) -> str | None:
-    """Say why a node may not read a reserved value, or return ``None``."""
-    if box:
-        return f"box {name!r} reads {value!r}; a box reads neither 'error' nor 'run', the system inside it does"
-    if value == "error" and name not in erred:
-        return f"{name!r} reads 'error', which only a node an on error edge reaches can read"
-    return None
+def _human_problems(name: str, human: Human, types: Mapping[str, ValueType], edges: Sequence[Edge]) -> Iterator[str]:
+    """Say which placeholders of a human node read fields of text, its options' wrong type, or a timeout's gap."""
+    typed = {placeholder: types.get(value) for placeholder, value in human.reads.items()}
+    paths = {path for text in human.templates() for path in template_paths(text) if len(path) > 1}
+    for path in sorted(paths):
+        if path[0] in typed and typed[path[0]] not in (None, JSON):
+            yield f"human {name!r}: placeholder {'.'.join(path)!r} reads a field of {typed[path[0]]} {path[0]!r}"
+    if isinstance(human.options, str):
+        root, *fields = human.options.split(".")
+        vtype = typed.get(root)
+        if (vtype is not None and vtype not in (JSON, ValueType("list", TEXT))) or (
+            fields and vtype not in (None, JSON)
+        ):
+            yield (
+                f"human {name!r}: options {human.options!r} reads {vtype} {root!r}; options read from state "
+                "are a list of text, or json holding one"
+            )
+    otherwise = any(edge.source == name and edge.kind is EdgeKind.ELSE for edge in edges)
+    if human.timeout_s is not None and human.default is None and not otherwise:
+        yield f"human {name!r} times out after {human.timeout_s:g} s with no default; give a default or else edge"
 
 
 def _predicate_problems(
@@ -559,7 +563,7 @@ def _predicate_problems(
             root, fields = path[0], ".".join(path[1:])
             if root in RESERVED_READS:
                 if root == "error" and edge.source not in erred:
-                    yield f"{where} decides on 'error', which only a node an on error edge reaches can read"
+                    yield f"{where} decides on 'error', {_ERRED_ONLY}"
                 continue
             if root not in mas.inputs and not {edge.source, *before[edge.source]}.intersection(writers.get(root, ())):
                 yield f"{where} decides on {root!r}, which is not readable at {edge.source!r}"
@@ -650,47 +654,15 @@ def _setting_problems(mas: MAS, nodes: dict[str, _Node], members: set[str]) -> I
             yield f"agents {names} share the prompt {key!r} but hold different texts; give them one text"
 
 
-def _human_problems(
-    mas: MAS, types: Mapping[str, ValueType], edges: Sequence[Edge], members: set[str]
-) -> Iterator[str]:
-    """Say which human nodes read fields of text, options of the wrong type, or time out with nothing to take.
-
-    A chain's members are its own check's question.
-    """
-    for name, human in mas.humans.items():
-        if name in members or human.form not in ANSWER_FIELDS:
-            continue
-        typed = {placeholder: types.get(value) for placeholder, value in human.reads.items()}
-        paths = {path for text in human.templates() for path in template_paths(text) if len(path) > 1}
-        for path in sorted(paths):
-            if path[0] in typed and typed[path[0]] not in (None, JSON):
-                yield f"human {name!r}: placeholder {'.'.join(path)!r} reads a field of {typed[path[0]]} {path[0]!r}"
-        if isinstance(human.options, str):
-            root, *fields = human.options.split(".")
-            vtype = typed.get(root)
-            if (vtype is not None and vtype not in (JSON, ValueType("list", TEXT))) or (
-                fields and vtype not in (None, JSON)
-            ):
-                yield (
-                    f"human {name!r}: options {human.options!r} reads {vtype} {root!r}; options read from state "
-                    "are a list of text, or json holding one"
-                )
-        otherwise = any(edge.source == name and edge.kind is EdgeKind.ELSE for edge in edges)
-        if human.timeout_s is not None and human.default is None and not otherwise:
-            yield f"human {name!r} times out after {human.timeout_s:g} s with no default; give a default or else edge"
-
-
 def _race_problems(
     mas: MAS, edges: Sequence[Edge], writes: _Writes, heads: Mapping[str, ChainShape]
 ) -> tuple[list[str], dict[str, tuple[str, ...]]]:
     """Check each ``first of`` race of the flow and return its problems and the races, ``{source: contestants}``."""
     races: dict[str, tuple[str, ...]] = {}
-    for edge in edges:
-        if edge.kind is EdgeKind.FIRST:
-            races[edge.source] = (*races.get(edge.source, ()), edge.target)
-    problems: list[str] = []
+    for source, target in _pairs(edges, EdgeKind.FIRST):
+        races[source] = (*races.get(source, ()), target)
     entered = Counter(name for contestants in races.values() for name in contestants)
-    problems += [
+    problems = [
         f"{name!r} runs in {count} first of races; a node races in one" for name, count in entered.items() if count > 1
     ]
     for source, contestants in races.items():
@@ -701,16 +673,15 @@ def _race_problems(
             problems.append(
                 f"{where}: {source!r} also decides with when, switch or else edges; race from a node of its own"
             )
+        after: dict[str, str] = {}
         for name in contestants:
             kind = "a chain head" if name in heads else "a human node" if name in mas.humans else None
             kind = "the end" if name == END else kind
+            out = [e for e in edges if e.source == name and e.kind is not EdgeKind.WHILE]
             if kind is not None:
                 problems.append(f"{where}: {name!r} is {kind}; agents, steps and boxes race")
-            elif name in mas.boxes and holds_human(mas.boxes[name].system):
+            elif _pauses(mas, name):
                 problems.append(f"{where}: box {name!r} holds a human node; a contestant never waits for a person")
-        after: dict[str, str] = {}
-        for name in contestants:
-            out = [e for e in edges if e.source == name and e.kind is not EdgeKind.WHILE]
             if any(e.kind is EdgeKind.ERROR for e in out):
                 problems.append(f"{where}: {name!r} has an on error edge; a contestant's failure is the race's")
             elif len(out) > 1 or any(e.kind is not EdgeKind.PLAIN for e in out):
@@ -744,7 +715,7 @@ def _chains(
     chains: dict[str, Chain] = {}
     problems: list[str] = []
     for shape in shapes:
-        each, where = shape.each, f"chain {shape.head!r}"
+        each = shape.each
         root = types.get(each.root)
         listed = root.item if root is not None and not each.fields else None
         item = JSON if listed is None else listed
@@ -766,7 +737,7 @@ def _chains(
         found += [
             f"box {name!r} holds a for each chain; chains do not nest"
             for name in shape.nodes
-            if isinstance(box := nodes[name], Box) and _holds_chain(box.system)
+            if isinstance(box := nodes[name], Box) and _deep(box.system, lambda system: bool(system.each))
         ]
         if not shape.exits and not mas.outputs:
             found.append("it feeds the end, which needs declared outputs")
@@ -777,7 +748,7 @@ def _chains(
             found += exc.problems
         except ValueError as exc:
             found.append(str(exc))
-        problems += [f"{where}: {problem}" for problem in found]
+        problems += [f"chain {shape.head!r}: {problem}" for problem in found]
         if not found:
             info = system._checked()
             written = {value: info.types[value] for value in info.writers}
@@ -823,12 +794,11 @@ def check_system(mas: MAS) -> SystemInfo:
     edge_problems, predicates, buildable = _edge_problems(edges, {*flow_nodes, *SENTINELS})
     race_problems, races = _race_problems(mas, edges, flow_writes, heads)
     problems += type_problems + chain_problems + edge_problems + race_problems
-    problems += _human_problems(mas, types, edges, members)
 
     flow: nx.DiGraph[str] | None = None
     routes: RouteGraph | None = None
     joins: dict[str, Join] = {}
-    erred = {edge.target for edge in edges if edge.kind is EdgeKind.ERROR}
+    erred = {target for _, target in _pairs(edges, EdgeKind.ERROR)}
     typed = {**RESERVED_READS, **types}
     if buildable:
         flow, routes, joins, topology_problems = _topology(flow_nodes, edges, bool(mas.outputs))
@@ -838,7 +808,7 @@ def check_system(mas: MAS) -> SystemInfo:
             problems += _read_problems(mas, flow_reads, typed, writers, routes, before, erred)
             problems += _predicate_problems(mas, predicates, typed, writers, before, erred)
     problems += _writer_count_problems(mas, writers, routes)
-    problems += _capability_problems(mas, {**RESERVED_READS, **types}, members)
+    problems += _node_problems(mas, nodes, typed, edges, members)
     for name, vtype in mas.outputs.items():
         if name not in types:
             problems.append(f"output {name!r} is neither an input nor written by any node")
@@ -853,10 +823,9 @@ def check_system(mas: MAS) -> SystemInfo:
     types.update((value, vtype) for value, vtype in RESERVED_READS.items() if value in read)
     graph = _graph(list(nodes), mas.edges) if shapes else flow
     writers_of = {value: tuple(names) for value, names in writers.items()}
-    pausing = tuple(name for name in flow_nodes if _may_pause(mas, heads[name].nodes if name in heads else (name,)))
+    pausing = tuple(
+        name
+        for name in flow_nodes
+        if any(_pauses(mas, node) for node in (heads[name].nodes if name in heads else (name,)))
+    )
     return SystemInfo(types, writers_of, joins, graph, predicates, chains, edges, flow, pausing, races)
-
-
-def _may_pause(mas: MAS, names: Sequence[str]) -> bool:
-    """Return whether one of the nodes is a human, or a box whose system holds one at any depth."""
-    return any(name in mas.humans or (name in mas.boxes and holds_human(mas.boxes[name].system)) for name in names)

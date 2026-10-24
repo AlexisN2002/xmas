@@ -8,7 +8,7 @@ import binascii
 import os
 import re
 import time
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from contextvars import ContextVar
@@ -25,7 +25,7 @@ from xmas.budget import SLICE_S, CancelFlag, cancel_flag
 from xmas.errors import MONEY_WORDS, EmptyResponse, ErrorKind, XmasError
 from xmas.llms.call_log import CallLog, CallRecord
 from xmas.llms.meta import CallMeta, TokenPrice, cut_meta, meta_from_completion
-from xmas.llms.parts import Part, has_media, record_text, to_content
+from xmas.llms.parts import Part, prompt_messages, record_text
 from xmas.llms.scoring import ScoredSequence
 from xmas.media import Capabilities
 from xmas.tools import Tool, ToolCallRequest, _turn_usage
@@ -34,9 +34,9 @@ from xmas.utils import approximate_tokens, error_message, retry_after_seconds, t
 
 # promptolution's _ainvoke_with_retries returns only the text, so the provider's
 # completion id travels to CallRecord.response_id(s) in this per-request slot (each
-# prompt of a batch runs as its own task). Delete it, _Completion and the two hook
-# overrides once promptolution returns the completion.
-_completion_id: ContextVar[list[str | None] | None] = ContextVar("xmas_completion_id", default=None)
+# prompt of a batch runs as its own task); a request outside that loop writes to the
+# default slot, which no one reads.
+_completion_id: ContextVar[list[str | None]] = ContextVar("xmas_completion_id", default=[None])  # noqa: B039
 
 _STREAM = {"stream": True, "stream_options": {"include_usage": True}}
 """What a streamed request adds to the request, after its other keys."""
@@ -77,15 +77,17 @@ class APILLM(promptolution.APILLM):
     """promptolution's APILLM plus :meth:`score`, tool turns, call metadata and a per-call log.
 
     :meth:`get_response` is promptolution's batching, concurrency and retries,
-    timed and logged. :meth:`generate_with_meta` sends the same request through
-    ``_ainvoke_once`` and keeps what the provider reported (tokens, cost, finish
-    reason, served model) as a :class:`~xmas.llms.meta.CallMeta`;
+    timed and logged. :meth:`generate_with_meta` sends the same request and
+    keeps what the provider reported (tokens, cost, finish reason, served
+    model) as a :class:`~xmas.llms.meta.CallMeta`;
     :meth:`get_tool_response_meta` does the same for a tool turn,
     :meth:`generate_parts_with_meta` for a prompt with pictures or sound in it,
     and :meth:`generate_image_with_meta` for an answer with images. Each sends a
-    permanent client error once (see :meth:`tool_turn_once`) and asks an empty
-    answer again with promptolution's attempt count and backoff, unless the model
-    was cut or refused; every paid attempt is summed into the meta.
+    permanent client error once and retries the rest with promptolution's
+    attempt count and backoff: any 4xx but 408, 409 and 429, and any 4xx whose
+    message or body names money (:data:`~xmas.errors.MONEY_WORDS`), is
+    permanent. Each asks an empty answer again, unless the model was cut or
+    refused; every paid attempt is summed into the meta.
 
     A call made in a run ends within a moment once the run is stopped
     (:func:`~xmas.budget.cancel_flag`): the request is cancelled, which closes
@@ -210,14 +212,9 @@ class APILLM(promptolution.APILLM):
         return params
 
     async def _ainvoke_once(self, prompt: str, system_prompt: str) -> ChatCompletion:
-        """Make one request, promptolution's or streamed, noting the provider's completion id for the caller."""
-        if self.stream:
-            completion = await self._send(self._request(prompt, system_prompt))
-        else:
-            completion = await super()._ainvoke_once(prompt, system_prompt)
-        slot = _completion_id.get()
-        if slot is not None:
-            slot[0] = completion.id
+        """Make promptolution's request, noting the provider's completion id for the caller."""
+        completion = await self._once(self._request(prompt_messages(prompt, system_prompt)))
+        _completion_id.get()[0] = completion.id
         return completion
 
     async def _ainvoke_with_retries(self, prompt: str, system_prompt: str) -> str:
@@ -331,14 +328,13 @@ class APILLM(promptolution.APILLM):
             EmptyResponse: If no attempt's response had a choice, or the model
                 was cut or refused before it wrote any text or call.
         """
-        kwargs: dict[str, Any] = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
-        kwargs.update(self._call_kwargs)
+        request = self._request(messages)
         if tools:
-            kwargs["tools"] = [spec.to_openai() for spec in tools]
+            request["tools"] = [spec.to_openai() for spec in tools]
         started_at = timestamp()
         started = time.perf_counter()
         try:
-            completion, meta = self._ask(lambda: self.tool_turn_once(kwargs), "tool turn", tool_turn=True)
+            completion, meta = self._ask(request, "tool turn", tool_turn=True)
         except Exception as error:
             self._log("generate", started, started_at, error=error, params=self.call_params())
             raise
@@ -367,9 +363,7 @@ class APILLM(promptolution.APILLM):
                 refused; otherwise after the last attempt.
             TimeoutError: If the call outlives ``gather_timeout_s + 5``.
         """
-        _, text, meta = self._generate(
-            lambda: self._retrying(lambda: self._ainvoke_once(prompt, system_prompt)), prompt, system_prompt
-        )
+        _, text, meta = self._generate(prompt, system_prompt)
         return text, meta
 
     def generate_parts_with_meta(
@@ -387,8 +381,7 @@ class APILLM(promptolution.APILLM):
             EmptyResponse: As :meth:`generate_with_meta`.
             TimeoutError: As :meth:`generate_with_meta`.
         """
-        request = self._request(parts, system_prompt)
-        _, text, meta = self._generate(lambda: self.tool_turn_once(request), parts, system_prompt)
+        _, text, meta = self._generate(parts, system_prompt)
         return text, meta
 
     def generate_image_with_meta(
@@ -411,48 +404,34 @@ class APILLM(promptolution.APILLM):
             ValueError: If a part cannot be sent (see :func:`~xmas.llms.parts.to_content`).
             TimeoutError: As :meth:`generate_with_meta`.
         """
-        request = self._request(prompt, system_prompt, modalities=list(_IMAGE_MODALITIES))
-        params = self.call_params()
-        params.setdefault("modalities", list(_IMAGE_MODALITIES))
-        completion, text, meta = self._generate(
-            lambda: self.tool_turn_once(request), prompt, system_prompt, images=True, params=params
-        )
+        completion, text, meta = self._generate(prompt, system_prompt, modalities=list(_IMAGE_MODALITIES))
         try:
             images = [_decode_image(url) for url in _image_urls(completion.choices[0].message)]
         except XmasError as error:  # the call was paid: the meta goes with the error to the meter
             raise EmptyResponse(str(error), kind=ErrorKind.BAD_FORMAT, meta=meta) from None
         return text, images, meta
 
-    def _request(self, prompt: str | Sequence[Part], system_prompt: str, **extra: Any) -> dict[str, Any]:
-        """Return promptolution's request for ``prompt``, with ``extra`` keys before ``call_kwargs``."""
-        content: str | list[dict[str, Any]]
-        if isinstance(prompt, str) or not has_media(prompt):
-            content = prompt if isinstance(prompt, str) else record_text(prompt)
-        else:
-            content = to_content(prompt)
-        messages = [{"role": "system", "content": str(system_prompt)}, {"role": "user", "content": content}]
+    def _request(self, messages: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+        """Return promptolution's request for ``messages``, with ``extra`` keys before ``call_kwargs``."""
         request: dict[str, Any] = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
         request.update(extra)
         request.update(self._call_kwargs)
         return request
 
     def _generate(
-        self,
-        send: Callable[[], Coroutine[Any, Any, ChatCompletion]],
-        prompt: str | Sequence[Part],
-        system_prompt: str,
-        *,
-        images: bool = False,
-        params: dict[str, Any] | None = None,
+        self, prompt: str | Sequence[Part], system_prompt: str, **extra: Any
     ) -> tuple[ChatCompletion, str, CallMeta]:
-        """Send one generation, record it, and move the token counters by its text parts."""
+        """Send one generation with ``extra`` request keys, record it, and move the token counters by its text."""
+        request = self._request(prompt_messages(prompt, system_prompt), **extra)
         shown = prompt if isinstance(prompt, str) else record_text(prompt)
         counted = prompt if isinstance(prompt, str) else "".join(part for part in prompt if isinstance(part, str))
-        logged = {"params": self.call_params() if params is None else params}
+        logged = {"params": self.call_params()}
+        for key, value in extra.items():
+            logged["params"].setdefault(key, value)
         started_at = timestamp()
         started = time.perf_counter()
         try:
-            completion, meta = self._ask(send, "model call", images=images)
+            completion, meta = self._ask(request, "model call", images="modalities" in extra)
         except Exception as error:
             fields = self._provenance(shown, system_prompt, None, None)
             self._log("generate", started, started_at, error=error, **logged, **fields)
@@ -465,14 +444,9 @@ class APILLM(promptolution.APILLM):
         return completion, text, meta
 
     def _ask(
-        self,
-        send: Callable[[], Coroutine[Any, Any, ChatCompletion]],
-        what: str,
-        *,
-        tool_turn: bool = False,
-        images: bool = False,
+        self, request: dict[str, Any], what: str, *, tool_turn: bool = False, images: bool = False
     ) -> tuple[ChatCompletion, CallMeta]:
-        """Send until the response has an answer, summing the paid attempts into one meta.
+        """Send ``request`` until the response has an answer, summing the paid attempts into one meta.
 
         A plain answer needs content, or with ``images`` an image; a tool turn
         needs a choice, and its text may be empty when it calls tools or
@@ -488,7 +462,7 @@ class APILLM(promptolution.APILLM):
             progress = _Progress()
             token = _progress.set(progress)
             try:
-                future = asyncio.run_coroutine_threadsafe(send(), self._loop)
+                future = asyncio.run_coroutine_threadsafe(self._send(request), self._loop)
             finally:
                 _progress.reset(token)
             completion = self._wait(future, what, flag, started, progress, paid)
@@ -554,33 +528,22 @@ class APILLM(promptolution.APILLM):
                     future.cancel()
                     raise TimeoutError(f"{what} timed out after {deadline}s") from None
 
-    async def _retrying(self, send: Callable[[], Coroutine[Any, Any, ChatCompletion]]) -> ChatCompletion:
-        """Await ``send()``, retrying with promptolution's backoff unless the error is permanent."""
+    async def _send(self, request: dict[str, Any]) -> ChatCompletion:
+        """Make ``request``, retrying with promptolution's backoff unless the error is permanent."""
         attempt = 0
         while True:
             try:
-                return await send()
+                return await self._once(request)
             except Exception as exc:
                 if _is_permanent(exc) or attempt >= self.max_retries:
                     raise
                 await asyncio.sleep(self.retry_base_delay_s * (2**attempt))
                 attempt += 1
 
-    async def tool_turn_once(self, kwargs: dict[str, Any]) -> ChatCompletion:
-        """One chat-completions call with promptolution's timeout and backoff.
-
-        A permanent client error is raised at once instead of being retried: any
-        4xx but 408 request timeout, 409 conflict and 429 rate limit, and any 4xx
-        whose message or body names money (:data:`~xmas.errors.MONEY_WORDS`: 402,
-        403 "Key limit exceeded", 429 "insufficient_quota"), which asking again
-        only repeats. Connection errors, timeouts, 5xx and a plain 429 are retried.
-        """
-        return await self._retrying(lambda: self._send(kwargs))
-
-    async def _send(self, kwargs: dict[str, Any]) -> ChatCompletion:
-        """Make one request in a slot of promptolution's semaphore, within its per-call timeout."""
+    async def _once(self, request: dict[str, Any]) -> ChatCompletion:
+        """Make ``request`` once, in a slot of promptolution's semaphore, within its per-call timeout."""
         async with self._sem:
-            return await asyncio.wait_for(self._completion(kwargs), timeout=self.call_timeout_s)
+            return await asyncio.wait_for(self._completion(request), timeout=self.call_timeout_s)
 
     async def _completion(self, kwargs: dict[str, Any]) -> ChatCompletion:
         """Send ``kwargs``; when streaming, with :data:`_STREAM` added, the chunks assembled (:func:`assemble`)."""

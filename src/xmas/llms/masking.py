@@ -9,17 +9,10 @@ from collections.abc import Sequence
 
 
 def assistant_span(tokens: Sequence[str], continuation: str) -> tuple[int, int]:
-    """Locate a continuation inside an echoed token sequence.
+    """Return the half-open ``(start, end)`` range of ``continuation`` in the echoed ``tokens``.
 
     Walks backwards from the end until the concatenated tokens equal ``continuation``
     exactly; an approximate match is never returned.
-
-    Args:
-        tokens: Every token the backend echoed, in order.
-        continuation: The exact text whose span is wanted.
-
-    Returns:
-        A half-open ``(start, end)`` index range into ``tokens``.
 
     Raises:
         ValueError: If the continuation does not align with token boundaries.
@@ -40,16 +33,9 @@ def mask_logprobs(
     logprobs: Sequence[float | None],
     continuation: str,
 ) -> list[float]:
-    """Return the log-probabilities belonging to the continuation alone.
+    """Return the log-probabilities belonging to the continuation alone, one per continuation token.
 
-    Args:
-        tokens: Every token the backend echoed, in order.
-        logprobs: Their log-probabilities. The first is usually ``None``, since
-            nothing conditions it.
-        continuation: The exact text whose log-probabilities are wanted.
-
-    Returns:
-        One log-probability per continuation token.
+    ``logprobs`` align to ``tokens``; the first is usually ``None``, since nothing conditions it.
 
     Raises:
         ValueError: If the continuation does not align with token boundaries, or

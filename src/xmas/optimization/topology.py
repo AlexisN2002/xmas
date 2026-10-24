@@ -2,23 +2,14 @@
 # architecture_evolution/{graph_ops,mutation,crossover}.py
 """Graph operators for topology search.
 
-The seed's operators work on integer-labelled graphs where node ``0`` is the
-single source and ``max(nodes)`` the single terminal, and relabel on every call.
-xmas keeps agent names instead, and expresses the boundary with the ``START`` and
-``END`` sentinels, so these operators work on the *agent* edge set: the edges
-between agents, with the sentinel wiring left to :func:`xmas.graph.build_graph`,
-which reconnects loose ends on every construction.
-
-That substitution buys the validity predicate for free. A candidate is legal
-exactly when a ``MAS`` can be built from it, which is the same check the engine
-already applies, so the sampler, the operators and the executor cannot disagree
-about what a runnable graph is.
-
-Two differences from the seed follow from it. xmas permits several agents to be
-fed from ``START``, which the seed's single-source rule forbids and which the
-canonical fan-in-to-consensus shape needs. And the single-terminal rule is
-enforced rather than assumed, because a second agent reaching ``END`` makes the
-system's output ambiguous and xmas refuses to build one.
+The operators work on the *agent* edge set, by name: the edges between agents,
+with the ``START`` and ``END`` wiring left to :func:`xmas.graph.build_graph`,
+which reconnects loose ends on every construction. A candidate is legal exactly
+when a ``MAS`` can be built from it, the same check the engine applies, so the
+sampler, the operators and the executor cannot disagree about what a runnable
+graph is. Several agents may be fed from ``START``, as a fan-in-to-consensus
+shape needs; a second agent reaching ``END`` makes the output ambiguous, so the
+single-terminal rule is enforced.
 
 A version 2 system adds what no operator may touch (:class:`Fixed`): frozen
 nodes and the endpoints of conditional edges keep every edge around them, steps
@@ -46,9 +37,7 @@ class TopologyBudget:
     """The bounds a searched topology has to stay inside.
 
     One object, consulted by the sampler, the mutation operators, the crossover
-    and the search loop alike, so that "legal" means one thing. Ported from the
-    seed's ``GraphSamplingConfig``, minus the fields that only its prompt
-    pipeline used.
+    and the search loop alike, so that "legal" means one thing.
 
     The node bounds count every node, steps and boxes included, so a system
     whose code nodes already fill ``max_agents`` cannot grow.
@@ -60,8 +49,7 @@ class TopologyBudget:
             the least a connected chain needs.
         max_edges: Most node-to-node edges.
         max_cycles: How many non-trivial strongly connected components are
-            allowed. Zero, the default, searches directed acyclic graphs only,
-            which is also the seed's default.
+            allowed. Zero, the default, searches directed acyclic graphs only.
     """
 
     min_agents: int = 2
@@ -71,11 +59,7 @@ class TopologyBudget:
     max_cycles: int = 0
 
     def __post_init__(self) -> None:
-        """Reject a budget that no topology could satisfy.
-
-        Raises:
-            ValueError: If the bounds are inconsistent.
-        """
+        """Reject a budget that no topology could satisfy."""
         if self.min_agents < 1:
             raise ValueError("min_agents must be at least 1.")
         if self.max_agents < self.min_agents:
@@ -127,10 +111,14 @@ def terminals(names: list[str], edges: Edges) -> list[str]:
 
 def cycles(names: list[str], edges: Edges) -> int:
     """Count the non-trivial strongly connected components among the agents."""
+    return sum(1 for component in nx.strongly_connected_components(_digraph(names, edges)) if len(component) > 1)
+
+
+def _digraph(names: list[str], edges: Edges) -> nx.DiGraph[str]:
     graph: nx.DiGraph[str] = nx.DiGraph()
     graph.add_nodes_from(names)
     graph.add_edges_from(edges)
-    return sum(1 for component in nx.strongly_connected_components(graph) if len(component) > 1)
+    return graph
 
 
 def sources(names: list[str], edges: Edges) -> list[str]:
@@ -153,16 +141,9 @@ def mas_edges(names: list[str], edges: Edges, entry: str | None = None) -> Edges
 
     The exit is the agent that closes the cycle, which is the same agent the
     engine gives the loop-or-continue decision to. Anything else would put the
-    decision and the way out in different places.
-
-    Args:
-        names: The candidate's agent names.
-        edges: Its agent-level edge set.
-        entry: Preferred entry agent, normally inherited from the parent. Ignored
-            if it is not among ``names`` or if the topology already has a source.
-
-    Returns:
-        The edge list, with explicit sentinel edges added where needed.
+    decision and the way out in different places. ``entry``, normally the
+    parent's, is the preferred entry, ignored if it is not among ``names`` or
+    the topology already has a source.
     """
     if not names:
         return list(edges)
@@ -176,39 +157,13 @@ def mas_edges(names: list[str], edges: Edges, entry: str | None = None) -> Edges
 
 
 def _exit_agent(names: list[str], wiring: Edges) -> str:
-    """Return the agent that should be able to leave a fully cyclic topology.
-
-    Args:
-        names: The candidate's agent names.
-        wiring: The edges so far, including the explicit ``START`` edge.
-
-    Returns:
-        The source of a cycle-closing edge, or the last agent by name if the
-        classification finds none.
-    """
-    graph: nx.DiGraph[str] = nx.DiGraph()
-    graph.add_nodes_from([START, *names])
-    graph.add_edges_from(wiring)
-    closing = sorted(back_edges(graph))
+    """Return the source of a cycle-closing edge of ``wiring``, else the last agent by name."""
+    closing = sorted(back_edges(_digraph([START, *names], wiring)))
     return closing[0][0] if closing else sorted(names)[-1]
 
 
 def is_buildable(names: list[str], edges: Edges, entry: str | None = None) -> bool:
-    """Check whether a ``MAS`` could be constructed from this candidate.
-
-    Delegates to the core's own predicate rather than restating it. The seed kept
-    a separate ``is_valid_source_terminal_graph``, which the executor then had to
-    be trusted to agree with; asking the thing that will run the candidate is one
-    fewer definition to keep in step.
-
-    Args:
-        names: The candidate's agent names.
-        edges: Its agent-level edge set.
-        entry: Preferred entry agent.
-
-    Returns:
-        Whether the topology is runnable.
-    """
+    """Whether a ``MAS`` could be constructed from this candidate, by the core's own predicate."""
     try:
         graph = build_graph(list(names), mas_edges(names, edges, entry))
         validate_graph(graph)
@@ -292,15 +247,13 @@ def add_agent(
     """Insert a new agent upstream of the terminal.
 
     The new agent is wired before the current terminal and, where there is one to
-    spare, after a randomly chosen other agent. That is the seed's shape: a node
-    arrives with somewhere to read from and somewhere to write to, so the
-    candidate stays connected without a repair pass.
+    spare, after a randomly chosen other agent, so it arrives with somewhere to
+    read from and somewhere to write to and the candidate stays connected
+    without a repair pass.
 
-    The predecessor is never the terminal itself. Wiring it there would close a
-    cycle between the two, which fails an acyclic budget, so every mutation that
-    drew this operator on a one-agent system used to be discarded and the search
-    could not grow past its first node. With no other agent available the new one
-    simply has no predecessor, and becomes the entry.
+    The predecessor is never the terminal itself, which would close a cycle
+    between the two and fail an acyclic budget. With no other agent available
+    the new one has no predecessor, and becomes the entry.
 
     A version 2 system keeps its ends, so there the new agent goes beside a
     movable edge ``a -> b`` instead, as ``a -> new -> b``: it reads what ``a``
@@ -330,7 +283,7 @@ def remove_agent(
     """Drop an agent, bridging its predecessors to its successors.
 
     Bridging rather than simply deleting is what keeps the rest of the graph
-    connected, and it is the seed's behaviour. Fixed nodes, steps and boxes are
+    connected. Fixed nodes, steps and boxes are
     never dropped, nor an agent next to a fixed node, whose edge is fixed too.
     """
     terminal = terminals(names, edges)
@@ -375,24 +328,12 @@ def mutate(
 ) -> tuple[list[str], Edges]:
     """Apply a sequence of operators, retrying the sequence if it lands outside the budget.
 
-    Retries the whole sequence rather than the last operator, and falls back to
-    the parent unchanged when none of the attempts works, which is the seed's
-    semantics. A tightly bounded search space produces a lot of invalid
+    Retries the whole sequence of ``operations`` operators rather than the last
+    one, and falls back to the parent unchanged when none of the attempts
+    works. A tightly bounded search space produces a lot of invalid
     intermediates, and retrying only the last step biases the walk toward
-    whichever operator happens to be cheapest to satisfy.
-
-    Args:
-        names: The parent's agent names.
-        edges: The parent's agent-level edge set.
-        budget: The bounds a candidate must stay inside.
-        rng: Source of randomness.
-        operations: How many operators to apply in one mutation step.
-        entry: The parent's entry agent, preferred for the child when the child's
-            entry is inside a cycle and has to be named.
-        fixed: What a version 2 parent holds still.
-
-    Returns:
-        The mutated names and edges, or the parent's unchanged.
+    whichever operator happens to be cheapest to satisfy. ``entry`` is the
+    parent's, preferred for a child whose entry is inside a cycle.
     """
     for _ in range(3):
         current_names, current_edges = list(names), list(edges)
@@ -434,15 +375,15 @@ def _apply_one(
 
 KEEP_FROM_FIRST = 0.75
 KEEP_FROM_SECOND = 0.6
-"""Inheritance rates from the seed. The first parent contributes more."""
+"""Inheritance rates: the first parent contributes more."""
 
 MAX_ATTEMPTS = 10
 """Retries before giving up on recombination.
 
-The seed's comment on this is worth keeping: falling back to a fresh random graph
-*within* an attempt turns most crossovers into reseeds in a tightly constrained
-space, which defeats the point of having two parents. So the whole recombination
-is retried, and only a total failure falls back.
+Falling back to a fresh random graph *within* an attempt turns most crossovers
+into reseeds in a tightly constrained space, which defeats the point of having
+two parents. So the whole recombination is retried, and only a total failure
+falls back.
 """
 
 
@@ -459,18 +400,7 @@ def crossover(
     A version 2 child keeps the first parent's fixed edges and inherits only
     movable ones. It is not repaired, because the repair reshapes the graph
     around one terminal; an attempt outside the rules is retried instead.
-
-    Args:
-        first: One parent's names and edges.
-        second: The other parent's.
-        budget: The bounds the child must stay inside.
-        rng: Source of randomness.
-        entry: Preferred entry agent for the child.
-        fixed: What the first parent, a version 2 system, holds still.
-
-    Returns:
-        The child's names and edges, falling back to the first parent when no
-        attempt produced something legal.
+    With no legal attempt, the child is the first parent.
     """
     for _ in range(MAX_ATTEMPTS):
         names = list(rng.choice([first[0], second[0]]))
@@ -496,15 +426,6 @@ def repair(names: list[str], edges: Edges, budget: TopologyBudget, rng: random.R
     that reach it through nothing, and an edge count anywhere at all. This walks
     it back inside the rules in that order, because each step can undo the last
     if they are done the other way round.
-
-    Args:
-        names: The child's agent names.
-        edges: The inherited edges.
-        budget: The bounds.
-        rng: Source of randomness.
-
-    Returns:
-        A repaired edge set.
     """
     current = [(source, target) for source, target in edges if source != target]
     terminal = _pick_terminal(names, current, rng)
@@ -543,9 +464,7 @@ def _connect_to_terminal(names: list[str], edges: Edges, terminal: str) -> Edges
     """Add edges until every agent has a path to the terminal."""
     current = list(edges)
     while True:
-        graph: nx.DiGraph[str] = nx.DiGraph()
-        graph.add_nodes_from(names)
-        graph.add_edges_from(current)
+        graph = _digraph(names, current)
         stranded = [name for name in names if name != terminal and not nx.has_path(graph, name, terminal)]
         if not stranded:
             return current
@@ -556,11 +475,8 @@ def _break_cycles(names: list[str], edges: Edges, terminal: str) -> Edges:
     """Drop edges until the topology is acyclic, keeping the terminal reachable."""
     current = list(edges)
     while True:
-        graph: nx.DiGraph[str] = nx.DiGraph()
-        graph.add_nodes_from(names)
-        graph.add_edges_from(current)
         try:
-            cycle = nx.find_cycle(graph)
+            cycle = nx.find_cycle(_digraph(names, current))
         except nx.NetworkXNoCycle:
             return _connect_to_terminal(names, current, terminal)
         source, target = cycle[-1][0], cycle[-1][1]
