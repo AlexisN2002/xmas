@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import statistics
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -115,29 +115,7 @@ class CallRecord:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form, one JSONL line's worth."""
-        return {
-            "operation": self.operation,
-            "model": self.model,
-            "backend": self.backend,
-            "latency_s": self.latency_s,
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "scored_tokens": self.scored_tokens,
-            "n_prompts": self.n_prompts,
-            "ok": self.ok,
-            "error": self.error,
-            "call_id": self.call_id,
-            "ts": self.ts,
-            "prompt": self.prompt,
-            "system_prompt": self.system_prompt,
-            "response": self.response,
-            "params": self.params,
-            "response_id": self.response_id,
-            "prompts": self.prompts,
-            "system_prompts": self.system_prompts,
-            "responses": self.responses,
-            "response_ids": self.response_ids,
-        }
+        return {item.name: getattr(self, item.name) for item in fields(self)}
 
 
 @dataclass
@@ -178,14 +156,9 @@ class CallLog:
     def to_jsonl(self, path: str | Path, append: bool = False) -> Path:
         """Write one JSON object per call.
 
-        Args:
-            path: Destination file.
-            append: Add to the end of an existing file instead of replacing it. Each
-                record carries its ``call_id``, so appending the same log twice is
-                detectable afterwards.
-
-        Returns:
-            The path written.
+        ``append`` adds to the end of an existing file instead of replacing it;
+        each record carries its ``call_id``, so appending the same log twice is
+        detectable afterwards. Returns the path written.
         """
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -202,7 +175,6 @@ def aggregate(log: CallLog, records: list[CallRecord]) -> dict[str, Any]:
     latencies = sorted(record.latency_s for record in records)
     input_tokens = sum(record.input_tokens for record in records)
     output_tokens = sum(record.output_tokens for record in records)
-    # Latency as a distribution, not a mean: a probe path's tail is what a batch waits on.
     latency = {"mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
     if latencies:
         latency = {
