@@ -1403,6 +1403,13 @@ def test_the_gate_checks() -> None:
     assert timed._checked().joins[END].kind == "merge"
 
 
+def test_a_mapping_write_names_the_answer() -> None:
+    typed = gate(writes={"approval": "json"})  # {name: type}, as an agent writes
+    assert typed.humans["approve"] == gate().humans["approve"] and typed._checked().humans == ("approve",)
+    with pytest.raises(ValueError, match=r"writes is a value name, \{name: json\}"):
+        gate(writes={"approval": "text"})
+
+
 @pytest.mark.parametrize(
     ("build", "phrase"),
     [

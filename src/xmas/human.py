@@ -66,6 +66,9 @@ _GIVEN = ("who", "comment", "answered_at")
 
 _YES_NO = {True: "yes", False: "no"}
 
+_ROLES = ("answer", "value")
+"""The keys of ``writes``: the answer, and an edit's edited value."""
+
 _PLACEHOLDER = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\}(?!\})")
 
 
@@ -136,8 +139,9 @@ class Human:
         form: One of :data:`FORMS`.
         reads: ``{placeholder: value}``; a list of value names reads each under
             its own name. What the person is shown.
-        writes: ``{"answer": name}``, given as the name alone; an edit adds
-            ``"value"``, the name its edited value is written under.
+        writes: ``{"answer": name}``, given as the name alone or as
+            ``{name: json}``; an edit adds ``"value"``, the name its edited
+            value is written under.
         question: The question, a template over the reads.
         options: An ask node's choices: a list of label templates, or the path
             of a read holding them (a list of text, or of ``{label: ...}`` maps).
@@ -196,8 +200,18 @@ class Human:
             raise ValueError(f"{where}: reads must name values, got {reads!r}.")
         given["reads"] = dict(pairs)
         named = {"answer": writes} if isinstance(writes, str) else given["writes"]
-        if not isinstance(named, Mapping) or not all(_is_text(v) for v in named.values()):
-            raise ValueError(f"{where}: writes is a value name or {{answer: name, value: name}}, got {writes!r}.")
+        if isinstance(named, Mapping) and len(named) == 1 and not set(named) <= set(_ROLES):
+            ((value, word),) = named.items()  # {name: type}, as an agent writes
+            named = {"answer": value} if word == "json" else named
+        if (
+            not isinstance(named, Mapping)
+            or "answer" not in named
+            or not set(named) <= set(_ROLES)
+            or not all(_is_text(v) for v in named.values())
+        ):
+            raise ValueError(
+                f"{where}: writes is a value name, {{name: json}} or {{answer: name, value: name}}, got {writes!r}."
+            )
         given["writes"] = dict(named)
         if options is not None and not isinstance(options, str):
             given["options"] = _texts(where, "options", given["options"])
@@ -258,10 +272,9 @@ class Human:
             yield f"{where}: a judge node needs a pair, the names of two reads"
         if self.form == "edit" and self.edits not in reads:
             yield f"{where}: edits names one of its reads {list(reads)}, got {self.edits!r}"
-        keys = set(self.writes)
-        wanted = {"answer", "value"} if self.form == "edit" else {"answer"}
-        if keys != wanted:
-            yield f"{where}: the {self.form} form writes {sorted(wanted)}, got {sorted(keys)}"
+        wanted = _ROLES if self.form == "edit" else _ROLES[:1]
+        if tuple(sorted(self.writes)) != wanted:
+            yield f"{where}: the {self.form} form writes {list(wanted)}, got {sorted(self.writes)}"
         yield from (
             f"{where}: labels sets {key!r}; an approve node labels 'yes' and 'no'"
             for key in sorted(set(self.labels or {}) - set(DEFAULT_LABELS))
