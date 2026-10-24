@@ -68,14 +68,17 @@ TABLE_TYPES = frozenset(
 MAX_PART_BYTES = 20 * 1024 * 1024
 """The largest media value sent to a model in one content part."""
 
-_OCTET = "application/octet-stream"
 _REMOTE = ("http://", "https://")
-_SHA_CHUNK = 1 << 20
+
+
+def base_type(media_type: str) -> str:
+    """Return a media type without its parameters, in lower case, such as ``text/csv``."""
+    return media_type.split(";", 1)[0].strip().lower()
 
 
 def kind_of(media_type: str) -> str:
     """Return the kind of a media type: ``image/*``, ``audio/*``, a document or table type, else ``file``."""
-    base = media_type.split(";", 1)[0].strip().lower()
+    base = base_type(media_type)
     family = base.split("/", 1)[0]
     if family in ("image", "audio"):
         return family
@@ -89,18 +92,6 @@ def kind_of(media_type: str) -> str:
 def fits_kind(ref: Ref, kind: str) -> bool:
     """Whether ``ref`` is a value of ``kind``; every ref is a ``file``."""
     return kind == "file" or ref.kind == kind
-
-
-def _guess_type(name: str) -> str:
-    return mimetypes.guess_type(name)[0] or _OCTET
-
-
-def _sha256_of(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(_SHA_CHUNK):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -144,12 +135,12 @@ class Ref:
         resolved = Path(path).expanduser().resolve()
         if not resolved.is_file():
             raise ValueError(f"{os.fspath(path)} is not a file")
-        return cls(
-            str(resolved),
-            media_type or _guess_type(resolved.name),
-            resolved.stat().st_size,
-            _sha256_of(resolved),
-        )
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+        guessed = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        return cls(str(resolved), media_type or guessed, resolved.stat().st_size, digest.hexdigest())
 
     @classmethod
     def from_bytes(cls, data: bytes, media_type: str, name: str = "") -> Ref:
@@ -311,13 +302,14 @@ Table = Annotated[Ref, Kind("table")]
 File = Annotated[Ref, Kind("file")]
 """Any ref."""
 
-ACCEPTABLE = ("text", "json", "image", "audio")
+_ALWAYS = ("text", "json")
+
+ACCEPTABLE = (*_ALWAYS, "image", "audio")
 """The kinds a model may accept."""
 
-PRODUCIBLE = ("text", "json", "image")
+PRODUCIBLE = (*_ALWAYS, "image")
 """The kinds a model may produce."""
 
-_ALWAYS = ("text", "json")
 _KEYS = {"accepts": ("accept", ACCEPTABLE), "produces": ("produce", PRODUCIBLE)}
 
 

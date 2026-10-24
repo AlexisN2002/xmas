@@ -14,51 +14,16 @@ import io
 import re
 from html.parser import HTMLParser
 
-from xmas.media import Document, Table
+from xmas.media import Document, Table, base_type
 from xmas.tools import tool
 
-_BLOCKS = frozenset(
-    {
-        "address",
-        "article",
-        "aside",
-        "blockquote",
-        "br",
-        "dd",
-        "div",
-        "dl",
-        "dt",
-        "figcaption",
-        "footer",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "header",
-        "hr",
-        "li",
-        "main",
-        "nav",
-        "ol",
-        "p",
-        "pre",
-        "section",
-        "table",
-        "td",
-        "th",
-        "title",
-        "tr",
-        "ul",
-    }
-)
+_BLOCKS = frozenset({
+    "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "figcaption", "footer", "h1", "h2",
+    "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "td", "th",
+    "title", "tr", "ul",
+})  # fmt: skip
 _HIDDEN = frozenset({"script", "style"})
 _DELIMITERS = {"text/csv": ",", "text/tab-separated-values": "\t"}
-
-
-def _base(media_type: str) -> str:
-    return media_type.split(";", 1)[0].strip().lower()
 
 
 class _HTMLText(HTMLParser):
@@ -100,7 +65,7 @@ def document_text(source: Document) -> str:
     Args:
         source: The document to read.
     """
-    media_type = _base(source.media_type)
+    media_type = base_type(source.media_type)
     if media_type in ("text/plain", "text/markdown"):
         return source.read_bytes().decode("utf-8")
     if media_type == "text/html":
@@ -120,7 +85,7 @@ def table_rows(table: Table) -> list[dict[str, str]]:
     Args:
         table: The table to read.
     """
-    delimiter = _DELIMITERS.get(_base(table.media_type))
+    delimiter = _DELIMITERS.get(base_type(table.media_type))
     if delimiter is None:
         raise ValueError(f"table_rows reads csv and tsv; convert {table.media_type} with a step of your own")
     reader = csv.DictReader(io.StringIO(table.read_bytes().decode("utf-8-sig"), newline=""), delimiter=delimiter)

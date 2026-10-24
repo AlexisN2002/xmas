@@ -20,7 +20,7 @@ from typing import Any
 
 from xmas.media import MEDIA_KINDS, Kind, Ref, Store, fits_kind
 
-KINDS = ("text", "json", "image", "audio", "document", "table", "file")
+KINDS = ("text", "json", *MEDIA_KINDS)
 """Every value kind of the format; ``list of <kind>`` builds on them."""
 
 _LIST = "list"
