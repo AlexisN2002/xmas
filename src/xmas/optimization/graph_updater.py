@@ -31,8 +31,9 @@ class GraphUpdater:
 
     A version 2 system mutates around what it holds still (see
     :class:`~xmas.optimization.topology.Fixed`): steps and boxes stay steps and
-    boxes, frozen agents and conditional edges stay as they are, and a
-    candidate its own check refuses is dropped rather than returned.
+    boxes, human nodes, frozen agents and conditional edges stay as they are,
+    and a candidate its own check refuses is dropped rather than returned. A
+    candidate keeps the parent's asker and run store.
 
     Attributes:
         budget: The bounds every candidate stays inside.
@@ -127,7 +128,7 @@ class GraphUpdater:
     def rebuild(self, mas: MAS, names: list[str], edges: Edges) -> MAS:
         """Build a runnable system from a mutated topology; ``ValueError`` if a version 2 candidate does not check.
 
-        Steps and boxes come over as they are, and so do the agents whose
+        Steps, boxes and human nodes come over as they are, and so do the agents whose
         predecessors did not change, frozen ones among them; a version 2 system
         also keeps its conditional edges and its named ``START``/``END`` edges,
         in the parent's order.
@@ -169,6 +170,8 @@ class GraphUpdater:
             max_tool_rounds=mas.max_tool_rounds,
             max_visits=mas.max_visits,
             budget=mas.budget,
+            asker=mas.asker,
+            store=mas.store,
             **mas._v2_kwargs(),
         )
 
@@ -220,10 +223,10 @@ class GraphUpdater:
         every frozen agent and every endpoint of a conditional edge. Any other
         agent keeps the reads still satisfiable (an input, or written by a node
         that now runs before it) and gains every value its new predecessors
-        write; one left with nothing reads the system's inputs. Steps and boxes
-        are not rewired.
+        write; one left with nothing reads the system's inputs. Steps, boxes and
+        human nodes are not rewired.
         """
-        code = {*mas.steps, *mas.boxes}
+        code = {*mas.steps, *mas.boxes, *mas.humans}
         writes: dict[str, set[str]] = {name: {self.output_of(mas, name)} for name in names if name not in code}
         agents = list(writes)
         for value, writers in mas._checked().writers.items():
@@ -249,8 +252,8 @@ class GraphUpdater:
     # --------------------------------------------------------------- helpers
 
     def names_of(self, mas: MAS) -> list[str]:
-        """Return a system's node names: agents, then steps, then boxes."""
-        return [*mas.agents, *mas.steps, *mas.boxes]
+        """Return a system's node names: agents, then steps, boxes and human nodes."""
+        return [*mas.agents, *mas.steps, *mas.boxes, *mas.humans]
 
     def edges_of(self, mas: MAS) -> Edges:
         """Return a system's node-level edges as pairs, conditional ones included, without the sentinel wiring."""
@@ -260,16 +263,17 @@ class GraphUpdater:
     def fixed_of(self, mas: MAS) -> Fixed | None:
         """Return what no mutation of a version 2 system may change, or ``None`` for version 1.
 
-        Frozen nodes, the ends of conditional edges and every member of a ``for
-        each`` chain are held, so no mutation breaks a chain.
+        Frozen nodes, human nodes, the ends of conditional edges and every
+        member of a ``for each`` chain are held, so no mutation breaks a chain
+        or moves a person.
         """
         if mas.version != 2:
             return None
         conditional = [edge for edge in mas.edges if edge.kind is not EdgeKind.PLAIN]
-        held = set(mas.frozen).union(mas.each, *({edge.source, edge.target} for edge in conditional))
+        held = set(mas.frozen).union(mas.each, mas.humans, *({edge.source, edge.target} for edge in conditional))
         return Fixed(
             nodes=frozenset(held.difference(SENTINELS)),
-            code=frozenset([*mas.steps, *mas.boxes]),
+            code=frozenset([*mas.steps, *mas.boxes, *mas.humans]),
             terminals=frozenset(terminals(self.names_of(mas), self.edges_of(mas))),
             conditional=frozenset((edge.source, edge.target) for edge in conditional),
         )

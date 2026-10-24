@@ -22,6 +22,9 @@ from xmas.errors import ErrorKind, Stopped
 from xmas.graph import END
 from xmas.human import Human, Question, ReplayAsker
 from xmas.llms.meta import CallMeta
+from xmas.optimization.graph_updater import GraphUpdater
+from xmas.optimization.synthesis import MechanicalSynthesizer
+from xmas.optimization.topology import TopologyBudget
 from xmas.store import Store
 from xmas.tools import tool
 from xmas.trace import Event, Trace
@@ -170,6 +173,17 @@ def test_approve_pauses_and_resumes(tmp_path: Path) -> None:
     held = gated()
     run(held, {"query": "cats"}, "r2")
     assert resume(held, "r2", {"r2/approve/1": {"approved": False, **TOM}}).outputs["held"] == "hold"
+
+
+def test_an_optimizer_keeps_people_where_they_are() -> None:
+    mas = gated(asker=Asker(), store=Store())
+    updater = GraphUpdater(MechanicalSynthesizer(), TopologyBudget(min_agents=2, max_agents=5, max_edges=8), seed=0)
+    fixed = updater.fixed_of(mas)
+    assert fixed is not None and "approve" in fixed.nodes and "approve" in fixed.code
+    rebuilt = updater.rebuild(mas, updater.names_of(mas), updater.edges_of(mas))
+    assert rebuilt.humans == mas.humans and (rebuilt.asker, rebuilt.store) == (mas.asker, mas.store)
+    assert set(rebuilt.agents) == {"writer", "ship", "hold"}
+    assert rebuilt.run_state({"query": "cats"}, run_id="o1").status == "paused"
 
 
 def test_a_pause_lets_other_branches_end() -> None:
