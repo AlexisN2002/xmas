@@ -1805,9 +1805,8 @@ def test_questions_and_answers_without_a_run() -> None:
     assert Trace("q", "").pause is None and "pause" not in Trace("q", "").to_dict()
 
 
-@pytest.mark.skipif(not hasattr(RunStatus, "PAUSED"), reason="needs RunStatus.PAUSED")
 def test_a_paused_trace_says_so() -> None:
     question = Human("a", "approve", ["query"]).ask({"query": "q"}, {}, run_id="r", visit=1, now=NOW)
     paused = Trace("q", "", pause=Pause("r", (question,)))
-    assert paused.status == "paused" and paused == Trace("q", "")
+    assert paused.status is RunStatus.PAUSED and paused == Trace("q", "")
     assert paused.to_dict()["status"] == "paused" and paused.to_dict()["pause"]["questions"][0]["id"] == "r/a/1"

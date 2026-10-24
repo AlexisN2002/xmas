@@ -312,7 +312,7 @@ class Trace:
     def status(self) -> RunStatus:
         """How the run ended: ``paused`` while it waits on a person, ``ok`` without an error, else by ``error_kind``."""
         if self.pause is not None:
-            return RunStatus("paused")
+            return RunStatus.PAUSED
         return RunStatus.OK if self.error is None else status_for(self.error_kind)
 
     @property

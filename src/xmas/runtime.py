@@ -61,7 +61,7 @@ from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from promptolution.utils.token_counter import get_token_counter
 
 from xmas.agent import Agent
-from xmas.budget import RunMeter, VisitMeter
+from xmas.budget import RUNNING, RunMeter, VisitMeter
 from xmas.check import SENT, step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
 from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, XmasError, classify
@@ -76,7 +76,7 @@ from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
 from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
-from xmas.store import Store, open_store
+from xmas.store import Store
 from xmas.tools import run_step, run_tool_loop
 from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, check_value, coerce_media, media_kind, parse_type, plain, render_value
@@ -226,16 +226,10 @@ def _asking() -> _Asking:
     return asking
 
 
-def _humans(mas: MAS) -> dict[str, Human]:
-    """Return the system's human nodes by name."""
-    humans = getattr(mas, "humans", None) or {}
-    return dict(humans) if isinstance(humans, Mapping) else {human.name: human for human in humans}
-
-
 def pauses(mas: MAS) -> bool:
     """Return whether a system can pause: it, or a chain or box in it at any depth, holds a human node."""
     inner = [box.system for box in mas.boxes.values()] + [chain.system for chain in _chains(mas).values()]
-    return bool(_humans(mas)) or any(pauses(system) for system in inner)
+    return bool(mas.humans) or any(pauses(system) for system in inner)
 
 
 def _chains(mas: MAS) -> dict[str, Chain]:
@@ -1314,7 +1308,7 @@ def compile_mas(mas: MAS) -> Any:
     """
     chains = _chains(mas)
     members = {name for chain in chains.values() for name in chain.nodes}
-    humans = {name: human for name, human in _humans(mas).items() if name not in members}
+    humans = {name: human for name, human in mas.humans.items() if name not in members}
     holding = [name for name, box in mas.boxes.items() if name not in members and pauses(box.system)]
     if humans or holding:
         schema: type[MASState] = _ChainAskState if chains else _AskState
@@ -1322,7 +1316,7 @@ def compile_mas(mas: MAS) -> Any:
         schema = _ChainState if chains else MASState
     builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(schema)
     types = mas.info.types if mas.info is not None else {}
-    elsewhere = members | set(_humans(mas))
+    elsewhere = members | set(mas.humans)
     bodies: dict[str, _NodeBody] = {}
     for agent in mas.agents.values():
         if agent.name not in elsewhere:
@@ -1522,14 +1516,14 @@ def run_state(
     query = _query(values)
     if not pauses(mas):
         return _run_all(mas, [dict(values)], [query], [prompts], on_event, run_id)[0]
-    store = _store(mas)
+    store = mas._runs()
     run_id = run_id or uuid.uuid4().hex
     if store.run(run_id) is not None:
         raise ValueError(f"Run id {run_id!r} is taken in {store!r}.")
     graph_id = mas.describe()["id"]
     meter = RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id)
     store.save_run(run_id, graph_id, "running")
-    asking = _Asking(store, getattr(mas, "asker", None), run_id, run_id, run_id)
+    asking = _Asking(store, mas.asker, run_id, run_id, run_id)
     return _advance(mas, query, _initial_state(dict(values), prompts), meter, asking)
 
 
@@ -1553,7 +1547,7 @@ def resume(
             system is not the one that paused (its ``describe()`` id), an
             answer does not fit, or no open question is answered or due.
     """
-    store = _store(mas)
+    store = mas._runs()
     row = store.run(run_id)
     if row is None:
         raise ValueError(f"{store!r} has no run {run_id!r}.")
@@ -1570,8 +1564,12 @@ def resume(
     meter = RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id)
     if row.totals is not None:
         meter.seed(row.totals)
-    asking = _Asking(store, getattr(mas, "asker", None), run_id, run_id, run_id, resumed=frozenset(row.paused))
-    snapshot = mas.compiled.copy(update={"checkpointer": store}).get_state(_run_config(mas, meter, asking=asking))
+    asking = _Asking(store, mas.asker, run_id, run_id, run_id, resumed=frozenset(row.paused))
+    try:
+        snapshot = mas.compiled.copy(update={"checkpointer": store}).get_state(_run_config(mas, meter, asking=asking))
+    except BaseException:
+        meter.close()
+        raise
     meter.records.extend(snapshot.values["records"])
     store.save_run(run_id, graph_id, "running", row.paused)
     query = _query({name: snapshot.values["values"][name] for name in mas.inputs})
@@ -1585,10 +1583,14 @@ def answer(mas: MAS, run_id: str, answers: Mapping[str, Mapping[str, Any]]) -> N
     a running run takes it when it reaches the question's wait.
 
     Raises:
-        ValueError: Listing every problem, keeping none of the answers: an id
-            that is no open question of the run, an answer that does not fit.
+        ValueError: If the run is stopped; else listing every problem, keeping
+            none of the answers: an id that is no open question of the run, an
+            answer that does not fit.
     """
-    store = _store(mas)
+    store = mas._runs()
+    run = store.run(run_id)
+    if run is not None and run.status == "stopped":
+        raise ValueError(f"Run {run_id!r} is stopped: it takes no answers.")
     checked: list[tuple[Question, Mapping[str, Any]]] = []
     problems: list[str] = []
     for question_id_, given in answers.items():
@@ -1610,13 +1612,27 @@ def answer(mas: MAS, run_id: str, answers: Mapping[str, Mapping[str, Any]]) -> N
         _keep(store, question, given)
 
 
-def _store(mas: MAS) -> Store:
-    """Return the system's run store, opening it on first use: the file named, else ``XMAS_RUNS``, else memory."""
-    store = getattr(mas, "store", None)
-    if not isinstance(store, Store):
-        store = open_store(None if store is None else str(store))
-        mas.store = store  # type: ignore[attr-defined]
-    return store
+def stop(mas: MAS, run_id: str, reason: str = "stopped") -> bool:
+    """Stop a run: a running one through its meter, a paused one in the store; ``False`` for neither.
+
+    A paused run's row becomes ``stopped`` and each of its open questions is
+    withdrawn through the asker's ``withdraw``, when it has one.
+    """
+    meter = RUNNING.get(run_id)
+    if meter is not None:
+        meter.stop(reason)
+        return True
+    store = mas._runs()
+    row = store.run(run_id)
+    if row is None or row.status != "paused":
+        return False
+    store.save_run(run_id, row.system_id, "stopped")
+    withdraw = getattr(mas.asker, "withdraw", None)
+    for question in row.paused:
+        saved = store.question(question)
+        if withdraw is not None and saved is not None and saved.payload is not None:
+            withdraw(Question.from_dict(saved.payload), reason)
+    return True
 
 
 def _advance(mas: MAS, query: str, start: MASState | Command[Any], meter: RunMeter, asking: _Asking) -> Trace:
@@ -1701,7 +1717,7 @@ def _run_all(
     states = [_initial_state(start, prompt_set) for start, prompt_set in zip(starts, prompts, strict=True)]
     graph, configs, durable = mas.compiled, [_run_config(mas, meter) for meter in meters], {}
     if pauses(mas):
-        store, asker = Store(), getattr(mas, "asker", None)
+        store, asker = Store(), mas.asker
         askings = [_Asking(store, asker, m.run_id, m.run_id, m.run_id, unattended=True) for m in meters]
         configs = [_run_config(mas, meter, asking=asking) for meter, asking in zip(meters, askings, strict=True)]
         graph, durable = graph.copy(update={"checkpointer": store}), {"durability": "exit"}

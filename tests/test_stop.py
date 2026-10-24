@@ -24,6 +24,7 @@ from xmas import MAS, Agent, Budget, TokenUsage
 from xmas.budget import RUNNING, SLICE_S, RunMeter, cancel_flag, contestant
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BudgetExceeded, ErrorKind, RaceLost, RunStatus, Stopped, classify
+from xmas.human import Human, Question
 from xmas.llms.api_llm import APILLM, assemble
 from xmas.llms.meta import CallMeta, TokenPrice
 from xmas.nodes import Box
@@ -122,10 +123,9 @@ def test_stop_ends_a_run_within_a_second() -> None:
     assert trace.health.budget["cost_usd"]["spent"] == pytest.approx(META_USD + 6 * CUT_USD)
 
 
-@pytest.mark.skipif(not hasattr(MAS, "stop"), reason="MAS.stop is not in this build")
 def test_mas_stop_keeps_cut_records_and_one_event() -> None:
     model = PollingLLM(lambda prompt: 0.0 if prompt.startswith("Plan") else 5.0)
-    mas: Any = stop_system(model)
+    mas = stop_system(model)
     events: list[Any] = []
     done: dict[str, Any] = {}
     runner = threading.Thread(
@@ -446,6 +446,46 @@ def test_stop_paused_and_unknown_runs() -> None:
     gc.collect()
     assert "turn-1" not in RUNNING  # a dropped meter leaves the registry too
     assert len({RunMeter().run_id for _ in range(3)}) == 3
+
+
+class Withdrawing:
+    """A host asker that never answers at once and notes each question it withdraws."""
+
+    def __init__(self) -> None:
+        """Note nothing yet."""
+        self.withdrawn: list[tuple[str, str]] = []
+
+    def ask(self, question: Question) -> None:
+        """Leave the question open."""
+
+    def withdraw(self, question: Question, reason: str) -> None:
+        """Note the withdrawn question."""
+        self.withdrawn.append((question.id, reason))
+
+
+def test_stop_a_paused_run() -> None:
+    asker = Withdrawing()
+    gate = Human("approve", "approve", ["draft"], "approval", question="Ship {draft}?")
+    mas = MAS(
+        [Agent("writer", "Write {query}", "draft")],
+        [("writer", "approve")],
+        humans=[gate],
+        llm=MockLLM(lambda prompt: "a draft"),
+        asker=asker,
+    )
+    assert mas.run_state({"query": "q"}, run_id="turn-2").status == "paused"
+    with pytest.raises(ValueError, match="'turn-2' is taken"):
+        mas.run_state({"query": "q"}, run_id="turn-2")
+    assert mas.stop("turn-2", "Tom pressed Stop") is True
+    assert asker.withdrawn == [("turn-2/approve/1", "Tom pressed Stop")]
+    row = mas._runs().run("turn-2")
+    assert row is not None and row.status == "stopped"
+    approved = {"turn-2/approve/1": {"approved": True, "who": "tom"}}
+    with pytest.raises(ValueError, match="is stopped, not paused"):
+        mas.resume("turn-2", approved)
+    with pytest.raises(ValueError, match="is stopped: it takes no answers"):
+        mas.answer("turn-2", approved)
+    assert mas.stop("turn-2") is False
 
 
 # ------------------------------------------------------------ first of

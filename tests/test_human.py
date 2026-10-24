@@ -16,14 +16,14 @@ import pytest
 from langgraph.checkpoint.serde.event_hooks import SerdeEvent, register_serde_event_listener
 
 from tests.conftest import MockLLM, SeeingLLM, req
-from xmas import MAS, Agent, Box, Budget, runtime
+from xmas import MAS, Agent, Box, Budget
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import ErrorKind, Stopped
 from xmas.graph import END
 from xmas.human import Human, Question, ReplayAsker
-from xmas.nodes import Step
+from xmas.llms.meta import CallMeta
 from xmas.store import Store
-from xmas.tools import Tool, tool
+from xmas.tools import tool
 from xmas.trace import Event, Trace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,59 +33,22 @@ TOM = {"who": "tom"}
 # ---------------------------------------------------------------- building systems
 
 
-def _standin(human: Human, kinds: Mapping[str, str]) -> Tool:
-    """A callable with the human's reads and writes, so the system checks with the human in its place."""
-    reads = cast("Mapping[str, str]", human.reads)
-    writes = cast("Mapping[str, str]", human.writes)
-    hints = {name: "str" if kinds.get(name, "text") == "text" else "Any" for name in dict.fromkeys(reads.values())}
-    space: dict[str, Any] = {"Any": Any}
-    params = ", ".join(f"{name}: {hint}" for name, hint in hints.items())
-    exec(f"def {human.name}({params}) -> dict:\n    '''Stand in for a human node.'''\n", space)
-    produced = {writes["answer"]: "json"}
-    if "value" in writes:
-        produced[writes["value"]] = kinds.get(reads[cast("str", human.edits)], "text")
-    return tool(space[human.name], writes=produced)
-
-
 def people(
     agents: list[Agent],
     edges: Sequence[tuple[str, str] | Edge] = (),
     humans: Sequence[Human] = (),
-    *,
-    kinds: Mapping[str, str] | None = None,
-    asker: Any = None,
-    store: Store | str | None = None,
     **kwargs: Any,
 ) -> MAS:
-    """P1: real MAS(agents, edges, humans=humans, asker=asker, store=store, **kwargs).
-
-    Until the human surface is in ``MAS``, each human checks as a step with its reads and writes (``kinds`` names
-    the non-text values it reads), and the engine finds it on ``humans``, also on the chain systems.
-    """
-    stand = [_standin(human, kinds or {}) for human in humans]
-    steps = [*kwargs.pop("steps", []), *(Step(human.name, human.name) for human in humans)]
-    mas = MAS(agents, edges, steps=steps, tools=[*kwargs.pop("tools", []), *stand], **kwargs)
-    seated = {human.name: human for human in humans}
-    mas.humans = seated  # type: ignore[attr-defined]
-    for chain in cast("Any", mas.info).chains.values():
-        chain.system.humans = {name: human for name, human in seated.items() if name in chain.nodes}
-    mas.asker, mas.store = asker, store  # type: ignore[attr-defined]
-    return mas
+    """A system of agents and people."""
+    return MAS(agents, edges, humans=humans, **kwargs)
 
 
 def run(mas: MAS, values: Mapping[str, Any], run_id: str, events: list[Event] | None = None) -> Trace:
-    """P1: mas.run_state(values, run_id=run_id, on_event=...)."""
-    return runtime.run_state(mas, values, mas.prompts(), None if events is None else events.append, run_id)
+    return mas.run_state(values, run_id=run_id, on_event=None if events is None else events.append)
 
 
 def resume(mas: MAS, run_id: str, answers: Mapping[str, Any] | None = None, events: list[Event] | None = None) -> Trace:
-    """P1: mas.resume(run_id, answers, on_event=...)."""
-    return runtime.resume(mas, run_id, answers, None if events is None else events.append)
-
-
-def answer(mas: MAS, run_id: str, answers: Mapping[str, Any]) -> None:
-    """P1: mas.answer(run_id, answers)."""
-    runtime.answer(mas, run_id, answers)
+    return mas.resume(run_id, answers, on_event=None if events is None else events.append)
 
 
 class Asker:
@@ -176,7 +139,7 @@ def test_approve_pauses_and_resumes(tmp_path: Path) -> None:
         ("Ship a draft", "Redraw"),
         {"draft": "a draft"},
     )
-    store = cast("Store", mas.store)  # type: ignore[attr-defined]
+    store = mas._runs()
     row = cast("Any", store.run("r1"))
     assert (row.status, row.paused, row.totals["calls"]) == ("paused", ("r1/approve/1",), 1)
     with pytest.raises(ValueError, match="is taken"):
@@ -283,7 +246,7 @@ def boxed_inner(*, confirm: bool = False) -> MAS:
         humans.append(Human("confirm", "approve", ["approval"], "confirmed", question="Sure?"))
         edges.append(("approve", "confirm"))
     llm = MockLLM(lambda p: "a draft")
-    return people(agents, edges, humans, kinds={"approval": "json"}, inputs={"topic": "text"}, llm=llm)
+    return people(agents, edges, humans, inputs={"topic": "text"}, llm=llm)
 
 
 def test_pauses_inside_boxes() -> None:
@@ -364,7 +327,7 @@ def test_resume_after_a_restart(tmp_path: Path) -> None:
     assert done.status == "ok" and done.outputs["shipped"] == "done"
     assert [r.agent for r in done.records] == ["writer", "approve", "ship"]
     assert done.cost_usd == pytest.approx(0.02)
-    assert cast("Any", fresh.store).run("r9").totals["calls"] == 2  # type: ignore[attr-defined]
+    assert cast("Any", fresh._runs().run("r9")).totals["calls"] == 2
 
     # The calls made before the pause count: one call left of a limit of one is none.
     subprocess.run([sys.executable, "-c", RESTART, str(tmp_path / "b.db")], cwd=ROOT, check=True, timeout=120)
@@ -387,7 +350,7 @@ def test_timeouts_take_the_default() -> None:
     waits = gated(human=gate(timeout_s=0.2, default={"approved": False}))
     paused = run(waits, {"query": "q"}, "t2")
     assert cast("Any", paused.pause).questions[0].deadline is not None
-    store = cast("Store", waits.store)  # type: ignore[attr-defined]
+    store = waits._runs()
     assert store.due() == ()
     with pytest.raises(ValueError, match="none is answered or past its deadline"):
         resume(waits, "t2")
@@ -403,14 +366,14 @@ def test_forms_and_answer_checks() -> None:
     llm = MockLLM(lambda p: '{"title": "T", "choices": ["short", "long"]}')
     pick = Human("pick", "ask", ["outline"], "picked", question="Which for {outline.title}?", options="outline.choices")
     writer = Agent("writer", "Outline {query}", "outline", output_type="json")
-    asked = people([writer], [("writer", "pick")], [pick], kinds={"outline": "json"}, llm=llm)
+    asked = people([writer], [("writer", "pick")], [pick], llm=llm)
     paused = run(asked, {"query": "q"}, "f1")
     question = cast("Any", paused.pause).questions[0]
     assert (question.text, question.options) == ("Which for T?", ("short", "long"))
     with pytest.raises(ValueError) as refused:
         resume(asked, "f1", {"f1/pick/1": {"option": "medium", "extra": 1}})
     assert all(word in str(refused.value) for word in ("medium", "extra", "who"))  # every problem in one error
-    store = cast("Store", asked.store)  # type: ignore[attr-defined]
+    store = asked._runs()
     assert cast("Any", store.run("f1")).status == "paused" and store.question("f1/pick/1").answer is None  # type: ignore[union-attr]
     assert resume(asked, "f1", {"f1/pick/1": {"option": "long", **TOM}}).outputs == {}
     assert store.question("f1/pick/1").answer["option"] == "long"  # type: ignore[union-attr,index]
@@ -473,7 +436,7 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def late(prompt: str) -> str:
         if prompt.startswith("b2"):
-            answer(holder["mas"], "e1", {"e1/approve/1": {"approved": True, **TOM}})
+            holder["mas"].answer("e1", {"e1/approve/1": {"approved": True, **TOM}})
         return prompt.split()[0]
 
     agents = [Agent("b1", "b1 {query}", "b1_out"), Agent("b2", "b2 {b1_out}", "b2_out", ["b1_out"])]
@@ -484,9 +447,9 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
     done = run(mas, {"query": "q"}, "e1", events)
     assert done.status == "ok" and {"pause", "resume"}.isdisjoint(e.kind for e in events)
     with pytest.raises(ValueError, match="answered already"):
-        answer(mas, "e1", {"e1/approve/1": {"approved": False, **TOM}})
+        mas.answer("e1", {"e1/approve/1": {"approved": False, **TOM}})
     with pytest.raises(ValueError, match="no question of run"):
-        answer(mas, "e1", {"e1/approve/9": {"approved": False, **TOM}})
+        mas.answer("e1", {"e1/approve/9": {"approved": False, **TOM}})
 
     # An answer that lands after the wait looked and before the run returns: resumed in place.
     from langgraph.types import interrupt as real
@@ -495,8 +458,8 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def landing(value: Any) -> Any:
         for question in value["questions"]:
-            if cast("Any", gated_mas.store).question(question).answer is None:  # type: ignore[attr-defined]
-                answer(gated_mas, "e2", {question: {"approved": True, **TOM}})
+            if cast("Any", gated_mas._runs().question(question)).answer is None:
+                gated_mas.answer("e2", {question: {"approved": True, **TOM}})
         return real(value)
 
     monkeypatch.setattr("xmas.runtime.interrupt", landing)
@@ -509,7 +472,7 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
     paused = run(mas, plan(*keys), "e3")
     assert len(open_ids(paused)) == 8
     threads = [
-        threading.Thread(target=answer, args=(mas, "e3", {qid: {"approved": True, **TOM}})) for qid in open_ids(paused)
+        threading.Thread(target=mas.answer, args=("e3", {qid: {"approved": True, **TOM}})) for qid in open_ids(paused)
     ]
     for thread in threads:
         thread.start()
@@ -531,7 +494,7 @@ def serde_events() -> Iterator[list[SerdeEvent]]:
 def test_store_keeps_deadlines_totals_and_threads(tmp_path: Path) -> None:
     mas = chained(side=False, store=Store(tmp_path / "runs.db"))
     run(mas, plan("a", "b"), "s1")
-    store = cast("Store", mas.store)  # type: ignore[attr-defined]
+    store = mas._runs()
     (row,) = store.runs("paused")
     assert row.paused == ("s1/fix/a/1", "s1/fix/b/1") and row.totals is not None and row.totals["calls"] == 2
     question = cast("Any", store.question("s1/fix/b/1"))
@@ -603,16 +566,24 @@ def test_a_model_without_parts_fails_clearly(png: Path) -> None:
 
 
 def test_a_stopped_visit_keeps_its_record() -> None:
-    """P3: through MAS.stop; here the model raises the stop on the visit's second call."""
-    llm = MockLLM(answers=["not json", Stopped("stopped")], meta=True)
+    """The model raises the stop on the visit's second call, after a part of its answer; the record sums both."""
+    cut = Stopped("stopped", CallMeta(latency_s=0.1, cost_usd=0.002), '{"half')
+    llm = MockLLM(answers=["not json", cut], meta=True)
     events: list[Event] = []
     mas = MAS([Agent("judge", "Judge {query}", "verdict", output_type="json")], llm=llm)
     trace = mas.run_state({"query": "q"}, on_event=events.append)
     assert trace.status == "stopped"
     (record,) = trace.records
-    assert (record.error_kind, record.cost_usd, record.route) == (ErrorKind.STOPPED, 0.01, None)
+    assert (record.error_kind, record.route, record.raw_response) == (ErrorKind.STOPPED, None, '{"half')
+    assert record.cost_usd == pytest.approx(0.012)
     assert [(e.kind, e.status) for e in events] == [("start", None), ("end", "stopped")]
-    refused = MAS(
-        [Agent("judge", "Judge {query}", "verdict", output_type="json")], llm=MockLLM(answers=[Stopped("stopped")])
-    )
-    assert refused.run_state({"query": "q"}).records == ()  # no call made, no record
+    holder: dict[str, MAS] = {}
+
+    def press(prompt: str) -> str:
+        holder["mas"].stop("s2")  # the writer's call ends; the judge's never starts
+        return "a draft"
+
+    agents = [Agent("writer", "Write {query}", "draft"), Agent("judge", "Judge {draft}", "verdict", ["draft"])]
+    holder["mas"] = pressed = MAS(agents, [("writer", "judge")], llm=MockLLM(press))
+    stopped = pressed.run_state({"query": "q"}, run_id="s2")
+    assert stopped.status == "stopped" and "judge" not in {record.agent for record in stopped.records}

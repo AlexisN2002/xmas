@@ -430,7 +430,13 @@ class MAS(BasePredictor):
         self._check_runs_on_query()
         return runtime.run_one(self, query, self.prompts())
 
-    def run_state(self, values: Mapping[str, Any], *, on_event: Callable[[Event], None] | None = None) -> Trace:
+    def run_state(
+        self,
+        values: Mapping[str, Any],
+        *,
+        on_event: Callable[[Event], None] | None = None,
+        run_id: str | None = None,
+    ) -> Trace:
         """Run the system on its inputs, given by name, and return the trace of the run.
 
         A version 2 system takes exactly its inputs, each a value of its type,
@@ -438,12 +444,54 @@ class MAS(BasePredictor):
         system takes text values, ``query`` among them, and runs as :meth:`run`
         runs. ``on_event`` hears every visit's and item's start and end; it is
         called on the run's threads, so it must be quick and thread-safe. A
-        failure inside the run is a failed trace.
+        failure inside the run is a failed trace. ``run_id`` names the run, for
+        :meth:`stop`, :meth:`answer` and :meth:`resume`; a new random id when
+        ``None``. A system with people in it returns a ``paused`` trace when a
+        question is still open once every other branch has ended.
 
         Raises:
-            ValueError: Listing every missing, extra or mistyped input, before any call.
+            ValueError: Listing every missing, extra or mistyped input, before
+                any call; or when ``run_id`` names a run running or kept.
         """
-        return runtime.run_state(self, values, self.prompts(), on_event)
+        return runtime.run_state(self, values, self.prompts(), on_event, run_id)
+
+    def resume(
+        self,
+        run_id: str,
+        answers: Mapping[str, Mapping[str, Any]] | None = None,
+        *,
+        on_event: Callable[[Event], None] | None = None,
+    ) -> Trace:
+        """Continue a paused run from its store, after keeping ``answers`` (``{question id: answer}``).
+
+        It runs on in this process or a new one, with the prompts it paused
+        with and its budget counting on; a question past its deadline takes
+        its default, and the run pauses again on a question still open.
+
+        Raises:
+            ValueError: If the store has no such run, the run is not paused,
+                this system is not the one that paused, an answer does not fit,
+                or no open question is answered or due.
+        """
+        return runtime.resume(self, run_id, answers, on_event)
+
+    def answer(self, run_id: str, answers: Mapping[str, Mapping[str, Any]]) -> None:
+        """Keep answers to a run's questions, ``{question id: answer}``, while it runs or waits.
+
+        Raises:
+            ValueError: If the run is stopped, or listing every answer that is
+                not for an open question of the run or does not fit; none is kept then.
+        """
+        runtime.answer(self, run_id, answers)
+
+    def stop(self, run_id: str, reason: str = "stopped") -> bool:
+        """Stop a run by its id; ``False`` when no such run is running or paused.
+
+        A running run starts no call, step or item after this, and its calls in
+        flight are cut; it returns a ``stopped`` trace. A paused run is marked
+        stopped in the store, its open questions withdrawn through the asker.
+        """
+        return runtime.stop(self, run_id, reason)
 
     def run_batch(self, queries: list[str]) -> list[Trace]:
         """Run the MAS over several inputs, concurrently where the LLM allows; one trace per query, in order."""
