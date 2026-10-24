@@ -7,7 +7,8 @@ information for the person reading the trace, not a rule. It reads four things:
   ``bad_format``, ``error_routed``, ``item_failed``, ``empty``, ``stuck``,
   ``unfilled``, ``leak``, ``long``, ``short``, ``item_over_budget``;
 - per ``while`` edge, how often the loop was taken and whether its cap was hit;
-- per run, each limit the budget sets, with what the run spent of it;
+- per run, each limit the budget sets, with what the run spent of it, and the
+  time human nodes waited for their answers;
 - per ``for each`` chain, its items, the failed ones and what each cost.
 """
 
@@ -93,7 +94,9 @@ class Health:
         loops: Per ``while`` edge taken or capped, keyed ``"source -> target"``:
             ``{"taken": n, "cap_hit": bool}``.
         budget: Per limit the budget sets (``"calls"``, ``"cost_usd"``,
-            ``"wall_s"``): ``{"spent": x, "limit": y}``.
+            ``"wall_s"``): ``{"spent": x, "limit": y}``; and ``"waited_s"``,
+            ``{"spent": x}``, the seconds human nodes waited for answers,
+            which no wall limit counts.
         items: Per ``for each`` chain, keyed by its head: ``{"items": n,
             "failed": k, "cost_usd": [...]}``, one cost per item in item order,
             ``None`` where a record's cost is unknown.
@@ -130,7 +133,8 @@ def summarize(
     """Read a run's records, in run order, for the health signals.
 
     The budget entry reads ``meter`` against its budget; without a meter nothing
-    was spent, so there is none. ``while_edges`` are the system's
+    was spent, so there is none. Its ``waited_s`` sums the records' ``wait_s``,
+    when any has one. ``while_edges`` are the system's
     ``(source, target)`` loops. ``values`` are the system's value names: a
     placeholder naming none of them is literal prompt text, so it is not
     ``unfilled``; when ``None``, every placeholder outside a record's inputs is.
@@ -143,7 +147,7 @@ def summarize(
     return Health(
         flags=_flags(records, settings, None if values is None else frozenset(values), over),
         loops=_loops(records, while_edges),
-        budget=_budget_use(meter),
+        budget=_budget_use(meter, records),
         items=items,
     )
 
@@ -238,19 +242,21 @@ def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]
     return loops
 
 
-def _budget_use(meter: RunMeter | None) -> dict[str, dict[str, float]]:
-    """Return ``{limit: {"spent", "limit"}}`` for each limit the meter's budget sets."""
-    budget = None if meter is None else meter.budget
-    if meter is None or budget is None:
-        return {}
+def _budget_use(meter: RunMeter | None, records: Sequence[AgentRecord]) -> dict[str, dict[str, float]]:
+    """Return ``{limit: {"spent", "limit"}}`` for each limit the meter's budget sets, then the time waited."""
     use: dict[str, dict[str, float]] = {}
-    for name, limit, spent in (
-        ("calls", budget.max_calls, meter.calls),
-        ("cost_usd", budget.max_cost_usd, meter.cost_usd),
-        ("wall_s", budget.max_wall_s, meter.elapsed_s),
-    ):
-        if limit is not None:
-            use[name] = {"spent": spent, "limit": limit}
+    budget = None if meter is None else meter.budget
+    if meter is not None and budget is not None:
+        for name, limit, spent in (
+            ("calls", budget.max_calls, meter.calls),
+            ("cost_usd", budget.max_cost_usd, meter.cost_usd),
+            ("wall_s", budget.max_wall_s, meter.elapsed_s),
+        ):
+            if limit is not None:
+                use[name] = {"spent": spent, "limit": limit}
+    waits = [record.wait_s for record in records if record.wait_s is not None]
+    if waits:
+        use["waited_s"] = {"spent": sum(waits)}
     return use
 
 

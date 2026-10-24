@@ -10,6 +10,9 @@ A spec lists its edges as items of two forms::
     - judge -> publish: {switch: verdict.action}              # case defaults to the target
     - judge -> hold: {switch: verdict.action, case: wait}
 
+    - outline -> quick_notes: first of                       # a race: the first to finish wins
+    - outline -> careful_notes: first of
+
 :func:`parse_edges` reads them into :class:`Edge` objects, one per arrow, and
 :func:`dump_edges` writes them back canonically. Whether the predicates, paths
 and error kinds make sense, and whether a pair of nodes is listed twice, is
@@ -48,6 +51,8 @@ class EdgeKind(StrEnum):
     """Taken when the switched path equals ``case``."""
     ERROR = "error"
     """Taken when the source fails with one of ``errors``."""
+    FIRST = "first of"
+    """One of a race: every ``first of`` edge of a source is taken, and the target that finishes first wins."""
 
 
 @dataclass(frozen=True)
@@ -104,8 +109,8 @@ class Edge:
         """Return the spec of a conditional edge as a spec writes it, ``None`` for a plain edge."""
         if self.kind is EdgeKind.PLAIN:
             return None
-        if self.kind is EdgeKind.ELSE:
-            return EdgeKind.ELSE.value
+        if self.kind in (EdgeKind.ELSE, EdgeKind.FIRST):
+            return self.kind.value
         if self.kind is EdgeKind.ERROR:
             return {_ON_ERROR: ANY_ERROR if self.errors == (ANY_ERROR,) else list(self.errors)}
         if self.kind is EdgeKind.SWITCH:
@@ -130,10 +135,10 @@ def _names(text: str) -> list[str]:
 def _conditional(source: str, target: str, spec: Any) -> Edge:
     """Build one edge from the spec of a one-key mapping."""
     where = f"{source} {ARROW} {target}"
-    if spec == EdgeKind.ELSE.value:
-        return Edge(source, target, EdgeKind.ELSE)
+    if spec in (EdgeKind.ELSE.value, EdgeKind.FIRST.value):
+        return Edge(source, target, EdgeKind(spec))
     if not isinstance(spec, dict):
-        raise ValueError(f"Edge {where!r}: its spec is 'else' or a mapping, not {spec!r}.")
+        raise ValueError(f"Edge {where!r}: its spec is 'else', 'first of' or a mapping, not {spec!r}.")
     deciders = [key for key in ("when", "switch", _ON_ERROR) if key in spec]
     if len(deciders) != 1:
         raise ValueError(f"Edge {where!r} needs exactly one of 'when', 'switch' or 'on error', got {sorted(spec)}.")
@@ -169,7 +174,8 @@ def parse_edges(items: Iterable[Any]) -> list[Edge]:
     """Read a spec's edge list into edges, in the order written; a chain gives one edge per arrow.
 
     The items are chain strings such as ``"a -> b -> c"`` and one-key mappings
-    such as ``{"a -> b": {"when": "..."}}`` or ``{"a -> b": "else"}``; anything
+    such as ``{"a -> b": {"when": "..."}}``, ``{"a -> b": "else"}`` or
+    ``{"a -> b": "first of"}``; anything
     else raises ValueError.
     """
     if isinstance(items, (str, dict)):

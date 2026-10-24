@@ -5,7 +5,8 @@ expensively: does each value a node reads exist before the node runs, is each
 value written once (or by alternatives), does each prompt placeholder name a
 read, do the names and types of steps and boxes fit, do the edges decide on
 values that exist, and is every node with several incoming edges a merge or a
-join, and can each agent's model read and write the kinds the agent does. It
+join, can each agent's model read and write the kinds the agent does, does each
+human node fit its form and its reads, and is each ``first of`` race sound. It
 collects every problem and raises them together, so one edit cycle fixes them
 all. A version 1 system never comes here; it keeps
 ``validate_graph`` and ``terminal_agent``.
@@ -19,7 +20,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from xmas.agent import Agent
@@ -38,8 +39,9 @@ from xmas.graph import (
     loop_problems,
     validate_graph,
 )
+from xmas.human import ANSWER_FIELDS, COMMON_FIELDS, Human, template_paths
 from xmas.llms.meta import supports_images, supports_parts
-from xmas.nodes import Box
+from xmas.nodes import Box, Step
 from xmas.predicates import BUILTINS, KEYWORDS, Predicate, PredicateError, parse_predicate
 from xmas.prompts import extract_placeholders
 from xmas.routes import Join, RouteGraph
@@ -50,7 +52,6 @@ if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
 
     from xmas.mas import MAS
-    from xmas.nodes import Step
     from xmas.tools import Tool
 
 MERGE_LAST = "last"
@@ -100,6 +101,11 @@ class SystemInfo:
             collapsed into its head.
         flow: The topology of ``edges``, what the engine wires; ``graph``
             when there is no chain.
+        humans: The nodes of the flow that may pause the run: every human
+            node, and each chain head or box whose system holds a human at
+            any depth (a pausing container).
+        races: Each ``first of`` race of the flow: its source and its
+            contestants, in declared order.
 
     A value a chain writes has its gathered type here, a list; the reserved
     reads (:data:`RESERVED_READS`) are among ``types`` when a node reads them.
@@ -113,6 +119,8 @@ class SystemInfo:
     chains: dict[str, Chain]
     edges: tuple[Edge, ...]
     flow: nx.DiGraph[str]
+    humans: tuple[str, ...] = ()
+    races: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class _CheckError(ValueError):
@@ -150,6 +158,11 @@ def _value_problems(name: str) -> Iterator[str]:
         yield "is a reserved name; pick another"
     elif name.startswith("__"):
         yield "starts with '__'; such names belong to xmas"
+
+
+def holds_human(system: MAS) -> bool:
+    """Return whether a system, or a box in it at any depth, has a human node: whether its runs may pause."""
+    return bool(system.humans) or any(holds_human(box.system) for box in system.boxes.values())
 
 
 def _holds_chain(system: MAS) -> bool:
@@ -225,12 +238,18 @@ def _edge_problems(edges: tuple[Edge, ...], endpoints: set[str]) -> tuple[list[s
 
 
 _Reads = dict[str, dict[str, tuple[str, ValueType, str] | None]]
-"""Per node, each value it reads: ``(name inside, type, type word)`` for a step or a box, ``None`` for an agent."""
+"""Per node, each value it reads: ``(name inside, type, type word)`` for a step or a box, ``None`` for an agent
+or a human."""
 _Writes = dict[str, dict[str, ValueType]]
+_Node = Agent | Step | Box | Human
 
 
-def _node_io(mas: MAS, nodes: dict[str, Agent | Step | Box]) -> tuple[_Reads, _Writes, dict[str, list[str]]]:
-    """Return what each node reads and writes, and per node the problems of its tools, prompt, callable or box."""
+def _node_io(mas: MAS, nodes: dict[str, _Node]) -> tuple[_Reads, _Writes, dict[str, list[str]]]:
+    """Return what each node reads and writes, and per node the problems of its tools, prompt, callable or box.
+
+    A human's own problems (:meth:`~xmas.human.Human.problems`) are its node's
+    problems too.
+    """
     problems: dict[str, list[str]] = {name: [] for name in nodes}
     reads: _Reads = {}
     writes: _Writes = {}
@@ -249,6 +268,15 @@ def _node_io(mas: MAS, nodes: dict[str, Agent | Step | Box]) -> tuple[_Reads, _W
                 problems[name].append(
                     f"agent {name!r}: prompt placeholders {missing} are not among its reads {list(node.reads)}"
                 )
+        elif isinstance(node, Human):
+            problems[name] += node.problems()
+            reserved = [value for value in node.reads.values() if value in RESERVED_READS]
+            problems[name] += [
+                f"human {name!r} reads {value!r}; a human reads values nodes write, not 'error' or 'run'"
+                for value in reserved
+            ]
+            reads[name] = dict.fromkeys(value for value in node.reads.values() if value not in reserved)
+            writes[name] = {node.answer: JSON}
         elif isinstance(node, Box):
             if _contains(node.system, mas, set()):
                 problems[name].append(f"box {name!r} contains the system it sits in")
@@ -276,7 +304,22 @@ def _node_io(mas: MAS, nodes: dict[str, Agent | Step | Box]) -> tuple[_Reads, _W
                 outer: (inner, parameters[inner], _schema_type(item, inner)) for inner, outer in inner_reads.items()
             }
             writes[name] = {outer: produced[inner] for inner, outer in inner_writes.items()}
+    for name, node in nodes.items():
+        if isinstance(node, Human) and "value" in node.writes and node.edits in node.reads:
+            writes[name][node.writes["value"]] = _edited_type(mas, name, node.reads[node.edits], writes)
     return reads, writes, problems
+
+
+def _edited_type(mas: MAS, name: str, value: str, writes: _Writes) -> ValueType:
+    """Return the type of the value an edit node changes: an input's, a writer's, its chain item's, else json."""
+    if value in mas.inputs:
+        return mas.inputs[value]
+    found = [produced[value] for other, produced in writes.items() if other != name and value in produced]
+    if found:
+        return found[0]
+    each = mas.each.get(name)
+    root = mas.inputs.get(each.root) if each is not None and each.item == value and not each.fields else None
+    return root.item if root is not None and root.item is not None else JSON
 
 
 def _writer_types(
@@ -527,6 +570,10 @@ def _predicate_problems(
                 yield f"{where} reads the field {fields!r} of {root!r}, which is not json"
                 continue
             for writer in writers.get(root, ()):
+                human = mas.humans.get(writer)
+                known = (*ANSWER_FIELDS.get(human.form, ()), *COMMON_FIELDS) if human is not None else ()
+                if human is not None and root == human.answer and path[1] not in known:
+                    yield f"{where} reads {root}.{fields}, but {writer!r}'s answer has the fields {list(known)}"
                 agent = mas.agents.get(writer)
                 if agent is None or agent.schema is None:
                     continue
@@ -569,7 +616,7 @@ def _writer_count_problems(mas: MAS, writers: dict[str, list[str]], routes: Rout
         )
 
 
-def _setting_problems(mas: MAS, nodes: dict[str, Agent | Step | Box], members: set[str]) -> Iterator[str]:
+def _setting_problems(mas: MAS, nodes: dict[str, _Node], members: set[str]) -> Iterator[str]:
     """Say what is wrong with the ``for each``, ``retry`` and shared prompt settings.
 
     A chain node's retry is its chain's own check's question.
@@ -581,6 +628,8 @@ def _setting_problems(mas: MAS, nodes: dict[str, Agent | Step | Box], members: s
             yield f"retry names {name!r}, which is no node"
         elif isinstance(node, Box):
             yield f"box {name!r} takes no retry; retry inside its system"
+        elif isinstance(node, Human):
+            yield f"human {name!r} takes no retry; a person answers once"
         elif name not in members:
             for kind, attempts in rules.items():
                 count: Any = attempts
@@ -601,6 +650,79 @@ def _setting_problems(mas: MAS, nodes: dict[str, Agent | Step | Box], members: s
             yield f"agents {names} share the prompt {key!r} but hold different texts; give them one text"
 
 
+def _human_problems(
+    mas: MAS, types: Mapping[str, ValueType], edges: Sequence[Edge], members: set[str]
+) -> Iterator[str]:
+    """Say which human nodes read fields of text, options of the wrong type, or time out with nothing to take.
+
+    A chain's members are its own check's question.
+    """
+    for name, human in mas.humans.items():
+        if name in members or human.form not in ANSWER_FIELDS:
+            continue
+        typed = {placeholder: types.get(value) for placeholder, value in human.reads.items()}
+        paths = {path for text in human.templates() for path in template_paths(text) if len(path) > 1}
+        for path in sorted(paths):
+            if path[0] in typed and typed[path[0]] not in (None, JSON):
+                yield f"human {name!r}: placeholder {'.'.join(path)!r} reads a field of {typed[path[0]]} {path[0]!r}"
+        if isinstance(human.options, str):
+            root, *fields = human.options.split(".")
+            vtype = typed.get(root)
+            if (vtype is not None and vtype not in (JSON, ValueType("list", TEXT))) or (
+                fields and vtype not in (None, JSON)
+            ):
+                yield (
+                    f"human {name!r}: options {human.options!r} reads {vtype} {root!r}; options read from state "
+                    "are a list of text, or json holding one"
+                )
+        otherwise = any(edge.source == name and edge.kind is EdgeKind.ELSE for edge in edges)
+        if human.timeout_s is not None and human.default is None and not otherwise:
+            yield f"human {name!r} times out after {human.timeout_s:g} s with no default; give a default or else edge"
+
+
+def _race_problems(
+    mas: MAS, edges: Sequence[Edge], writes: _Writes, heads: Mapping[str, ChainShape]
+) -> tuple[list[str], dict[str, tuple[str, ...]]]:
+    """Check each ``first of`` race of the flow and return its problems and the races, ``{source: contestants}``."""
+    races: dict[str, tuple[str, ...]] = {}
+    for edge in edges:
+        if edge.kind is EdgeKind.FIRST:
+            races[edge.source] = (*races.get(edge.source, ()), edge.target)
+    problems: list[str] = []
+    entered = Counter(name for contestants in races.values() for name in contestants)
+    problems += [
+        f"{name!r} runs in {count} first of races; a node races in one" for name, count in entered.items() if count > 1
+    ]
+    for source, contestants in races.items():
+        where = f"the first of race from {source!r}"
+        if len(contestants) < 2:
+            problems.append(f"{where} has one contestant, {contestants[0]!r}; a race needs two or more")
+        if any(e.source == source and e.kind in (EdgeKind.WHEN, EdgeKind.SWITCH, EdgeKind.ELSE) for e in edges):
+            problems.append(
+                f"{where}: {source!r} also decides with when, switch or else edges; race from a node of its own"
+            )
+        for name in contestants:
+            kind = "a chain head" if name in heads else "a human node" if name in mas.humans else None
+            kind = "the end" if name == END else kind
+            if kind is not None:
+                problems.append(f"{where}: {name!r} is {kind}; agents, steps and boxes race")
+        after: dict[str, str] = {}
+        for name in contestants:
+            out = [e for e in edges if e.source == name and e.kind is not EdgeKind.WHILE]
+            if any(e.kind is EdgeKind.ERROR for e in out):
+                problems.append(f"{where}: {name!r} has an on error edge; a contestant's failure is the race's")
+            elif len(out) > 1 or any(e.kind is not EdgeKind.PLAIN for e in out):
+                problems.append(f"{where}: {name!r} has {len(out)} out-edges; a contestant has one plain edge or none")
+            else:
+                after[name] = out[0].target if out else END
+        if len(set(after.values())) > 1:
+            problems.append(f"{where}: its contestants go on to different nodes {after}; they go on to one")
+        written = {name: {v: str(t) for v, t in writes.get(name, {}).items()} for name in contestants}
+        if len({tuple(sorted(w.items())) for w in written.values()}) > 1:
+            problems.append(f"{where}: its contestants write differently {written}; they write the same values")
+    return problems, races
+
+
 def _outside_reads(shape: ChainShape, reads: _Reads, writes: _Writes) -> list[str]:
     """Return the values a chain's nodes read from outside it, in order; the item, its writes and reserved reads not."""
     written = {value for name in shape.nodes for value in writes[name]}
@@ -611,7 +733,7 @@ def _outside_reads(shape: ChainShape, reads: _Reads, writes: _Writes) -> list[st
 def _chains(
     mas: MAS,
     shapes: list[ChainShape],
-    nodes: dict[str, Agent | Step | Box],
+    nodes: dict[str, _Node],
     io: tuple[_Reads, _Writes],
     types: dict[str, ValueType],
 ) -> tuple[dict[str, Chain], list[str]]:
@@ -667,7 +789,7 @@ def check_system(mas: MAS) -> SystemInfo:
     Raises:
         ValueError: Listing every problem found, one per line.
     """
-    nodes: dict[str, Agent | Step | Box] = {**mas.agents, **mas.steps, **mas.boxes}
+    nodes: dict[str, _Node] = {**mas.agents, **mas.steps, **mas.boxes, **mas.humans}
     problems = [f"node {name!r}: names starting with '__' belong to xmas" for name in nodes if name.startswith("__")]
     problems += [f"frozen names {name!r}, which is no node" for name in sorted(mas.frozen - set(nodes))]
     for name in mas.inputs:
@@ -697,7 +819,9 @@ def check_system(mas: MAS) -> SystemInfo:
         flow_reads[head] = dict.fromkeys([*outside, shape.each.root])
     edges = collapse(shapes, mas.edges)
     edge_problems, predicates, buildable = _edge_problems(edges, {*flow_nodes, *SENTINELS})
-    problems += type_problems + chain_problems + edge_problems
+    race_problems, races = _race_problems(mas, edges, flow_writes, heads)
+    problems += type_problems + chain_problems + edge_problems + race_problems
+    problems += _human_problems(mas, types, edges, members)
 
     flow: nx.DiGraph[str] | None = None
     routes: RouteGraph | None = None
@@ -727,4 +851,10 @@ def check_system(mas: MAS) -> SystemInfo:
     types.update((value, vtype) for value, vtype in RESERVED_READS.items() if value in read)
     graph = _graph(list(nodes), mas.edges) if shapes else flow
     writers_of = {value: tuple(names) for value, names in writers.items()}
-    return SystemInfo(types, writers_of, joins, graph, predicates, chains, edges, flow)
+    pausing = tuple(name for name in flow_nodes if _may_pause(mas, heads[name].nodes if name in heads else (name,)))
+    return SystemInfo(types, writers_of, joins, graph, predicates, chains, edges, flow, pausing, races)
+
+
+def _may_pause(mas: MAS, names: Sequence[str]) -> bool:
+    """Return whether one of the nodes is a human, or a box whose system holds one at any depth."""
+    return any(name in mas.humans or (name in mas.boxes and holds_human(mas.boxes[name].system)) for name in names)

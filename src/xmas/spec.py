@@ -12,7 +12,9 @@ node may run ``for each`` item of a list and ``retry`` on some error kinds; an
 agent may read values under placeholders of other names and share a prompt
 with other agents under a ``prompt`` name. Its ``models`` section says, per
 bound model name, which kinds beyond text the model ``accepts`` and
-``produces``; never a URL, a key or a model parameter.
+``produces``; never a URL, a key or a model parameter. Its ``humans`` are the
+nodes that ask a person (:class:`xmas.human.Human`), and an edge may be one of a
+``first of`` race.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ V2_KEYS: dict[str, Any] = {
     "agents": list,
     "steps": list,
     "boxes": list,
+    "humans": list,
     "edges": list,
     "state": dict,
     "frozen": list,
@@ -63,6 +66,24 @@ _ENTRIES: dict[str, tuple[str, frozenset[str], dict[str, Any]]] = {
         frozenset({"reads", "writes", "system"}),
         {"name": str, "for each": (str, dict), "reads": dict, "writes": dict, "system": dict},
     ),
+    "humans": (
+        "Human",
+        frozenset({"form", "writes"}),
+        {
+            "name": str,
+            "form": str,
+            "for each": (str, dict),
+            "reads": (list, dict),
+            "writes": (str, dict),
+            "question": str,
+            "options": (list, str),
+            "labels": dict,
+            "pair": list,
+            "edits": str,
+            "timeout_s": (int, float),
+            "default": dict,
+        },
+    ),
 }
 _CALLABLE = {"kind": str, "import": str, "server": str, "reads": dict, "writes": dict}
 _HEALTH = {"length_factor": (int, float), "min_samples": int, "leak": list}
@@ -75,6 +96,7 @@ _WORDS = {
     dict: "a mapping",
     (str, dict): "a string or a mapping",
     (list, dict): "a list or a mapping",
+    (list, str): "a list or a string",
 }
 
 

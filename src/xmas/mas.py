@@ -33,10 +33,12 @@ from xmas.graph import (
     validate_graph,
 )
 from xmas.health import HealthSettings
+from xmas.human import Asker, Human
 from xmas.media import TEXT_ONLY, Capabilities
 from xmas.nodes import Box, Step
 from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import validate_spec, validate_spec_v2
+from xmas.store import Store, open_store
 from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools
 from xmas.trace import Event, Trace
 from xmas.values import TEXT, ValueType, parse_type
@@ -61,15 +63,17 @@ class MAS(BasePredictor):
     :meth:`copy` is how candidates are derived from them.
 
     A system is version 1 or version 2. Version 2 adds steps (nodes that run a
-    callable without a model), boxes (nodes that run a whole system), typed
-    values, answer forms, declared inputs and conditional edges, and is checked
-    by :func:`xmas.check.check_system` when it is built.
+    callable without a model), boxes (nodes that run a whole system), human
+    nodes (which ask a person), typed values, answer forms, declared inputs and
+    conditional edges, and is checked by :func:`xmas.check.check_system` when
+    it is built.
 
     Attributes:
         agents: Agents keyed by name. Mutable, so ``mas.agents["solver"].prompt``
             is a supported edit.
         steps: Steps keyed by name; empty in version 1.
         boxes: Boxes keyed by name; empty in version 1.
+        humans: Human nodes keyed by name; empty in version 1.
         frozen: Names of the nodes no optimizer may change.
         health: The thresholds of the run's health signals, or ``None`` for
             the defaults.
@@ -95,6 +99,10 @@ class MAS(BasePredictor):
         llms: Additional models by name, which agents bind to via ``Agent.model``.
         default_model: Name recorded for the default model in a serialized spec.
         budget: Limits for each run, or ``None`` for none; never part of the spec.
+        asker: How a run asks a person, or ``None``; never part of the spec.
+        store: Where paused runs are kept, or ``None`` for the one
+            :func:`xmas.store.open_store` opens on first use; never part of
+            the spec.
         max_visits: How often one agent of a version 1 cycle may run in a single
             query before its back edges close.
         last_trace: Trace of the most recent :meth:`__call__`, or ``None`` before any.
@@ -107,6 +115,7 @@ class MAS(BasePredictor):
     agents: dict[str, Agent]
     steps: dict[str, Step]
     boxes: dict[str, Box]
+    humans: dict[str, Human]
     frozen: frozenset[str]
     health: HealthSettings | None
     edges: tuple[Edge, ...]
@@ -121,6 +130,8 @@ class MAS(BasePredictor):
     info: SystemInfo | None
     graph: nx.DiGraph[str]
     budget: Budget | None
+    asker: Asker | None
+    store: Store | None
 
     def __init__(
         self,
@@ -147,6 +158,9 @@ class MAS(BasePredictor):
         retry: Mapping[str, Mapping[str, int]] | None = None,
         prompt_names: Mapping[str, str] | None = None,
         models: Mapping[str, Mapping[str, Any] | Capabilities] | None = None,
+        humans: Sequence[Human] = (),
+        asker: Asker | None = None,
+        store: Store | str | Path | None = None,
     ) -> None:
         """Initialize a MAS.
 
@@ -175,8 +189,8 @@ class MAS(BasePredictor):
                 ``{"query": "text"}``.
             state: ``{value: {"merge": "last"}}`` for each value several nodes
                 may write.
-            version: 1 or 2. Defaults to 2 when steps, boxes, conditional
-                edges, a non-text agent, an agent reading a value under
+            version: 1 or 2. Defaults to 2 when steps, boxes, humans,
+                conditional edges, a non-text agent, an agent reading a value under
                 another name, ``inputs``, ``state``, ``frozen``, ``each``,
                 ``outputs``, ``retry``, ``prompt_names`` or ``models`` are
                 used, else 1.
@@ -198,6 +212,13 @@ class MAS(BasePredictor):
                 such as ``image``, and answers with. A model not named here
                 states its own through ``accepts`` and ``produces``
                 attributes, else reads and writes text only.
+            humans: Nodes that ask a person (:class:`~xmas.human.Human`).
+            asker: How a run asks a person (:class:`~xmas.human.Asker`);
+                runtime state like ``llm``, never part of the spec.
+            store: Where paused runs are kept: a :class:`~xmas.store.Store`
+                or a file path. ``None`` opens the one ``XMAS_RUNS`` names,
+                else one in memory, when a run first needs it. Never part of
+                the spec.
 
         Raises:
             ValueError: If the system is not runnable. A version 2 system
@@ -215,8 +236,8 @@ class MAS(BasePredictor):
             name: entry if isinstance(entry, Capabilities) else Capabilities.parse(entry, f"models entry {name!r}")
             for name, entry in (models or {}).items()
         }
-        self.version = self._infer_version(version, agents, steps, boxes, inputs, state)
-        if not agents and (self.version == 1 or not (steps or boxes)):
+        self.version = self._infer_version(version, agents, [*steps, *boxes, *humans], inputs, state)
+        if not agents and (self.version == 1 or not (steps or boxes or humans)):
             raise ValueError(
                 "A MAS needs at least one node." if self.version == 2 else "A MAS needs at least one agent."
             )
@@ -224,12 +245,14 @@ class MAS(BasePredictor):
             raise ValueError("max_tool_rounds must be >= 0.")
         super().__init__(llm=llm)  # type: ignore[arg-type]
 
-        names = [agent.name for agent in agents] + [step.name for step in steps] + [box.name for box in boxes]
+        nodes: list[Agent | Step | Box | Human] = [*agents, *steps, *boxes, *humans]
+        names = [node.name for node in nodes]
         if len(set(names)) != len(names):
             raise ValueError(f"Node names must be unique: {sorted({n for n in names if names.count(n) > 1})}.")
         self.agents = {agent.name: agent for agent in agents}
         self.steps = {step.name: step for step in steps}
         self.boxes = {box.name: box for box in boxes}
+        self.humans = {human.name: human for human in humans}
         self.llms = dict(llms or {})
         for agent in agents:
             if agent.model is not None and agent.model not in self.llms:
@@ -239,6 +262,8 @@ class MAS(BasePredictor):
         self.max_steps = max_steps
         self.max_visits = max_visits
         self.budget = budget
+        self.asker = asker
+        self.store = Store(store) if isinstance(store, str | Path) else store
         self.default_model = default_model if default_model is not None else getattr(llm, "model_id", None)
         self.tools = tuple(tools)
         self.tool_index: ToolIndex | None = None  # built on first use, so tool-free systems never touch their sources
@@ -255,14 +280,13 @@ class MAS(BasePredictor):
         self,
         version: int | None,
         agents: list[Agent],
-        steps: Sequence[Step],
-        boxes: Sequence[Box],
+        nodes: Sequence[Step | Box | Human],
         inputs: Mapping[str, str | ValueType] | None,
         state: Mapping[str, Mapping[str, str]] | None,
     ) -> int:
-        """Return the version asked for, else 2 when a version 2 feature is used, else 1."""
+        """Return the version asked for, else 2 when a version 2 feature (``nodes`` among them) is used, else 1."""
         uses_v2 = (
-            bool(steps or boxes or self.frozen or self.each or self.outputs or self.retry or self.prompt_names)
+            bool(nodes or self.frozen or self.each or self.outputs or self.retry or self.prompt_names)
             or bool(self.models)
             or inputs is not None
             or state is not None
@@ -274,8 +298,8 @@ class MAS(BasePredictor):
             raise ValueError(f"version must be 1 or 2, not {inferred!r}.")
         if inferred == 1 and uses_v2:
             raise ValueError(
-                "Steps, boxes, inputs, outputs, state, frozen, models, for each, retry, shared prompts, read maps, "
-                "conditional edges and typed writes need version 2."
+                "Steps, boxes, humans, inputs, outputs, state, frozen, models, for each, retry, shared prompts, "
+                "read maps, conditional edges and typed writes need version 2."
             )
         return inferred
 
@@ -316,6 +340,12 @@ class MAS(BasePredictor):
             raise ValueError(refusal)
         return self.info
 
+    def _runs(self) -> Store:
+        """Return the run store, opening the one ``XMAS_RUNS`` names, else one in memory, on first use."""
+        if self.store is None:
+            self.store = open_store()
+        return self.store
+
     def _callables(self) -> ToolIndex:
         """Return the callables registry: every tool and tool source, indexed on first use."""
         if self.tool_index is None:
@@ -339,9 +369,9 @@ class MAS(BasePredictor):
         return index[step.uses]
 
     @property
-    def nodes(self) -> dict[str, Agent | Step | Box]:
-        """Every node, agents, steps and boxes, keyed by name in the topological order of one pass."""
-        everything: dict[str, Agent | Step | Box] = {**self.agents, **self.steps, **self.boxes}
+    def nodes(self) -> dict[str, Agent | Step | Box | Human]:
+        """Every node, agents, steps, boxes and humans, keyed by name in the topological order of one pass."""
+        everything: dict[str, Agent | Step | Box | Human] = {**self.agents, **self.steps, **self.boxes, **self.humans}
         return {name: everything[name] for name in agent_names(forward_graph(self.graph, self.while_edges))}
 
     @property
@@ -497,9 +527,10 @@ class MAS(BasePredictor):
     ) -> MAS:
         """Derive a new MAS with some components replaced.
 
-        This is how an optimizer proposes a candidate. Models are shared with the
-        original by reference, and the budget is carried over; everything else is
-        copied, so the original is never touched.
+        This is how an optimizer proposes a candidate. Models, the asker and
+        the store are shared with the original by reference, and the budget is
+        carried over; everything else is copied, so the original is never
+        touched.
 
         ``prompts`` and ``models`` are keyed by agent name; a prompt given to
         one agent of a shared prompt reaches every agent sharing it. A
@@ -531,6 +562,8 @@ class MAS(BasePredictor):
             max_tool_rounds=self.max_tool_rounds,
             max_visits=self.max_visits,
             budget=self.budget,
+            asker=self.asker,
+            store=self.store,
             **self._v2_kwargs(),
         )
 
@@ -555,6 +588,7 @@ class MAS(BasePredictor):
             "retry": {name: dict(rules) for name, rules in self.retry.items()},
             "prompt_names": dict(self.prompt_names),
             "models": dict(self.models),
+            "humans": tuple(self.humans.values()),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -581,6 +615,7 @@ class MAS(BasePredictor):
             ],
             "steps": [self._entry(name, step.to_dict()) for name, step in self.steps.items()],
             "boxes": [self._entry(name, box.to_dict()) for name, box in self.boxes.items()],
+            "humans": [self._entry(name, human.to_dict()) for name, human in self.humans.items()],
             "edges": dump_edges(self.edges),
             "state": {value: {"merge": rule} for value, rule in self.merges.items()},
             "frozen": sorted(self.frozen),
@@ -602,7 +637,7 @@ class MAS(BasePredictor):
     def _entry(self, name: str, data: dict[str, Any]) -> dict[str, Any]:
         """Return a node's spec entry with its ``for each`` after the keys that name it and its ``retry`` last."""
         items = list(data.items())
-        named = sum(key in ("name", "model", "prompt", "uses") for key in data)
+        named = sum(key in ("name", "model", "prompt", "uses", "form") for key in data)
         if name in self.each:
             items.insert(named, ("for each", self.each[name].to_spec()))
         if name in self.retry:
@@ -692,7 +727,7 @@ class MAS(BasePredictor):
         """Rebuild a version 2 MAS and check its ``callables`` against those supplied."""
         spec: dict[str, Any] = dict(validate_spec_v2(data))
         prompts = spec.get("prompts", {})
-        entries = [*spec.get("agents", []), *spec.get("steps", []), *spec.get("boxes", [])]
+        entries = [*spec.get("agents", []), *spec.get("steps", []), *spec.get("boxes", []), *spec.get("humans", [])]
         agents = []
         for item in spec.get("agents", []):
             ((output, output_type),) = item["writes"].items()
@@ -733,6 +768,7 @@ class MAS(BasePredictor):
             retry={item["name"]: item["retry"] for item in entries if "retry" in item},
             prompt_names={item["name"]: item["prompt"] for item in spec.get("agents", []) if "prompt" in item},
             models=spec.get("models"),
+            humans=[Human.from_dict(item) for item in spec.get("humans", [])],
         )
         mas._check_callables(spec.get("callables", {}))
         return mas
@@ -801,7 +837,8 @@ class MAS(BasePredictor):
 
         A chain node gains its ``"for each"``, an agent reading a value under
         another name its ``"placeholders"`` map, a node that retries its
-        ``"retry"``. Declared ``"outputs"`` and the chains, as ``"groups"``,
+        ``"retry"``. A human node has its ``"form"``, and its ``"timeout_s"``
+        when it times out. Declared ``"outputs"`` and the chains, as ``"groups"``,
         appear only when there are any; a chain node's reads and writes have
         their types for one item. Declared ``"models"`` appear when there
         are any, outside the ``id``: they change no compiled graph.
@@ -837,7 +874,7 @@ class MAS(BasePredictor):
         description["id"] = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return description
 
-    def _describe_node(self, name: str, node: Agent | Step | Box) -> dict[str, Any]:
+    def _describe_node(self, name: str, node: Agent | Step | Box | Human) -> dict[str, Any]:
         """Return one node of :meth:`describe`."""
         entry = self._describe_body(name, node)
         if name in self.each:
@@ -848,7 +885,7 @@ class MAS(BasePredictor):
             entry["retry"] = dict(self.retry[name])
         return entry
 
-    def _describe_body(self, name: str, node: Agent | Step | Box) -> dict[str, Any]:
+    def _describe_body(self, name: str, node: Agent | Step | Box | Human) -> dict[str, Any]:
         """Return the kind, model or callable or system, typed reads and writes, and frozen of one node."""
         info = self.info
         chain = next((c for c in info.chains.values() if name in c.nodes), None) if info is not None else None
@@ -870,7 +907,12 @@ class MAS(BasePredictor):
             if node.schema is not None:
                 entry["schema"] = _copy.deepcopy(node.schema)
             return entry
-        if isinstance(node, Box):
+        if isinstance(node, Human):
+            entry = {"name": name, "kind": "human", "form": node.form, "reads": typed(node.reads.values())}
+            entry["writes"] = typed(node.written)
+            if node.timeout_s is not None:
+                entry["timeout_s"] = node.timeout_s
+        elif isinstance(node, Box):
             entry = {"name": name, "kind": "box", "reads": typed(node.reads.values())}
             entry.update(writes=typed(node.writes.values()), system=node.system.describe())
         else:
@@ -912,10 +954,11 @@ class MAS(BasePredictor):
         prompt candidates through one predictor this way. Prompts travel in the
         run state, so they are absent. A version 2 system adds lines for its
         steps, edges, answer types and forms, inputs, merges, outputs, read
-        maps, chain forms with ``at once`` and ``key``, retries and boxes (each
-        with its inner structure, indented); frozen nodes, health settings,
-        prompt names, item budgets and models change no compiled graph and
-        stay out.
+        maps, chain forms with ``at once`` and ``key``, retries, human nodes
+        (every setting but the question text) and boxes (each with its inner
+        structure, indented); frozen nodes, health settings, prompt names,
+        item budgets, models and questions change no compiled graph and stay
+        out.
         """
         lines = [
             f"{agent.name} {','.join(agent.inputs)} -> {agent.output} model={agent.model} tools={','.join(agent.tools)}"
@@ -943,6 +986,10 @@ class MAS(BasePredictor):
         ]
         lines += [f"each {name} {f} at_once={f.at_once} key={f.key}" for name, f in sorted(self.each.items())]
         lines += [f"retry {name} {_canonical(rules)}" for name, rules in sorted(self.retry.items())]
+        lines += [
+            f"human {name} {_canonical({k: v for k, v in human.to_dict().items() if k not in ('name', 'question')})}"
+            for name, human in sorted(self.humans.items())
+        ]
         for box in sorted(self.boxes.values(), key=lambda b: b.name):
             lines.append(f"box {box.name} reads={_canonical(box.reads)} writes={_canonical(box.writes)}")
             lines += [f"  {line}" for line in box.system.structure.splitlines()]
@@ -1046,11 +1093,16 @@ class _ChainSystem(MAS):
             state={value: {"merge": rule} for value, rule in outer.merges.items() if value in written},
             version=2,
             boxes=[outer.boxes[name] for name in shape.nodes if name in outer.boxes],
+            humans=[outer.humans[name] for name in shape.nodes if name in outer.humans],
             health=outer.health,
             outputs=written,
             retry={name: rules for name, rules in outer.retry.items() if name in shape.nodes},
             models={name: entry for name, entry in outer.models.items() if name in {*outer.llms, outer.default_model}},
         )
+
+    def _runs(self) -> Store:
+        """Return the outer system's run store."""
+        return self.outer._runs()
 
     def _callables(self) -> ToolIndex:
         """Return the outer system's callables registry."""
