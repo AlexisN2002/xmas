@@ -45,9 +45,11 @@ def test_run_state_checks_inputs_and_returns_outputs() -> None:
     with pytest.raises(ValueError, match="do not fit the system's inputs") as caught:
         mas.run_state({"plan": {1, 2}, "query": "x"})
     lines = str(caught.value).splitlines()[1:]
-    assert len(lines) == 3 and llm.calls == []
+    assert len(lines) == 3
+    assert llm.calls == []
     assert lines[0] == "- input 'house' is missing"
-    assert lines[1].startswith("- 'query' is no input") and lines[2].startswith("- input 'plan' is not json")
+    assert lines[1].startswith("- 'query' is no input")
+    assert lines[2].startswith("- input 'plan' is not json")
 
     values = {"plan": {"slides": 2}, "house": "plain"}
     trace = mas.run_state(values)
@@ -56,21 +58,27 @@ def test_run_state_checks_inputs_and_returns_outputs() -> None:
     assert trace.output == "A summary."  # the first output, which a task scores
     assert sorted(trace.agents) == ["noter", "summarizer"]  # END joined both branches
     assert trace.query == json.dumps(values)
-    assert re.fullmatch("[0-9a-f]{32}", trace.run_id or "") and trace.graph_id == mas.describe()["id"]
+    assert re.fullmatch("[0-9a-f]{32}", trace.run_id or "")
+    assert trace.graph_id == mas.describe()["id"]
     again = mas.run_state(values)
-    assert again.run_id != trace.run_id and again.graph_id == trace.graph_id
+    assert again.run_id != trace.run_id
+    assert again.graph_id == trace.graph_id
     assert again == trace  # the run id is left out of ==
 
     # a failure is a failed trace, with no outputs
     broken = deck_notes(MockLLM(answers=[RuntimeError("boom"), RuntimeError("boom")]))
     failed = broken.run_state(values)
-    assert failed.error is not None and failed.outputs == {}
+    assert failed.error is not None
+    assert failed.outputs == {}
 
     # version 1: text values, a preset beside the query; equal to run(query) record for record
     v1 = MAS([Agent("a", "Answer {query} {style}", "answer", ["query", "style"])], llm=MockLLM())
     plain = v1.run_state({"query": "cats"})
-    assert plain.records == v1.run("cats").records and plain.query == "cats"
-    assert plain.run_id is None and plain.graph_id is None and plain.records[0].visit is None
+    assert plain.records == v1.run("cats").records
+    assert plain.query == "cats"
+    assert plain.run_id is None
+    assert plain.graph_id is None
+    assert plain.records[0].visit is None
     assert v1.run_state({"query": "cats", "style": "tersely"}).output == "echo:Answer cats tersely"
     assert v1("cats") == "echo:Answer cats "
     with pytest.raises(ValueError, match="'query' is not text"):
@@ -87,7 +95,8 @@ def test_run_state_checks_inputs_and_returns_outputs() -> None:
         llm=inner.llm,
     )
     outer: Any = boxed.run("cats")
-    assert outer.run_id is not None and outer.records[0].inner.run_id is None
+    assert outer.run_id is not None
+    assert outer.records[0].inner.run_id is None
 
 
 @tool(writes={"loud": "text"})
@@ -126,8 +135,10 @@ def test_retry_and_reserved_reads() -> None:
     llm = MockLLM(answers=["not json", ConnectionError("down"), '{"fits": true}'], meta=True)
     retried: Any = MAS([judge], retry={"judge": {"outage": 1}}, llm=llm).run("cats")
     (judged,) = retried["judge"]
-    assert judged.retries == 1 and judged.outputs == {"verdict": '{"fits": true}'}
-    assert judged.cost_usd == pytest.approx(0.02) and judged.tokens == TokenUsage(20, 4)
+    assert judged.retries == 1
+    assert judged.outputs == {"verdict": '{"fits": true}'}
+    assert judged.cost_usd == pytest.approx(0.02)
+    assert judged.tokens == TokenUsage(20, 4)
 
     # error: the failure routed to a fallback, as {kind, message, node}
     @tool(writes={"page": "text"})
@@ -172,7 +183,8 @@ def test_retry_and_reserved_reads() -> None:
     assert (note["calls"], note["records"], note["cost_usd"]) == (1, 1, pytest.approx(0.01))
     spent = json.loads(looked["spend"][0].outputs["spent"])
     assert (spent["calls"], spent["records"], spent["cost_usd"]) == (2, 2, pytest.approx(0.02))
-    assert spent["elapsed_s"] >= 0 and looked["spend"][0].route == ("fin",)  # three records only after spend
+    assert spent["elapsed_s"] >= 0
+    assert looked["spend"][0].route == ("fin",)
 
     reader = Agent("b", "So far: {run}", "note", ["run"])
     uncosted = MAS([Agent("a", "Answer {query}", "answer"), reader], [("a", "b")], llm=MockLLM(), version=2).run("cats")
@@ -201,7 +213,8 @@ def test_events_and_the_parallel_call_cap() -> None:
     assert [step[3] for step in per_item[1]] == [None, None, "ok", None, "failed", "failed"]
     assert {e.item_key for e in events if e.item == 1} == {"b"}
     fin = [e for e in events if e.node == "fin"]
-    assert [e.kind for e in fin] == ["start", "end"] and fin[1].item is None
+    assert [e.kind for e in fin] == ["start", "end"]
+    assert fin[1].item is None
     assert list(fin[1].to_dict()) == ["kind", "node", "run_id", "at_s", "visit", "status", "cost_usd"]
     item_end = next(e for e in events if e.kind == "item_end" and e.item == 0)
     assert item_end.cost_usd == pytest.approx(0.01)  # the writer's one call; the count is free
@@ -220,7 +233,9 @@ def test_events_and_the_parallel_call_cap() -> None:
     )
     with pytest.warns(RuntimeWarning, match="the viewer broke") as warned:
         heard_trace = two.run_state({"query": "cats"}, on_event=broken)
-    assert heard_trace.error is None and len(heard) == 1 and len(warned) == 1
+    assert heard_trace.error is None
+    assert len(heard) == 1
+    assert len(warned) == 1
 
     # eight agents in parallel never hold more than two calls at once
     lock = threading.Lock()
@@ -252,7 +267,8 @@ def test_run_state_with_pictures(png: Path) -> None:
     seeing = SeeingLLM("fits")
     looked = MAS([judge], inputs={"png": "list of image"}, llm=seeing).run_state({"png": [png]})
     ref = Ref.from_path(png)
-    assert looked.error is None and seeing.parts == [["Look: \n[png 0] ", ref]]
+    assert looked.error is None
+    assert seeing.parts == [["Look: \n[png 0] ", ref]]
     (record,) = looked.records
     assert record.rendered_prompt == "Look: \n[png 0] [image a.png, image/png, 6 B]"
     assert record.inputs == {"png": json.dumps([ref.to_dict()])}  # the model sees bytes, the record a reference
@@ -269,10 +285,15 @@ def test_run_state_with_pictures(png: Path) -> None:
     strict = Agent("judge", "Look: {png}", "verdict", ["png"], output_type="json", schema=form)
     retried = SeeingLLM(answers=["not json", '{"fits": true}'])
     trace = MAS([strict], inputs={"png": "image"}, llm=retried).run_state({"png": png})
-    assert trace.error is None and trace.records[0].outputs == {"verdict": '{"fits": true}'}
+    assert trace.error is None
+    assert trace.records[0].outputs == {"verdict": '{"fits": true}'}
     first, second = retried.parts
-    assert first[:2] == ["Look: ", ref] and first[2].startswith("\n\nAnswer") and len(first) == 3
-    assert second[:2] == first[:2] and second[2].startswith(first[2]) and len(second) == 3
+    assert first[:2] == ["Look: ", ref]
+    assert first[2].startswith("\n\nAnswer")
+    assert len(first) == 3
+    assert second[:2] == first[:2]
+    assert second[2].startswith(first[2])
+    assert len(second) == 3
     assert trace.records[0].rendered_prompt.startswith("Look: [image a.png, image/png, 6 B]\n\nAnswer")
 
     # a file that changed since it was given is refused when the call reads it
@@ -284,7 +305,9 @@ def test_run_state_with_pictures(png: Path) -> None:
     painter = Agent("painter", "Paint {query}", "picture", output_type="image")
     painted = MAS([painter], llm=PaintingLLM(), outputs={"picture": "image"}).run_state({"query": "a cat"})
     picture = painted.outputs["picture"]
-    assert painted.error is None and isinstance(picture, Ref) and picture.read_bytes() == PNG + b"\x00"
+    assert painted.error is None
+    assert isinstance(picture, Ref)
+    assert picture.read_bytes() == PNG + b"\x00"
     assert Path(picture.location).parent.parent == Path(os.environ["XMAS_STORE"])
     assert painted.records[0].outputs == {"picture": json.dumps(picture.to_dict())}
     assert painted.records[0].raw_response == "drawn"
@@ -293,14 +316,16 @@ def test_run_state_with_pictures(png: Path) -> None:
     assert [ref.read_bytes() for ref in drawn.outputs["pictures"]] == [PNG + b"\x00", PNG + b"\x01"]
     for count, wanted in ((2, "expected one image, got 2"), (0, "expected one image, got 0")):
         refused = MAS([painter], llm=PaintingLLM(count=count), version=2).run("a cat")
-        assert refused.error_kind is ErrorKind.BAD_FORMAT and wanted in (refused.error or "")
+        assert refused.error_kind is ErrorKind.BAD_FORMAT
+        assert wanted in (refused.error or "")
     nothing = MAS([many], llm=PaintingLLM(count=0), version=2).run("cats")
     assert "expected at least one image, got 0" in (nothing.error or "")
 
     # a trace with pictures is plain JSON, and no picture's bytes are in it
     for trace in (looked, painted, drawn):
         text = json.dumps(trace.to_dict())
-        assert "base64," not in text and json.loads(text)["records"]
+        assert "base64," not in text
+        assert json.loads(text)["records"]
     assert painted.to_dict()["outputs"] == {"picture": picture.to_dict()}
 
 
@@ -341,10 +366,10 @@ def test_the_run_log_keeps_a_run_that_dies_midway() -> None:
         mas.run_state({"query": "cats"}, run_id="dies")
     store = mas.runs()
     died = store.trace("dies")
-    assert [record.agent for record in died.records] == ["writer"] and died.records[0].outputs == {
-        "draft": "echo:Write cats"
-    }
-    assert cast("Any", store.run("dies")).status == "running" and "no end in the store" in str(died.error)
+    assert [record.agent for record in died.records] == ["writer"]
+    assert died.records[0].outputs == {"draft": "echo:Write cats"}
+    assert cast("Any", store.run("dies")).status == "running"
+    assert "no end in the store" in str(died.error)
     assert [(event.kind, event.node) for event in store.events("dies")] == [
         ("start", "writer"),
         ("end", "writer"),

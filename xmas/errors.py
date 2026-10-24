@@ -229,11 +229,11 @@ class BadFormat(XmasError):
 MONEY_WORDS = re.compile(
     r"key limit exceeded|requires more credits|insufficient credits|insufficient_quota"
     r"|exceeded your current quota|payment required|in_flight_budget_exhausted|insufficient_budget",
-    re.I,
+    re.IGNORECASE,
 )
 """Provider texts that mean the key or account is out of money."""
 
-MODERATION_WORDS = re.compile(r"flagged|moderation", re.I)
+MODERATION_WORDS = re.compile(r"flagged|moderation", re.IGNORECASE)
 """Provider texts that mean a moderation filter refused the request."""
 
 MAX_DEPTH = 8

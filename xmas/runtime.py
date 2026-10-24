@@ -88,7 +88,6 @@ from xmas.media import store
 from xmas.nodes import Box, Step
 from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
-from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
 from xmas.store import RunLog, Store
 from xmas.tools import run_step, run_tool_loop
@@ -96,6 +95,7 @@ from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, check_value, coerce_media, media_kind, parse_type, plain, render_value
 
 if TYPE_CHECKING:  # pragma: no cover
+    from xmas.routes import Join
     from promptolution.llms.base_llm import BaseLLM
 
     from xmas.budget import Budget

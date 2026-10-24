@@ -21,11 +21,13 @@ and error kinds make sense, and whether a pair of nodes is listed twice, is
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
 
 __all__ = [
     "ANY_ERROR",

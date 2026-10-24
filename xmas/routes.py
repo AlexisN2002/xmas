@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import networkx as nx
 
 from xmas.edges import Edge, EdgeKind
 from xmas.graph import END, START
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "ROUTE_CAP",

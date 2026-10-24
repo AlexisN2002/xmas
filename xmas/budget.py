@@ -20,7 +20,6 @@ import time
 import uuid
 import warnings
 import weakref
-from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from xmas.trace import AgentRecord, Event, Trace
 from xmas.utils import timestamp
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Mapping
     from xmas.llms.meta import CallMeta
     from xmas.store import RunLog
 
