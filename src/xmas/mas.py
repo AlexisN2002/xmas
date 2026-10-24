@@ -100,9 +100,9 @@ class MAS(BasePredictor):
         default_model: Name recorded for the default model in a serialized spec.
         budget: Limits for each run, or ``None`` for none; never part of the spec.
         asker: How a run asks a person, or ``None``; never part of the spec.
-        store: Where paused runs are kept, or ``None`` for the one
-            :func:`xmas.store.open_store` opens on first use; never part of
-            the spec.
+        store: Where paused runs are kept: a store, a file path opened on
+            first use, or ``None`` for the one :func:`xmas.store.open_store`
+            opens on first use; never part of the spec.
         max_visits: How often one agent of a version 1 cycle may run in a single
             query before its back edges close.
         last_trace: Trace of the most recent :meth:`__call__`, or ``None`` before any.
@@ -131,7 +131,7 @@ class MAS(BasePredictor):
     graph: nx.DiGraph[str]
     budget: Budget | None
     asker: Asker | None
-    store: Store | None
+    store: Store | str | Path | None
 
     def __init__(
         self,
@@ -341,9 +341,12 @@ class MAS(BasePredictor):
         return self.info
 
     def _runs(self) -> Store:
-        """Return the run store, opening the one ``XMAS_RUNS`` names, else one in memory, on first use."""
-        if self.store is None:
-            self.store = open_store()
+        """Return the run store, opening the one ``XMAS_RUNS`` names, else one in memory, on first use.
+
+        A path set as ``store`` after construction opens there.
+        """
+        if self.store is None or isinstance(self.store, str | Path):
+            self.store = open_store(None if self.store is None else str(self.store))
         return self.store
 
     def _callables(self) -> ToolIndex:

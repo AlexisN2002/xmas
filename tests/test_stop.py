@@ -24,6 +24,7 @@ from xmas import MAS, Agent, Budget, TokenUsage
 from xmas.budget import RUNNING, SLICE_S, RunMeter, cancel_flag, contestant
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BudgetExceeded, ErrorKind, RaceLost, RunStatus, Stopped, classify
+from xmas.graph import END
 from xmas.human import Human, Question
 from xmas.llms.api_llm import APILLM, assemble
 from xmas.llms.meta import CallMeta, TokenPrice
@@ -429,6 +430,10 @@ def test_streaming_is_opt_in_and_equivalent() -> None:
     assert assemble([]).choices == []
     assert isinstance(assemble([]), ChatCompletion)
 
+    # call_kwargs that name the stream keys give way to them, as call_params records it
+    on, sent = wired([streamed({"content": "ok"})], stream=True, call_kwargs={"stream_options": {"x": 1}})
+    assert on.generate_with_meta("hi")[0] == "ok" and sent == [STREAMED_BYTES]
+
 
 # ------------------------------------------------------------ runs that are not running
 
@@ -487,6 +492,75 @@ def test_stop_a_paused_run() -> None:
     with pytest.raises(ValueError, match="is stopped: it takes no answers"):
         mas.answer("turn-2", approved)
     assert mas.stop("turn-2") is False
+    with pytest.raises(ValueError, match="holds a '/'"):  # it would share the threads of turn-2's items and boxes
+        mas.run_state({"query": "q"}, run_id="turn-2/approve")
+
+
+class Asking(Withdrawing):
+    """A withdrawing asker that also notes each question it was asked."""
+
+    def __init__(self) -> None:
+        """Note nothing yet."""
+        super().__init__()
+        self.asked: list[str] = []
+
+    def ask(self, question: Question) -> None:
+        """Note the question and leave it open."""
+        self.asked.append(question.id)
+
+
+def test_a_stop_while_running_ends_the_run_even_at_a_pause() -> None:
+    def gated(model: MockLLM, asker: Asking, *, steps: tuple[Step, ...] = (), after: str = "") -> MAS:
+        side = [] if steps else [Agent("pre", "Pre {query}", "pre"), Agent("noter", "Note {pre}", "notes", ["pre"])]
+        side += [Agent("pre", "Pre {query}", "pre")] if after else []
+        return MAS(
+            [Agent("writer", "Write {query}", "draft"), *side],
+            [("writer", "approve"), *([] if steps else [("pre", "noter")]), *([("pre", after)] if after else [])],
+            steps=list(steps),
+            humans=[Human("approve", "approve", ["draft"], "approval")],
+            tools=[slow],
+            outputs={"approval": "json", ("thought" if steps else "notes"): "text"},
+            llm=model,
+            asker=asker,
+        )
+
+    # a stop during a step beside the human: no question is put after it, and the run ends stopped
+    asker = Asking()
+    mas = gated(
+        MockLLM(lambda prompt: "a draft"),
+        asker,
+        steps=(Step("think", "slow", reads={"outline": "query"}, writes={"slow": "thought"}),),
+    )
+    events: list[Event] = []
+    threading.Timer(0.1, mas.stop, args=("turn-3", "Tom pressed Stop")).start()
+    trace = mas.run_state({"query": "q"}, run_id="turn-3", on_event=events.append)
+    assert (trace.status, trace.error) == ("stopped", "Stopped: Tom pressed Stop")
+    assert asker.asked == [] and "pause" not in [event.kind for event in events]
+    row = mas._runs().run("turn-3")
+    assert row is not None and (row.status, row.paused) == ("stopped", ())
+    with pytest.raises(ValueError, match="is stopped, not paused"):
+        mas.resume("turn-3", {"turn-3/approve/1": {"approved": True, "who": "tom"}})
+
+    # a question put before the stop, while a call on another branch runs, is withdrawn when the run ends
+    asker = Asking()
+    model = PollingLLM(lambda prompt: 5.0 if prompt.startswith("Note") else 0.0)
+    mas = gated(model, asker)
+    threading.Timer(0.3, mas.stop, args=("turn-4", "Tom pressed Stop")).start()
+    trace = mas.run_state({"query": "q"}, run_id="turn-4")
+    assert trace.status == "stopped" and asker.asked == ["turn-4/approve/1"]
+    assert asker.withdrawn == [("turn-4/approve/1", "Tom pressed Stop")]
+
+    # a stop during a step that runs after the question was put: the pause it reaches ends stopped
+    asker = Asking()
+    think = Step("think", "slow", reads={"outline": "pre"}, writes={"slow": "thought"})
+    mas = gated(MockLLM(lambda prompt: "a draft"), asker, steps=(think,), after="think")
+    threading.Timer(0.1, mas.stop, args=("turn-5", "Tom pressed Stop")).start()
+    trace = mas.run_state({"query": "q"}, run_id="turn-5")
+    assert (trace.status, trace.pause, asker.asked) == ("stopped", None, ["turn-5/approve/1"])
+    assert asker.withdrawn == [("turn-5/approve/1", "Tom pressed Stop")]
+    assert [record.agent for record in trace.records] == ["pre", "writer", "think"]
+    row = mas._runs().run("turn-5")
+    assert row is not None and (row.status, row.paused) == ("stopped", ())
 
 
 # ------------------------------------------------------------ first of
@@ -657,6 +731,67 @@ def test_a_race_inside_a_chain_item() -> None:
     assert trace.status == "ok" and trace.outputs == {"notes": ["done", "done"]}
     lost = sorted((record.agent, record.item) for record in trace.records if record.lost)
     assert lost == [("careful", 0), ("careful", 1)]
+
+
+def test_each_inner_run_races_on_its_own() -> None:
+    def inner() -> MAS:
+        return MAS(
+            [
+                Agent("outline", "Outline {topic}", "outline", ["topic"]),
+                Agent("quick", "Quick {outline}", "notes", ["outline"]),
+                Agent("careful", "Careful {outline}", "notes", ["outline"]),
+            ],
+            [Edge("outline", "quick", EdgeKind.FIRST), Edge("outline", "careful", EdgeKind.FIRST)],
+            inputs={"topic": "text"},
+            outputs={"notes": "text"},
+            llm=PollingLLM(lambda prompt: SECONDS[prompt.split()[0]]),
+        )
+
+    # two boxes whose systems race under the same names, on one run's meter
+    boxes = MAS(
+        [Agent("join", "Join {a} {b}", "final", ["a", "b"])],
+        [("one", "join"), ("two", "join")],
+        boxes=[
+            Box("one", inner(), reads={"topic": "query"}, writes={"notes": "a"}),
+            Box("two", inner(), reads={"topic": "query"}, writes={"notes": "b"}),
+        ],
+        outputs={"a": "text", "b": "text"},
+        llm=MockLLM(lambda prompt: "joined"),
+    )
+    trace = boxes.run_state({"query": "q"})
+    assert trace.status == "ok" and trace.outputs == {"a": "done", "b": "done"}
+    for name in ("one", "two"):
+        (record,) = trace[name]
+        inner_records = record.inner.records  # type: ignore[union-attr]
+        assert sorted((r.agent, r.lost) for r in inner_records) == [
+            ("careful", True),
+            ("outline", False),
+            ("quick", False),
+        ]
+
+    # a chain item's race on the chain's second pass
+    looped = MAS(
+        [
+            Agent("drafter", "Draft {page}", "draft", ["page"]),
+            Agent("quick", "Quick {draft}", "notes", ["draft"]),
+            Agent("careful", "Careful {draft}", "notes", ["draft"]),
+            Agent("polish", "Polish {notes}", "final", ["notes"]),
+        ],
+        [
+            Edge("drafter", "quick", EdgeKind.FIRST),
+            Edge("drafter", "careful", EdgeKind.FIRST),
+            ("drafter", "polish"),
+            Edge("polish", "drafter", EdgeKind.WHILE, when="run.records < 99", max_visits=2),
+            Edge("polish", END, EdgeKind.ELSE),
+        ],
+        each={"drafter": {"item": "page", "in": "pages"}, "quick": "page in pages", "careful": "page in pages"},
+        inputs={"pages": "list of text"},
+        outputs={"notes": "list of text"},
+        llm=PollingLLM(lambda prompt: SECONDS[prompt.split()[0]]),
+    )
+    trace = looped.run_state({"pages": ["a"]})
+    assert trace.status == "ok" and trace.outputs == {"notes": ["done"]}
+    assert [r.agent for r in trace.records if r.lost] == ["careful", "careful"]
 
 
 # ------------------------------------------------------------ budgets, gates and the flag

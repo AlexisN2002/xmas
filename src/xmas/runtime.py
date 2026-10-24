@@ -23,7 +23,8 @@ A ``for each`` chain compiles to three nodes around its head ``h``:
 item, ``__each__.h`` runs the chain's own system on one item, and
 ``__each__.h.out`` gathers each write into a list aligned to the items. Every
 record a chain's item makes carries the item, and records keep the order of the
-items, however the items finish.
+items, however the items finish; an item resumed after a pause adds its records
+when it ends, after those of the items that ended before the pause.
 
 A system with people in it (a :class:`~xmas.human.Human` at any depth) can
 pause. A human ``h`` compiles to two nodes: ``h`` asks (it fills the question,
@@ -65,7 +66,17 @@ from xmas.agent import Agent
 from xmas.budget import RUNNING, RunMeter, VisitMeter, contestant
 from xmas.check import SENT, step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
-from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, RaceLost, XmasError, classify
+from xmas.errors import (
+    RUN_ENDS,
+    BadFormat,
+    BudgetExceeded,
+    ErrorKind,
+    RaceLost,
+    RunStatus,
+    Stopped,
+    Unanswered,
+    classify,
+)
 from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
 from xmas.human import Asker, Human, Pause, Question, answer_value, question_id
@@ -101,6 +112,10 @@ _ITEM_KEY = "xmas_item"
 
 _ASKING_KEY = "xmas_asking"
 """Key of a run's :class:`_Asking`, in ``config["configurable"]`` of a system that can pause."""
+
+_RACES_KEY = "xmas_races"
+"""Key of a run's own prefix for its ``first of`` race keys, in ``config["configurable"]`` of a system with races:
+a box's or a chain item's inner run races on the outer run's meter, under keys of its own."""
 
 Prompt = str | list[Part]
 """What an agent sends its model: one text, or content parts when it reads an image or audio."""
@@ -331,7 +346,7 @@ def _wrap(
     visit (``starts=False``: the visit has started already).
 
     A contestant of a ``first of`` race (``race``: its source and how many
-    race) runs on the race's flag, keyed by source, item and visit. The first
+    race) runs on the race's flag, keyed by its run, source, item and visit. The first
     to finish wins and writes; a later one, or one whose call the win cut,
     writes nothing and keeps a ``lost`` record of what it paid. A contestant
     that fails goes on no further, and the race fails with the last one when
@@ -354,7 +369,8 @@ def _wrap(
         visit = VisitMeter(meter)
         update: dict[str, Any] = {}
         used: Counter[str] = Counter()
-        contest = None if race is None else f"{race[0]}:{index}:{here['visit']}"
+        races = get_config().get("configurable", {}).get(_RACES_KEY)
+        contest = None if race is None else f"{races}:{race[0]}:{index}:{here['visit']}"
 
         def lost(record: AgentRecord) -> dict[str, Any]:
             """Keep a race loser's record, paid but writing nothing, and send it nowhere."""
@@ -399,7 +415,7 @@ def _wrap(
             kind = _kind_of(error)
             stopped = kind is ErrorKind.STOPPED
             cut = stopped and bool(visit.metas or visit.inner)
-            if mas.version != 2 or (kind in RUN_ENDS and not cut):
+            if mas.version != 2 or (kind in RUN_ENDS and not cut) or isinstance(error, Unanswered):
                 meter.emit("end", name, status="stopped" if stopped else "failed", **here)
                 raise
             target = None if decision is None or cut else decision.on_error(kind)
@@ -738,6 +754,8 @@ def _human_nodes(
 
     def ask(state: MASState) -> dict[str, Any]:
         meter, asking = _current_meter(mas), _asking()
+        if meter.stopped is not None:  # a stopped run puts no more questions
+            raise Stopped(meter.stopped)
         meter.start()
         index, key = _item() or (None, None)
         visit = 1 + sum(record.agent == name for record in state["records"])
@@ -823,7 +841,7 @@ def _answer(asking: _Asking, question: Question) -> dict[str, Any] | None:
     if question.due(datetime.now(UTC)) or (asking.unattended and question.default is not None):
         return _keep(asking.store, question, question.default or {}, timed_out=True)
     if asking.unattended:
-        raise XmasError(f"human node {question.node!r} got no answer in an unattended run")
+        raise Unanswered(f"human node {question.node!r} got no answer in an unattended run")
     return None
 
 
@@ -1248,7 +1266,7 @@ def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS,
                 if record.agent in chain.nodes and record.item == index
             ]
             run.emit("item_end", head, status="failed", cost_usd=_cost(mine), **where)
-            if kind in RUN_ENDS or kind is ErrorKind.MONEY:
+            if kind in RUN_ENDS or kind is ErrorKind.MONEY or isinstance(error, Unanswered):
                 raise
             row: dict[str, Any] = {"error": f"{type(error).__name__}: {error}", "kind": kind.value}
             return {"items": {head: {"rows": {index: row}}}, "records": mine}
@@ -1489,6 +1507,8 @@ def _run_config(
     A run that can pause also carries its :class:`_Asking` and its checkpoint thread.
     """
     configurable: dict[str, Any] = {_RUN_KEY: meter}
+    if mas.info is not None and mas.info.races:
+        configurable[_RACES_KEY] = uuid.uuid4().hex
     if item is not None:
         configurable[_ITEM_KEY] = item
     if asking is not None:
@@ -1535,7 +1555,9 @@ def run_state(
 
     Raises:
         ValueError: Before any call, listing every input missing, extra or of
-            the wrong type; or when the store holds a run with ``run_id``.
+            the wrong type; or, for a system that can pause, when ``run_id``
+            holds a ``/`` (the threads of a run's items and boxes) or the
+            store holds a run with it.
     """
     if mas.version == 2:
         values = {
@@ -1548,11 +1570,17 @@ def run_state(
         return _run_all(mas, [dict(values)], [query], [prompts], on_event, run_id)[0]
     store = mas._runs()
     run_id = run_id or uuid.uuid4().hex
+    if "/" in run_id:
+        raise ValueError(f"Run id {run_id!r} holds a '/', which names the threads of a run's items and boxes.")
     if store.run(run_id) is not None:
         raise ValueError(f"Run id {run_id!r} is taken in {store!r}.")
     graph_id = mas.describe()["id"]
     meter = RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id)
-    store.save_run(run_id, graph_id, "running")
+    try:
+        store.save_run(run_id, graph_id, "running")
+    except BaseException:
+        meter.close()
+        raise
     asking = _Asking(store, mas.asker, run_id, run_id, run_id)
     return _advance(mas, query, _initial_state(dict(values), prompts), meter, asking)
 
@@ -1597,11 +1625,13 @@ def resume(
     asking = _Asking(store, mas.asker, run_id, run_id, run_id, resumed=frozenset(row.paused))
     try:
         snapshot = mas.compiled.copy(update={"checkpointer": store}).get_state(_run_config(mas, meter, asking=asking))
+        if not snapshot.values:
+            raise ValueError(f"{store!r} holds no checkpoint of run {run_id!r}.")
+        meter.records.extend(snapshot.values["records"])
+        store.save_run(run_id, graph_id, "running", row.paused)
     except BaseException:
         meter.close()
         raise
-    meter.records.extend(snapshot.values["records"])
-    store.save_run(run_id, graph_id, "running", row.paused)
     query = _query({name: snapshot.values["values"][name] for name in mas.inputs})
     return _advance(mas, query, Command(resume=_ready(store, snapshot.interrupts)), meter, asking)
 
@@ -1646,7 +1676,8 @@ def stop(mas: MAS, run_id: str, reason: str = "stopped") -> bool:
     """Stop a run: a running one through its meter, a paused one in the store; ``False`` for neither.
 
     A paused run's row becomes ``stopped`` and each of its open questions is
-    withdrawn through the asker's ``withdraw``, when it has one.
+    withdrawn through the asker's ``withdraw``, when it has one; a running
+    run's open questions are withdrawn once it ends (:func:`_advance`).
     """
     meter = RUNNING.get(run_id)
     if meter is not None:
@@ -1657,12 +1688,16 @@ def stop(mas: MAS, run_id: str, reason: str = "stopped") -> bool:
     if row is None or row.status != "paused":
         return False
     store.save_run(run_id, row.system_id, "stopped")
-    withdraw = getattr(mas.asker, "withdraw", None)
-    for question in row.paused:
-        saved = store.question(question)
-        if withdraw is not None and saved is not None and saved.payload is not None:
-            withdraw(Question.from_dict(saved.payload), reason)
+    _withdraw(mas, store, run_id, reason)
     return True
+
+
+def _withdraw(mas: MAS, store: Store, run_id: str, reason: str) -> None:
+    """Withdraw each unanswered question of a stopped run through the asker's ``withdraw``, when it has one."""
+    withdraw = getattr(mas.asker, "withdraw", None)
+    for row in store.questions(run_id):
+        if withdraw is not None and row.answer is None and row.payload is not None:
+            withdraw(Question.from_dict(row.payload), reason)
 
 
 def _advance(mas: MAS, query: str, start: MASState | Command[Any], meter: RunMeter, asking: _Asking) -> Trace:
@@ -1670,7 +1705,9 @@ def _advance(mas: MAS, query: str, start: MASState | Command[Any], meter: RunMet
 
     Answers that arrive before the run returns (from the asker, or through
     :func:`answer`) resume it here. The run's row keeps its status, the
-    questions it waits on and the meter's totals.
+    questions it waits on and the meter's totals. A run stopped while it ran
+    ends ``stopped`` even when it reached a pause, and its open questions are
+    withdrawn.
     """
     store = asking.store
     graph = mas.compiled.copy(update={"checkpointer": store})
@@ -1691,15 +1728,21 @@ def _advance(mas: MAS, query: str, start: MASState | Command[Any], meter: RunMet
                 if row.question_id in waiting
             )
             for question in questions:
-                if question.id not in asking.resumed:
+                if question.id not in asking.resumed and meter.stopped is None:
                     where = {"item": question.item, "item_key": question.item_key, "visit": question.visit}
                     meter.emit("pause", question.node, question=question.id, **where)
             trace = _trace(mas, query, result["records"], meter, output="", pause=Pause(asking.run_id, questions))
         else:
             trace = trace_from_state(mas, query, result, meter)
+        store.save_run(asking.run_id, cast("str", meter.graph_id), trace.status.value, waiting, meter.totals())
     finally:
         meter.close()
-    store.save_run(asking.run_id, cast("str", meter.graph_id), trace.status.value, waiting, meter.totals())
+    reason = meter.stopped
+    if reason is not None and trace.status in (RunStatus.PAUSED, RunStatus.STOPPED):  # a stop while it ran or paused
+        if trace.pause is not None:
+            trace = _failed_trace(mas, query, Stopped(reason), meter)
+        store.save_run(asking.run_id, cast("str", meter.graph_id), "stopped", (), meter.totals())
+        _withdraw(mas, store, asking.run_id, reason)
     return trace
 
 

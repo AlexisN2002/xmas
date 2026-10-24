@@ -591,9 +591,7 @@ class APILLM(promptolution.APILLM):
         progress.messages = kwargs["messages"]
         progress.text.clear()  # a retry starts its answer anew
         chunks: list[ChatCompletionChunk] = []
-        stream = await self.client.chat.completions.create(
-            **kwargs, stream=True, stream_options={"include_usage": True}
-        )
+        stream = await self.client.chat.completions.create(**{**kwargs, **_STREAM})  # as call_params records it
         try:
             async for chunk in stream:
                 chunks.append(chunk)

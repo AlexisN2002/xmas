@@ -162,6 +162,13 @@ class RaceLost(Stopped):
     """
 
 
+class Unanswered(XmasError):
+    """A question of a run no one answers later (``run``, ``run_batch``) got no answer and has no default.
+
+    It fails the run wherever the human node sits, a chain item or a box included.
+    """
+
+
 class EmptyResponse(XmasError):
     """A model answered with no content.
 

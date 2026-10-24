@@ -450,8 +450,11 @@ class Store(BaseCheckpointSaver[str]):
         return tuple(_question_row(r) for r in rows)
 
     def due(self, now: datetime | None = None) -> tuple[RunRow, ...]:
-        """Return the paused runs with an open question whose deadline has passed at ``now``, oldest first."""
-        moment = now or datetime.now(UTC)
+        """Return the paused runs with an open question whose deadline has passed at ``now``, oldest first.
+
+        A ``now`` without a zone is local time, as ``datetime.now()`` gives it.
+        """
+        moment = (now or datetime.now(UTC)).astimezone()
         rows = self._execute(
             "SELECT DISTINCT run_id, deadline FROM xmas_questions WHERE answer IS NULL AND deadline IS NOT NULL"
         )

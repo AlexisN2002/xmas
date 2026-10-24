@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
-from xmas.values import TEXT, ValueType, render_value
+from xmas.values import TEXT, ValueType, check_value, parse_type, render_value
 
 if TYPE_CHECKING:  # pragma: no cover
     from xmas.trace import Trace
@@ -327,6 +327,7 @@ class Human:
             deadline=deadline,
             default=None if self.default is None else dict(self.default),
             edits=self.edits if self.form == "edit" else None,
+            value_type=str(types[self.writes["value"]]) if self.writes.get("value") in types else None,
         )
 
     def _options(self, values: Mapping[str, Any], types: Mapping[str, ValueType]) -> tuple[str, ...]:
@@ -405,6 +406,8 @@ class Question:
         deadline: When its default is taken, ISO UTC; ``None`` without a timeout.
         default: The partial answer taken at the deadline.
         edits: An edit's placeholder in ``shown`` whose value the person changes.
+        value_type: The type an edit's value is checked against, such as
+            ``text``; ``None`` when not known.
     """
 
     id: str
@@ -421,6 +424,7 @@ class Question:
     deadline: str | None = None
     default: dict[str, Any] | None = None
     edits: str | None = None
+    value_type: str | None = None
 
     def due(self, now: datetime) -> bool:
         """Whether the deadline has passed at ``now``."""
@@ -471,7 +475,9 @@ class ReplayAsker:
     A question is answered by the human record of its node, item (key, else
     index) and visit, from the first trace that holds one; a question with no
     record, or whose recorded answer was a default taken on timeout, gets
-    ``None``. A human record's ``raw_response`` is its answer's JSON.
+    ``None``. A human record's ``raw_response`` is its answer's JSON. A
+    replayed answer is given when it is asked, so its recorded ``answered_at``
+    is left out.
     """
 
     def __init__(self, traces: Trace | Iterable[Trace]) -> None:
@@ -492,7 +498,7 @@ class ReplayAsker:
         recorded = self.answers.get((question.node, where, question.visit))
         if recorded is None or recorded.get("timed_out"):
             return None
-        given = (*ANSWER_FIELDS[question.form], *_GIVEN, EDITED)
+        given = (*ANSWER_FIELDS[question.form], "who", "comment", EDITED)
         return {key: value for key, value in recorded.items() if key in given}
 
 
@@ -521,7 +527,9 @@ def answer_value(
 
     Raises:
         ValueError: Listing every problem: a missing, extra or mistyped field,
-            an unknown choice, a missing ``who``.
+            an unknown choice, a missing ``who``, an ``answered_at`` that is no
+            ISO time with its zone or comes before the question was asked, an
+            edited value not of the question's ``value_type``.
     """
     fields = ANSWER_FIELDS[question.form]
     allowed = (*fields, *_GIVEN, *([EDITED] if question.form == "edit" else []))
@@ -536,6 +544,9 @@ def answer_value(
     comment = given.get("comment")
     if comment is not None and not isinstance(comment, str):
         problems.append(f"comment is a text, got {comment!r}")
+    answered = given.get("answered_at") if not timed_out else None
+    if answered is not None:
+        problems += _time_problems(answered, question.asked_at)
     answer = {name: given.get(name) for name in fields}
     approved = given.get("approved")
     if question.form == "approve" and approved is None and given.get("option") in question.options:
@@ -553,6 +564,9 @@ def answer_value(
     if question.form == "edit":
         if EDITED in given:
             answer[EDITED] = given[EDITED]
+            wrong = None if question.value_type is None else check_value(given[EDITED], parse_type(question.value_type))
+            if wrong is not None:
+                problems.append(f"the edited value is not {question.value_type}: {wrong}")
             if "changed" not in given and question.edits is not None:
                 before = question.shown.get(question.edits)
                 answer["changed"] = before not in (
@@ -565,12 +579,24 @@ def answer_value(
             answer["changed"] = False
     if problems:
         raise ValueError(f"The answer to {question.id!r} does not fit: " + "; ".join(problems) + ".")
-    answered = given.get("answered_at") if not timed_out else None
     return {
         **answer,
         "who": who,
         "asked_at": question.asked_at,
-        "answered_at": answered if isinstance(answered, str) else now.isoformat(),
+        "answered_at": answered or now.isoformat(),
         "comment": comment,
         "timed_out": timed_out,
     }
+
+
+def _time_problems(answered: Any, asked_at: str) -> list[str]:
+    """Say what is wrong with a host's ``answered_at``: not an ISO time with its zone, or before ``asked_at``."""
+    try:
+        moment = datetime.fromisoformat(answered) if isinstance(answered, str) else None
+    except ValueError:
+        moment = None
+    if moment is None or moment.tzinfo is None:
+        return [f"answered_at is an ISO time with its zone, such as 2026-10-24T09:30:00+00:00, got {answered!r}"]
+    if moment < datetime.fromisoformat(asked_at):
+        return [f"answered_at {answered} comes before the question was asked, {asked_at}"]
+    return []

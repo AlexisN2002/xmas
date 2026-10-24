@@ -1638,6 +1638,34 @@ def test_a_race_checks() -> None:
             id="human contestant",
         ),
         pytest.param(
+            lambda: MAS(
+                [
+                    Agent("outline", "Outline {query}", "outline"),
+                    Agent("quick", "Notes {outline}", "notes", ["outline"]),
+                ],
+                [Edge("outline", "quick", EdgeKind.FIRST), Edge("outline", "careful", EdgeKind.FIRST)],
+                boxes=[
+                    Box(
+                        "careful",
+                        MAS(
+                            [Agent("w", "Notes {topic}", "draft", ["topic"])],
+                            [("w", "ok")],
+                            humans=[Human("ok", "edit", ["draft"], {"answer": "okd", "value": "notes"}, edits="draft")],
+                            inputs={"topic": "text"},
+                            outputs={"notes": "text"},
+                            llm=MockLLM(),
+                        ),
+                        reads={"topic": "outline"},
+                        writes={"notes": "notes"},
+                    )
+                ],
+                outputs={"notes": "text"},
+                llm=MockLLM(),
+            ),
+            r"box 'careful' holds a human node; a contestant never waits for a person",
+            id="box holding a human contestant",
+        ),
+        pytest.param(
             lambda: race(
                 {"name": "fallback", "reads": ["outline"], "writes": {"apology": "text"}},
                 edges=[*FIRST, {"careful -> fallback": {"on error": "any"}}],
@@ -1773,6 +1801,23 @@ def test_questions_and_answers_without_a_run() -> None:
     assert edit.state_writes(kept, "Old title")["final"] == "Old title"
     with pytest.raises(ValueError, match="changed is true, but the edited value is missing"):
         answer_value(page, {"changed": True, "who": "tom"}, now=NOW)
+    typed = edit.ask({"draft": "Old title"}, {"final": ValueType("text")}, run_id="r1", visit=1, now=NOW)
+    assert (page.value_type, typed.value_type) == (None, "text")
+    assert Question.from_dict({k: v for k, v in typed.to_dict().items() if k != "value_type"}).value_type is None
+    with pytest.raises(ValueError, match="the edited value is not text: expected text, got dict"):
+        answer_value(typed, {"value": {"title": "New"}, "who": "tom"}, now=NOW)
+
+    # a host's answered_at is an ISO time with its zone, not before the question
+    given_at = {"approved": True, "who": "tom", "answered_at": later.isoformat()}
+    assert answer_value(question, given_at, now=NOW)["answered_at"] == later.isoformat()
+    for stamp, problem in (
+        ("yesterday", "answered_at is an ISO time with its zone"),
+        ("2026-10-24T09:00:30", "answered_at is an ISO time with its zone"),
+        (5, "answered_at is an ISO time with its zone"),
+        ((NOW - timedelta(seconds=1)).isoformat(), "comes before the question was asked"),
+    ):
+        with pytest.raises(ValueError, match=problem):
+            answer_value(question, {"approved": True, "who": "tom", "answered_at": stamp}, now=later)
     assert set(ANSWER_FIELDS) == set(FORMS)
 
     # an optimizer replays recorded answers and asks nobody
@@ -1781,11 +1826,11 @@ def test_questions_and_answers_without_a_run() -> None:
     )
     unanswered = AgentRecord("approve", 1, "", "", {}, {}, kind="human", raw_response=json.dumps(timed_out), visit=2)
     replay = ReplayAsker(Trace("q", "", (record, unanswered)))
-    given = {"approved": True, "option": "Ship Deck", "who": "tom", "answered_at": later.isoformat(), "comment": None}
-    assert replay.ask(question) == given
+    given = {"approved": True, "option": "Ship Deck", "who": "tom", "comment": None}
+    assert replay.ask(question) == given  # answered when asked again: the recorded time stays behind
     assert replay.ask(Question(**{**question.to_dict(), "visit": 2, "options": ("a", "b")})) is None  # a default
     assert replay.ask(asked) is None
-    assert answer_value(question, replay.ask(question) or {}, now=NOW) == answer
+    assert answer_value(question, replay.ask(question) or {}, now=later) == answer
 
     # records, events and health carry the waits
     assert record == AgentRecord("approve", 0, "", "", {}, {}, kind="human", raw_response=json.dumps(answer), visit=1)

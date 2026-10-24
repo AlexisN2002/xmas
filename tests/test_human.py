@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,7 +17,8 @@ import pytest
 from langgraph.checkpoint.serde.event_hooks import SerdeEvent, register_serde_event_listener
 
 from tests.conftest import MockLLM, SeeingLLM, req
-from xmas import MAS, Agent, Box, Budget
+from xmas import MAS, Agent, Box, Budget, Step
+from xmas.budget import RUNNING
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import ErrorKind, Stopped
 from xmas.graph import END
@@ -349,6 +351,24 @@ def test_resume_after_a_restart(tmp_path: Path) -> None:
     over = resume(tight, "r9", {"r9/approve/1": {"approved": True, **TOM}})
     assert over.status == "over_budget" and [r.agent for r in over.records] == ["writer", "approve"]
 
+    # a row whose checkpoints are gone is refused, and the run's id is free again
+    later = gated()
+    later.store = str(tmp_path / "later.db")  # a path set after construction opens there
+    assert run(later, {"query": "q"}, "r10").status == "paused"
+    assert later._runs().path == tmp_path / "later.db"
+    later._runs().delete_thread("r10")
+    with pytest.raises(ValueError, match="holds no checkpoint of run 'r10'"):
+        resume(later, "r10", {"r10/approve/1": {"approved": True, **TOM}})
+    assert "r10" not in RUNNING
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("disk full")
+
+    later._runs().save_run = broken  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="disk full"):
+        run(later, {"query": "q"}, "r11")
+    assert "r11" not in RUNNING
+
 
 def test_timeouts_take_the_default() -> None:
     never = gated(human=gate(timeout_s=0, default={"approved": False}))
@@ -370,6 +390,7 @@ def test_timeouts_take_the_default() -> None:
         resume(waits, "t2")
     time.sleep(0.25)
     assert [row.run_id for row in store.due()] == ["t2"]
+    assert [row.run_id for row in store.due(datetime.now())] == ["t2"]  # a time without a zone is local
     done = resume(waits, "t2")
     assert done.outputs["approval"]["timed_out"] is True and done.outputs["held"] == "hold"
     assert store.due() == ()
@@ -437,11 +458,31 @@ def test_askers_and_unattended_runs(tmp_path: Path) -> None:
     replayed = gated(asker=ReplayAsker(done)).run("q")
     assert replayed.status == "ok" and replayed.outputs["approval"]["approved"] is True
     assert replayed.outputs["shipped"] == done.outputs["shipped"]
+    assert cast("float", replayed["approve"][0].wait_s) >= 0  # answered when asked again
     defaulted = gated(human=gate(default={"approved": False})).run("q")
     assert defaulted.outputs["approval"]["timed_out"] is True and defaulted.outputs["held"] == "hold"
     failed = gated().run("q")
-    assert failed.error == "XmasError: human node 'approve' got no answer in an unattended run"
+    assert failed.error == "Unanswered: human node 'approve' got no answer in an unattended run"
     assert [r.agent for r in failed.records] == ["writer"]
+    split = Step("split", "pages", reads={"query": "query"}, writes={"pages": "plan"})
+    itemized = MAS(
+        [Agent("drafter", "Draft {page}", "draft", ["page"])],
+        [("split", "drafter"), ("drafter", "fix")],
+        steps=[split],
+        humans=[Human("fix", "approve", ["draft"], "fixed")],
+        each={"drafter": {"item": "page", "in": "plan"}, "fix": "page in plan"},
+        tools=[pages],
+        outputs={"fixed": "list of json"},
+        llm=MockLLM(lambda p: p),
+    )
+    (failed,) = itemized.run_batch(["q"])  # an item's open question fails the run, not just the item
+    assert failed.error == "Unanswered: human node 'fix' got no answer in an unattended run"
+
+
+@tool
+def pages(query: str) -> list[str]:
+    """Split a query into two pages."""
+    return [f"{query} 1", f"{query} 2"]
 
 
 def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:

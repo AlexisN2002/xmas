@@ -706,6 +706,8 @@ def _race_problems(
             kind = "the end" if name == END else kind
             if kind is not None:
                 problems.append(f"{where}: {name!r} is {kind}; agents, steps and boxes race")
+            elif name in mas.boxes and holds_human(mas.boxes[name].system):
+                problems.append(f"{where}: box {name!r} holds a human node; a contestant never waits for a person")
         after: dict[str, str] = {}
         for name in contestants:
             out = [e for e in edges if e.source == name and e.kind is not EdgeKind.WHILE]
