@@ -6,6 +6,7 @@ No network: the model is a scripted double and the tool source a recording one.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx2
@@ -15,8 +16,9 @@ from langgraph.errors import GraphBubbleUp, GraphInterrupt
 from pydantic import Field
 
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
-from xmas.errors import Stopped, XmasError
+from xmas.errors import BadFormat, Stopped, XmasError
 from xmas.llms.call_log import CallLog
+from xmas.media import Ref
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
 from xmas.optimization.topology import TopologyBudget
@@ -25,6 +27,7 @@ from xmas.tools import (
     Tool,
     ToolCallRequest,
     ToolSource,
+    run_step,
     tool,
 )
 from xmas.utils import timestamp
@@ -557,6 +560,32 @@ def test_a_graph_signal_in_a_local_tool_is_not_wrapped() -> None:
     with pytest.raises(GraphBubbleUp) as raised:
         LocalTools([ask]).call("ask", {"text": "x"})
     assert not isinstance(raised.value, XmasError)
+
+
+def test_a_step_writes_media_as_stored_refs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XMAS_STORE", str(tmp_path / "store"))
+    drawn = tmp_path / "slide.png"
+
+    def draw(page: str) -> Any:
+        """Draw one page into the same file every time."""
+        drawn.write_bytes(f"png-{page}".encode())
+        return drawn
+
+    page = {"type": "object", "properties": {"page": {"type": "string"}}}
+    paint = Tool("draw", "Draw a page.", page, fn=draw, writes={"png": "image"})
+    source = LocalTools([paint])
+    first = run_step(paint, source, {"page": "1"})["png"]  # the file is rewritten for page 2
+    second = run_step(paint, source, {"page": "2"})["png"]
+    assert isinstance(first, Ref) and first.location.startswith(str(tmp_path / "store"))
+    assert (first.read_bytes(), second.read_bytes(), first.media_type) == (b"png-1", b"png-2", "image/png")
+
+    raw = Tool("raw", "Return bytes.", page, fn=lambda page: b"png", writes={"png": "image"})
+    with pytest.raises(BadFormat, match=r"got bytes; return a Path or a Ref, Ref\.from_bytes stores bytes"):
+        run_step(raw, LocalTools([raw]), {"page": "1"})
+
+    remote = Tool("paint", "Paint remotely.", page, writes={"png": "image"})
+    with pytest.raises(XmasError, match="returns text only, so 'paint' cannot write media"):
+        run_step(remote, FakeToolSource(["paint"]), {"page": "1"})
 
 
 def test_api_llm_tool_turn_records_carry_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
