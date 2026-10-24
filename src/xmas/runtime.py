@@ -24,21 +24,39 @@ item, ``__each__.h`` runs the chain's own system on one item, and
 ``__each__.h.out`` gathers each write into a list aligned to the items. Every
 record a chain's item makes carries the item, and records keep the order of the
 items, however the items finish.
+
+A system with people in it (a :class:`~xmas.human.Human` at any depth) can
+pause. A human ``h`` compiles to two nodes: ``h`` asks (it fills the question,
+keeps it in the run's :class:`~xmas.store.Store` and calls the host's asker
+once) and the deferred ``h.wait`` takes the answer, so every other branch ends
+or reaches its own question first. A wait without an answer interrupts the
+graph; the run returns a trace with status ``paused`` and the open questions in
+``Trace.pause``, its checkpoints in the store under the run's id, and
+:func:`resume` goes on from there, in this process or after a restart. A chain
+or box holding a human runs its inner system as a root run of its own thread,
+so a pause inside it returns instead of holding the outer step; the
+container's deferred ``wait`` node resumes only the paused threads.
 """
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
+import json
 import operator
 import time
+import uuid
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
+from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.config import get_config
 from langgraph.errors import GraphBubbleUp, GraphRecursionError
 from langgraph.graph import StateGraph
-from langgraph.types import Send
+from langgraph.types import Command, Interrupt, Send, interrupt
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from promptolution.utils.token_counter import get_token_counter
 
@@ -46,9 +64,10 @@ from xmas.agent import Agent
 from xmas.budget import RunMeter, VisitMeter
 from xmas.check import SENT, step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
-from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, classify
+from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, XmasError, classify
 from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
+from xmas.human import Asker, Human, Pause, Question, answer_value, question_id
 from xmas.llms.meta import SupportsImages, SupportsMeta, SupportsParts, supports_meta, supports_parts
 from xmas.llms.parts import Part, render_parts
 from xmas.media import store
@@ -57,6 +76,7 @@ from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
 from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
+from xmas.store import Store, open_store
 from xmas.tools import run_step, run_tool_loop
 from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, check_value, coerce_media, media_kind, parse_type, plain, render_value
@@ -77,6 +97,9 @@ _RUN_KEY = "xmas_run"
 
 _ITEM_KEY = "xmas_item"
 """Key of the chain item a run works on, ``(index, key)``, in ``config["configurable"]``."""
+
+_ASKING_KEY = "xmas_asking"
+"""Key of a run's :class:`_Asking`, in ``config["configurable"]`` of a system that can pause."""
 
 Prompt = str | list[Part]
 """What an agent sends its model: one text, or content parts when it reads an image or audio."""
@@ -127,6 +150,56 @@ class _ChainState(MASState):
     items: Annotated[dict[str, Any], _merge_items]
 
 
+class _AskState(MASState):
+    """The state of a system with human nodes or pausing boxes.
+
+    Attributes:
+        asks: By node: a human's latest question (``Question.to_dict()``), or a
+            box's paused inner thread (``{"thread", "scope", "query"}``),
+            ``None`` once it finished.
+    """
+
+    asks: Annotated[dict[str, Any], operator.or_]
+
+
+class _ChainAskState(_ChainState, _AskState):
+    """The state of a system with chains and human nodes or pausing boxes."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Asking:
+    """How a run that can pause asks: where it keeps questions, who it asks, and where in the run a node is.
+
+    Attributes:
+        store: Questions, answers and checkpoints.
+        asker: The host's asker, or ``None``.
+        run_id: The run's id, the top-level thread.
+        thread: The checkpoint thread of the system running now: the run's
+            id, or a chain item's or box's own thread under it.
+        scope: What the questions asked here start their ids with.
+        unattended: A run no one can answer later (``run``, ``run_batch``):
+            an unanswered question takes its default or fails the run.
+        resumed: The questions the run was paused on when it was resumed.
+    """
+
+    store: Store
+    asker: Asker | None
+    run_id: str
+    thread: str
+    scope: str
+    unattended: bool = False
+    resumed: frozenset[str] = frozenset()
+
+
+class _Paused(GraphBubbleUp):
+    """A box's inner run paused: the box's wait node finishes the visit once its questions are answered."""
+
+    def __init__(self, marker: dict[str, Any]) -> None:
+        """Keep what the wait node needs: the inner thread, its question scope and the box's query."""
+        super().__init__(marker)
+        self.marker = marker
+
+
 _NodeBody = Callable[[MASState, VisitMeter], tuple[AgentRecord, dict[str, Any]]]
 """What a node does in one visit, on its share of the run's meter: its record, and the values it writes."""
 
@@ -145,6 +218,24 @@ def _item() -> tuple[int, str | None] | None:
     """Return the chain item the running node works on, ``(index, key)``, or ``None`` outside a chain."""
     item: tuple[int, str | None] | None = get_config().get("configurable", {}).get(_ITEM_KEY)
     return item
+
+
+def _asking() -> _Asking:
+    """Return the running node's :class:`_Asking`."""
+    asking: _Asking = get_config()["configurable"][_ASKING_KEY]
+    return asking
+
+
+def _humans(mas: MAS) -> dict[str, Human]:
+    """Return the system's human nodes by name."""
+    humans = getattr(mas, "humans", None) or {}
+    return dict(humans) if isinstance(humans, Mapping) else {human.name: human for human in humans}
+
+
+def pauses(mas: MAS) -> bool:
+    """Return whether a system can pause: it, or a chain or box in it at any depth, holds a human node."""
+    inner = [box.system for box in mas.boxes.values()] + [chain.system for chain in _chains(mas).values()]
+    return bool(_humans(mas)) or any(pauses(system) for system in inner)
 
 
 def _chains(mas: MAS) -> dict[str, Chain]:
@@ -214,7 +305,13 @@ def _call(
 
 
 def _wrap(
-    mas: MAS, name: str, body: _NodeBody, decision: _Decision | None = None, *, writes_error: bool = False
+    mas: MAS,
+    name: str,
+    body: _NodeBody,
+    decision: _Decision | None = None,
+    *,
+    writes_error: bool = False,
+    starts: bool = True,
 ) -> Callable[[MASState], dict[str, Any]]:
     """Turn a node's body into the node LangGraph runs.
 
@@ -231,6 +328,10 @@ def _wrap(
     error edge routes the error's kind, the visit takes it and writes only
     ``error`` (``{kind, message, node}``, when ``writes_error``); otherwise the
     error goes on. Version 1 raises.
+
+    A box whose inner run paused keeps no record yet: the node writes the
+    paused thread under ``asks`` for the box's wait node, which finishes the
+    visit (``starts=False``: the visit has started already).
     """
     retry = mas.retry.get(name, {})
 
@@ -243,7 +344,8 @@ def _wrap(
             "item": index,
             "item_key": key,
         }
-        meter.emit("start", name, **here)
+        if starts:
+            meter.emit("start", name, **here)
         started = time.perf_counter()
         visit = VisitMeter(meter)
         update: dict[str, Any] = {}
@@ -269,6 +371,8 @@ def _wrap(
                 route, capped = decision.route(_context(mas, name, state, update["values"], meter))
                 record = dataclasses.replace(record, route=tuple(route), capped=capped)
                 update["routes"] = {name: route}
+        except _Paused as paused:
+            return {"asks": {name: paused.marker}}
         except GraphBubbleUp:  # LangGraph's own signals, such as an interrupt, pass untouched
             raise
         except Exception as error:
@@ -502,7 +606,7 @@ def _raw(outputs: dict[str, str], writes: dict[str, Any]) -> str:
     return next(iter(outputs.values())) if len(outputs) == 1 else render_value(plain(writes), JSON)
 
 
-def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
+def _box_body(box: Box, types: Mapping[str, ValueType], *, resumes: bool = False) -> _NodeBody:
     """Build what a box does in one visit: run its inner system from the mapped values.
 
     The inner system runs on the outer run's meter, which adopts it, so its
@@ -510,8 +614,14 @@ def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
     on, if any. Its failure raises out of the box, so the box's own error edges
     route by the inner error's kind; the visit keeps the inner trace so far for
     the box's failed record.
+
+    An inner system that can pause runs as a root run of its own thread,
+    ``<thread>/<box>/<visit>``; a pause there raises :class:`_Paused`, and the
+    box's wait node (``resumes``) resumes the thread once its questions are
+    answered and finishes the visit.
     """
     inner: MAS = box.system
+    pausing = pauses(inner)
 
     def body(state: MASState, visit: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         run = visit.run
@@ -519,15 +629,30 @@ def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
         run.adopt(inner)
         values = state["values"]
         given = {inside: values[outside] for inside, outside in box.reads.items() if outside in values}
-        query = render_value(plain(given), JSON)
+        marker = cast("_AskState", state)["asks"][box.name] if resumes else None
+        query = marker["query"] if marker is not None else render_value(plain(given), JSON)
         kept = len(run.records_of(inner))
+        item = _item()
         try:
-            config = _run_config(inner, run, item=_item())
-            result = inner.compiled.invoke(_initial_state(given, inner.prompts()), config=config)
+            if marker is not None:
+                here = dataclasses.replace(_asking(), thread=marker["thread"], scope=marker["scope"])
+                result = _alone(inner, run, here, item)
+                while "__interrupt__" in result:
+                    interrupt({"questions": _open(result)})
+                    result = _alone(inner, run, here, item)
+            elif pausing:
+                asking, number = _asking(), 1 + sum(record.agent == box.name for record in state["records"])
+                thread, scope = f"{asking.thread}/{box.name}/{number}", f"{asking.scope}/{box.name}/{number}"
+                here = dataclasses.replace(asking, thread=thread, scope=scope)
+                result = _alone(inner, run, here, item, _initial_state(given, inner.prompts()))
+                if "__interrupt__" in result:
+                    raise _Paused({"thread": thread, "scope": scope, "query": query, "visit": number})
+            else:
+                config = _run_config(inner, run, item=item)
+                result = inner.compiled.invoke(_initial_state(given, inner.prompts()), config=config)
         except GraphBubbleUp:
             raise
-        except Exception as error:
-            item = _item()  # a box in a chain: its siblings' inner records sit on the same list
+        except Exception as error:  # a box in a chain: its siblings' inner records sit on the same list
             visit.inner = _failed_trace(inner, query, error, run, kept, None if item is None else item[0])
             raise
         trace, produced = trace_from_state(inner, query, result, run), result["values"]
@@ -555,6 +680,174 @@ def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
         return record, writes
 
     return body
+
+
+def _box_wait(name: str, finish: Callable[[MASState], dict[str, Any]]) -> Callable[[MASState], dict[str, Any]]:
+    """Build a pausing box's wait node: it finishes a visit whose inner run paused, and passes any other by."""
+
+    def wait(state: MASState) -> dict[str, Any]:
+        marker = cast("_AskState", state).get("asks", {}).get(name)
+        finished = sum(record.agent == name for record in state["records"])
+        return finish(state) if marker is not None and marker["visit"] > finished else {}
+
+    return wait
+
+
+def _human_nodes(
+    mas: MAS, human: Human, decision: _Decision | None, types: Mapping[str, ValueType]
+) -> tuple[Callable[[MASState], dict[str, Any]], Callable[[MASState], dict[str, Any]]]:
+    """Build a human node's two nodes: one asks once per visit, the deferred other takes the answer.
+
+    The asking node fills the question from the state, keeps it in the store,
+    calls the host's asker once, and keeps an answer given at once. The wait
+    node only reads before it interrupts, since LangGraph runs it again on
+    resume: the answer kept, else the default once the deadline passed, else
+    it pauses. It then writes the answer, keeps the visit's record (no cost,
+    ``wait_s`` from asking to answering) and routes on what it wrote.
+    """
+    name = human.name
+    reads: Mapping[str, str] = cast("Mapping[str, str]", human.reads)
+    edited = reads.get(human.edits or "")
+
+    def ask(state: MASState) -> dict[str, Any]:
+        meter, asking = _current_meter(mas), _asking()
+        meter.start()
+        index, key = _item() or (None, None)
+        visit = 1 + sum(record.agent == name for record in state["records"])
+        meter.emit("start", name, item=index, item_key=key, visit=visit)
+        now = datetime.now(UTC)
+        question = human.ask(
+            state["values"], types, run_id=asking.run_id, visit=visit, now=now, item=index, item_key=key
+        )
+        question = dataclasses.replace(question, id=question_id(asking.scope, name, visit, index, key))
+        asking.store.save_question(
+            question.id,
+            asking.run_id,
+            name,
+            question.form,
+            question.shown,
+            question.asked_at,
+            deadline=question.deadline,
+            payload=question.to_dict(),
+        )
+        given = None if asking.asker is None else asking.asker.ask(question)
+        if given is not None:
+            _keep(asking.store, question, given)
+        return {"asks": {name: question.to_dict()}}
+
+    def wait(state: MASState) -> dict[str, Any]:
+        asking = _asking()
+        question = Question.from_dict(cast("_AskState", state)["asks"][name])
+        while (answer := _answer(asking, question)) is None:
+            interrupt({"questions": [question.id]})
+        started = time.perf_counter()
+        meter = _current_meter(mas)
+        here: dict[str, Any] = {"visit": question.visit, "item": question.item, "item_key": question.item_key}
+        wait_s = (_time(answer["answered_at"]) - _time(question.asked_at)).total_seconds()
+        if question.id in asking.resumed:
+            meter.emit("resume", name, question=question.id, wait_s=wait_s, **here)
+        writes = human.state_writes(answer, state["values"].get(edited) if edited is not None else None)
+        record = AgentRecord(
+            agent=name,
+            step=-1,
+            prompt=human.question,
+            rendered_prompt=question.text,
+            inputs=dict(question.shown),
+            outputs={written: render_value(value, types.get(written, JSON)) for written, value in writes.items()},
+            raw_response=json.dumps(answer, ensure_ascii=False),
+            cost_usd=0.0,
+            kind="human",
+            wait_s=wait_s,
+            **here,
+        )
+        update: dict[str, Any] = {"values": writes}
+        if decision is not None:
+            route, capped = decision.route(_context(mas, name, state, writes, meter))
+            record = dataclasses.replace(record, route=tuple(route), capped=capped)
+            update["routes"] = {name: route}
+        record = dataclasses.replace(record, latency_s=time.perf_counter() - started)
+        meter.keep(record, mas)
+        meter.emit("end", name, status="ok", cost_usd=0.0, **here)
+        return {**update, "records": [record]}
+
+    return ask, wait
+
+
+def _time(stamp: str) -> datetime:
+    """Read an ISO time."""
+    return datetime.fromisoformat(stamp)
+
+
+def _keep(store: Store, question: Question, given: Mapping[str, Any], *, timed_out: bool = False) -> dict[str, Any]:
+    """Check an answer (:func:`~xmas.human.answer_value`), keep it in the store and return it in full."""
+    answer = answer_value(question, given, now=datetime.now(UTC), timed_out=timed_out)
+    store.answer(question.id, answer, who=answer["who"], answered_at=answer["answered_at"])
+    return answer
+
+
+def _answer(asking: _Asking, question: Question) -> dict[str, Any] | None:
+    """Return a question's answer: the one kept, else its default once due, else ``None``.
+
+    An unattended run takes the default at once, and fails without one.
+    """
+    row = asking.store.question(question.id)
+    if row is not None and row.answer is not None:
+        return row.answer
+    if question.due(datetime.now(UTC)) or (asking.unattended and question.default is not None):
+        return _keep(asking.store, question, question.default or {}, timed_out=True)
+    if asking.unattended:
+        raise XmasError(f"human node {question.node!r} got no answer in an unattended run")
+    return None
+
+
+def _answered(store: Store, questions: list[str]) -> bool:
+    """Return whether any of the questions has an answer or a deadline that has passed."""
+    now = datetime.now(UTC)
+    for question in questions:
+        row = store.question(question)
+        if row is not None and (row.answer is not None or (row.deadline is not None and _time(row.deadline) <= now)):
+            return True
+    return False
+
+
+def _open(result: Mapping[str, Any]) -> list[str]:
+    """Return the ids of the questions a paused run waits on, from its interrupts."""
+    return [question for pending in result["__interrupt__"] for question in pending.value["questions"]]
+
+
+def _ready(store: Store, pending: Sequence[Interrupt]) -> dict[str, None]:
+    """Return the resume map of the interrupts with an answered or due question; their nodes read the store."""
+    return {each.id: None for each in pending if _answered(store, each.value["questions"])}
+
+
+def _alone(
+    system: MAS,
+    run: RunMeter,
+    asking: _Asking,
+    item: tuple[int, str | None] | None,
+    start: MASState | None = None,
+) -> dict[str, Any]:
+    """Run ``system`` from ``start`` as a root run of ``asking.thread``, with checkpoints of its own.
+
+    A pause inside returns the state with ``__interrupt__`` instead of
+    interrupting the node that runs it. Without ``start`` the thread resumes
+    the interrupts whose questions are answered or due; when there is none,
+    its state and interrupts come back as they are.
+    """
+    graph = system.compiled.copy(update={"checkpointer": asking.store})
+    config = _run_config(system, run, item=item, asking=asking)
+
+    def go() -> dict[str, Any]:
+        var_child_runnable_config.set(None)  # no parent: LangGraph would nest the run in the node that calls it
+        if start is not None:
+            return cast("dict[str, Any]", graph.invoke(start, config=config, durability="exit"))
+        snapshot = graph.get_state(config)
+        ready = _ready(asking.store, snapshot.interrupts)
+        if not ready:
+            return {**snapshot.values, "__interrupt__": list(snapshot.interrupts)} if snapshot.next else snapshot.values
+        return cast("dict[str, Any]", graph.invoke(Command(resume=ready), config=config, durability="exit"))
+
+    return contextvars.copy_context().run(go)
 
 
 def _paid_inside(trace: Trace) -> dict[str, Any]:
@@ -716,13 +1009,11 @@ def _entry(name: str, chains: Mapping[str, Chain]) -> str:
     return f"__each__.{name}.in" if name in chains else name
 
 
-def _exit(name: str, chains: Mapping[str, Chain]) -> str:
-    """Return the node an edge out of ``name`` leaves from: a chain head's ``out`` node, else ``name``."""
-    return f"__each__.{name}.out" if name in chains else name
-
-
 def _add_joins(
-    builder: StateGraph[MASState, Any, MASState, MASState], joins: Mapping[str, Join], chains: Mapping[str, Chain]
+    builder: StateGraph[MASState, Any, MASState, MASState],
+    joins: Mapping[str, Join],
+    chains: Mapping[str, Chain],
+    exits: Mapping[str, str],
 ) -> tuple[set[tuple[str, str]], dict[tuple[str, str], str]]:
     """Add one barrier per join: it waits for each of the join's groups once per pass.
 
@@ -731,6 +1022,8 @@ def _add_joins(
     :class:`~xmas.routes.Join` names, which its sources route to. A merge needs
     nothing: its edges stay plain, and it runs on whichever arrives. Nor does a
     join at :data:`~xmas.graph.END`: the run ends once every branch has.
+    ``exits`` names the node an edge out of a node leaves from, where that is
+    another node.
 
     Returns the (source, join) pairs the barrier waits on directly, and the
     relay each other (source, join) pair goes to.
@@ -744,7 +1037,7 @@ def _add_joins(
         for group, relay in zip(join.groups, join.relays, strict=True):
             if relay is None:
                 direct.add((group[0], node))
-                starts.append(_exit(group[0], chains))
+                starts.append(exits.get(group[0], group[0]))
                 continue
             builder.add_node(relay, _relay)
             relays.update(((member, node), relay) for member in group)
@@ -803,28 +1096,35 @@ def _wire_v1(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS) -
 
 
 def _wire_v2(
-    builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS, out: dict[str, list[Edge]], deciding: set[str]
+    builder: StateGraph[MASState, Any, MASState, MASState],
+    mas: MAS,
+    out: dict[str, list[Edge]],
+    deciding: set[str],
+    waits: Mapping[str, str],
 ) -> None:
     """Wire a version 2 graph: a deciding node routes by what its wrapper wrote, joins are barriers, the rest plain.
 
     Each chain becomes its three nodes (:func:`_add_chain`); edges into its head
-    land on the first, edges out of it leave from the last.
+    land on the first, edges out of it leave from the last. Edges out of a
+    human or a pausing box leave from its wait node (``waits``).
     """
     chains = _chains(mas)
     for chain in chains.values():
         _add_chain(builder, mas, chain)
-    direct, relays = _add_joins(builder, mas._checked().joins, chains)
+    exits = {**{head: f"__each__.{head}.out" for head in chains}, **waits}
+    direct, relays = _add_joins(builder, mas._checked().joins, chains, exits)
     for source, edges in out.items():
         targets = {
             edge.target: relays.get((source, edge.target), _entry(edge.target, chains))
             for edge in edges
             if (source, edge.target) not in direct
         }
+        leaves = exits.get(source, source)
         if source not in deciding:
             for target in targets.values():
-                builder.add_edge(_exit(source, chains), target)
+                builder.add_edge(leaves, target)
         else:
-            builder.add_conditional_edges(source, _router(source, targets), sorted(set(targets.values())))
+            builder.add_conditional_edges(leaves, _router(source, targets), sorted(set(targets.values())))
 
 
 def _items(chain: Chain, values: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
@@ -876,53 +1176,105 @@ def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS,
     error, and ``None`` in every gathered list, unless the error ends the run
     (:data:`~xmas.errors.RUN_ENDS`) or is ``money``, which every other item
     would meet too.
+
+    A chain whose system can pause runs each item as a root run of its own
+    thread, ``<thread>/<head>/<pass>/<index>``. An item that pauses becomes a
+    paused row, and a fourth node, the deferred ``__each__.h.wait``, resumes
+    the paused items whose questions are answered, then comes back while any
+    item is still paused, and asks for all their questions at once when none
+    can go on.
     """
     head, each, system = chain.head, chain.each, chain.system
     start, target, gather = f"__each__.{head}.in", f"__each__.{head}", f"__each__.{head}.out"
+    hold, pausing = f"__each__.{head}.wait", pauses(system)
 
     def begin(state: _ChainState) -> dict[str, Any]:
         done = state.get("items", {}).get(head, {}).get("pass", 0)
         return {"items": {head: {"n": len(_items(chain, state["values"])), "pass": done + 1, "rows": {}}}}
 
-    def fan(state: MASState) -> list[Send] | list[str]:
+    def fan(state: _ChainState) -> list[Send] | list[str]:
         items = _items(chain, state["values"])
         if not items:
             return [gather]
         values = {name: state["values"][name] for name in chain.inputs if name in state["values"]}
+        passed = state["items"][head]["pass"]
+        task = {"values": values, "prompts": state["prompts"], "pass": passed}
         return [
-            Send(target, {"index": index, "item": item, "key": key, "values": values, "prompts": state["prompts"]})
-            for index, (item, key) in enumerate(items)
+            Send(target, {**task, "index": index, "item": item, "key": key}) for index, (item, key) in enumerate(items)
         ]
+
+    def outcome(
+        run: RunMeter, index: int, key: str | None, go: Callable[[], Any], here: _Asking | None = None
+    ) -> dict[str, Any]:
+        """Run one item and turn what it did into its row and records: values, an error, or a pause."""
+        where = {"item": index, "item_key": key}
+        kept = len(run.records_of(system))
+        try:
+            result = go()
+        except GraphBubbleUp:
+            raise
+        except Exception as error:
+            kind = _kind_of(error)
+            mine = [
+                record
+                for record in run.records_of(system)[kept:]
+                if record.agent in chain.nodes and record.item == index
+            ]
+            run.emit("item_end", head, status="failed", cost_usd=_cost(mine), **where)
+            if kind in RUN_ENDS or kind is ErrorKind.MONEY:
+                raise
+            row: dict[str, Any] = {"error": f"{type(error).__name__}: {error}", "kind": kind.value}
+            return {"items": {head: {"rows": {index: row}}}, "records": mine}
+        if here is not None and "__interrupt__" in result:
+            row = {"paused": here.thread, "scope": here.scope, "key": key, "questions": _open(result)}
+            return {"items": {head: {"rows": {index: row}}}}
+        run.emit("item_end", head, status="ok", cost_usd=_cost(result["records"]), **where)
+        produced = result["values"]
+        row = {"values": {name: produced[name] for name in chain.writes if name in produced}}
+        return {"items": {head: {"rows": {index: row}}}, "records": result["records"]}
 
     def run_item(task: dict[str, Any]) -> dict[str, Any]:
         run = _current_meter(mas)
         run.adopt(system, into=mas)
         index, key = task["index"], task["key"]
-        where = {"item": index, "item_key": key}
         with run.gate(f"each:{id(system)}", each.at_once):  # per chain, whatever its head is called
-            run.emit("item_start", head, **where)
-            kept = len(run.records_of(system))
+            run.emit("item_start", head, item=index, item_key=key)
             state = _initial_state({each.item: task["item"], **task["values"]}, task["prompts"])
-            try:
-                result = system.compiled.invoke(state, config=_run_config(system, run, item=(index, key)))
-            except GraphBubbleUp:
-                raise
-            except Exception as error:
-                kind = _kind_of(error)
-                mine = [
-                    record
-                    for record in run.records_of(system)[kept:]
-                    if record.agent in chain.nodes and record.item == index
-                ]
-                run.emit("item_end", head, status="failed", cost_usd=_cost(mine), **where)
-                if kind in RUN_ENDS or kind is ErrorKind.MONEY:
-                    raise
-                row: dict[str, Any] = {"error": f"{type(error).__name__}: {error}", "kind": kind.value}
-                return {"items": {head: {"rows": {index: row}}}, "records": mine}
-        run.emit("item_end", head, status="ok", cost_usd=_cost(result["records"]), **where)
-        produced = result["values"]
-        row = {"values": {name: produced[name] for name in chain.writes if name in produced}}
-        return {"items": {head: {"rows": {index: row}}}, "records": result["records"]}
+            if not pausing:
+                config = _run_config(system, run, item=(index, key))
+                return outcome(run, index, key, lambda: system.compiled.invoke(state, config))
+            asking, number = _asking(), task["pass"]
+            scope = asking.scope if number == 1 else f"{asking.scope}/{head}/{number}"
+            here = dataclasses.replace(asking, thread=f"{asking.thread}/{head}/{number}/{index}", scope=scope)
+            return outcome(run, index, key, lambda: _alone(system, run, here, (index, key), state), here)
+
+    def wait(state: _ChainState) -> dict[str, Any]:
+        rows = state["items"][head]["rows"]
+        paused = {index: row for index, row in rows.items() if "paused" in row}
+        if not paused:
+            return {}
+        run, asking = _current_meter(mas), _asking()
+        run.adopt(system, into=mas)  # a resumed run's meter is new
+        while not (ready := [index for index, row in paused.items() if _answered(asking.store, row["questions"])]):
+            interrupt({"questions": [question for row in paused.values() for question in row["questions"]]})
+
+        def again(index: int) -> dict[str, Any]:
+            row = paused[index]
+            here = dataclasses.replace(asking, thread=row["paused"], scope=row["scope"])
+            with run.gate(f"each:{id(system)}", each.at_once):
+                return outcome(run, index, row["key"], lambda: _alone(system, run, here, (index, row["key"])), here)
+
+        with ThreadPoolExecutor(len(ready)) as pool:
+            done = list(pool.map(again, ready))
+        rows = {index: row for part in done for index, row in part["items"][head]["rows"].items()}
+        return {
+            "items": {head: {"rows": rows}},
+            "records": [record for part in done for record in part.get("records", [])],
+        }
+
+    def onward(state: _ChainState) -> str:
+        rows = state["items"][head]["rows"]
+        return hold if any("paused" in row for row in rows.values()) else gather
 
     def finish(state: _ChainState) -> dict[str, Any]:
         entry = state.get("items", {}).get(head, {})
@@ -933,7 +1285,12 @@ def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS,
     builder.add_node(target, run_item)  # type: ignore[arg-type]
     builder.add_node(gather, finish)
     builder.add_conditional_edges(start, fan, [target, gather])
-    builder.add_edge(target, gather)
+    if not pausing:
+        builder.add_edge(target, gather)
+        return
+    builder.add_node(hold, wait, defer=True)
+    builder.add_edge(target, hold)
+    builder.add_conditional_edges(hold, onward, [hold, gather])
 
 
 def compile_mas(mas: MAS) -> Any:
@@ -944,23 +1301,32 @@ def compile_mas(mas: MAS) -> Any:
     query rather than once per wave of arriving inputs. In version 2 a node
     with conditional or error edges gets a :class:`_Decision`, a join is a
     barrier that runs its node once per pass, and a chain is its three nodes in
-    place of its members, on :class:`_ChainState`.
+    place of its members, on :class:`_ChainState`. A human is its asking node
+    and its deferred wait node (:func:`_human_nodes`), and so is a box that can
+    pause (its own node and :func:`_box_wait`); either adds the ``asks``
+    channel.
     """
     chains = _chains(mas)
     members = {name for chain in chains.values() for name in chain.nodes}
-    schema: type[MASState] = _ChainState if chains else MASState
+    humans = {name: human for name, human in _humans(mas).items() if name not in members}
+    holding = [name for name, box in mas.boxes.items() if name not in members and pauses(box.system)]
+    if humans or holding:
+        schema: type[MASState] = _ChainAskState if chains else _AskState
+    else:
+        schema = _ChainState if chains else MASState
     builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(schema)
     types = mas.info.types if mas.info is not None else {}
+    elsewhere = members | set(_humans(mas))
     bodies: dict[str, _NodeBody] = {}
     for agent in mas.agents.values():
-        if agent.name not in members:
+        if agent.name not in elsewhere:
             llm = mas.resolve_llm(agent)
             bodies[agent.name] = _agent_body(mas, agent, llm, get_token_counter(llm), types)
     for step in mas.steps.values():
-        if step.name not in members:
+        if step.name not in elsewhere:
             bodies[step.name] = _step_body(mas, step, types)
     for box in mas.boxes.values():
-        if box.name not in members:
+        if box.name not in elsewhere:
             bodies[box.name] = _box_body(box, types)
 
     out = _out_edges(mas) if mas.version == 2 else {}
@@ -975,8 +1341,19 @@ def compile_mas(mas: MAS) -> Any:
         node = _wrap(mas, name, body, decisions.get(name), writes_error=writes_error)
         # mypy rejects a TypedDict schema here; langgraph documents it as the usage.
         builder.add_node(name, node, defer=name in deferred, input_schema=schema)  # type: ignore[arg-type]
+    for name in holding:
+        body = _box_body(mas.boxes[name], types, resumes=True)
+        finish = _wrap(mas, name, body, decisions.get(name), writes_error=writes_error, starts=False)
+        builder.add_node(f"{name}.wait", _box_wait(name, finish), defer=True, input_schema=schema)  # type: ignore[arg-type]
+    for name, human in humans.items():
+        ask, wait = _human_nodes(mas, human, decisions.get(name), types)
+        builder.add_node(name, ask, input_schema=schema)  # type: ignore[arg-type]
+        builder.add_node(f"{name}.wait", wait, defer=True, input_schema=schema)  # type: ignore[arg-type]
+    waits = {name: f"{name}.wait" for name in [*humans, *holding]}
+    for name, wait_node in waits.items():
+        builder.add_edge(name, wait_node)
     if mas.version == 2:
-        _wire_v2(builder, mas, out, set(decisions))
+        _wire_v2(builder, mas, out, set(decisions), waits)
     else:
         _wire_v1(builder, mas)
     return builder.compile()
@@ -1074,11 +1451,18 @@ def _initial_state(query: str | Mapping[str, Any], prompts: Mapping[str, str]) -
     return MASState(values=values, prompts=dict(prompts), records=[], routes={})
 
 
-def _run_config(mas: MAS, meter: RunMeter, item: tuple[int, str | None] | None = None) -> dict[str, Any]:
-    """Build one run's config: the step cap, the meter the nodes read, and the chain item it works on, if any."""
+def _run_config(
+    mas: MAS, meter: RunMeter, item: tuple[int, str | None] | None = None, asking: _Asking | None = None
+) -> dict[str, Any]:
+    """Build one run's config: the step cap, the meter the nodes read, the chain item it works on, if any.
+
+    A run that can pause also carries its :class:`_Asking` and its checkpoint thread.
+    """
     configurable: dict[str, Any] = {_RUN_KEY: meter}
     if item is not None:
         configurable[_ITEM_KEY] = item
+    if asking is not None:
+        configurable.update({_ASKING_KEY: asking, "thread_id": asking.thread})
     return {"recursion_limit": mas.max_steps, "configurable": configurable}
 
 
@@ -1092,13 +1476,18 @@ def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> lis
 
     Every item runs once, with its own meter and budget. An item that fails
     becomes a failed trace that keeps its finished records; the others are
-    unaffected.
+    unaffected. No one answers later: a question the asker does not answer at
+    once takes its default, else fails the item.
     """
     return _run_all(mas, list(queries), queries, prompts)
 
 
 def run_state(
-    mas: MAS, values: Mapping[str, Any], prompts: dict[str, str], on_event: Callable[[Event], None] | None = None
+    mas: MAS,
+    values: Mapping[str, Any],
+    prompts: dict[str, str],
+    on_event: Callable[[Event], None] | None = None,
+    run_id: str | None = None,
 ) -> Trace:
     """Run a MAS on its declared inputs with a given prompt set; a failure is recorded in the trace, not raised.
 
@@ -1108,11 +1497,15 @@ def run_state(
     read. A version 1 system takes text values, ``query`` among them as
     ``run`` gives it. ``on_event`` is called with each event of the run, on the
     run's threads. The trace's query is the ``query`` value, else the values as
-    one line of JSON.
+    one line of JSON. ``run_id`` names the run, a new random id when ``None``.
+
+    A system that can pause (:func:`pauses`) runs on its store under the run's
+    id: a question not answered by the time every other branch has ended
+    returns a ``paused`` trace, which :func:`resume` continues.
 
     Raises:
         ValueError: Before any call, listing every input missing, extra or of
-            the wrong type.
+            the wrong type; or when the store holds a run with ``run_id``.
     """
     if mas.version == 2:
         values = {
@@ -1120,8 +1513,147 @@ def run_state(
             for name, value in values.items()
         }
     _check_inputs(mas, values)
-    query = values["query"] if isinstance(values.get("query"), str) else render_value(plain(dict(values)), JSON)
-    return _run_all(mas, [dict(values)], [query], [prompts], on_event)[0]
+    query = _query(values)
+    if not pauses(mas):
+        return _run_all(mas, [dict(values)], [query], [prompts], on_event, run_id)[0]
+    store = _store(mas)
+    run_id = run_id or uuid.uuid4().hex
+    if store.run(run_id) is not None:
+        raise ValueError(f"Run id {run_id!r} is taken in {store!r}.")
+    graph_id = mas.describe()["id"]
+    meter = RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id)
+    store.save_run(run_id, graph_id, "running")
+    asking = _Asking(store, getattr(mas, "asker", None), run_id, run_id, run_id)
+    return _advance(mas, query, _initial_state(dict(values), prompts), meter, asking)
+
+
+def resume(
+    mas: MAS,
+    run_id: str,
+    answers: Mapping[str, Mapping[str, Any]] | None = None,
+    on_event: Callable[[Event], None] | None = None,
+) -> Trace:
+    """Continue a paused run, after keeping ``answers`` (``{question id: answer}``) as :func:`answer` does.
+
+    The run goes on from its checkpoints in the system's store, in this
+    process or a new one, with the prompts it paused with. Its budget counts
+    on from what it had used (:meth:`~xmas.budget.RunMeter.seed`), the wait
+    left out of its wall time. A question past its deadline takes its default;
+    a question neither answered nor due stays open, and the run pauses again
+    if it reaches nothing else.
+
+    Raises:
+        ValueError: If the store has no such run, the run is not paused, the
+            system is not the one that paused (its ``describe()`` id), an
+            answer does not fit, or no open question is answered or due.
+    """
+    store = _store(mas)
+    row = store.run(run_id)
+    if row is None:
+        raise ValueError(f"{store!r} has no run {run_id!r}.")
+    if row.status != "paused":
+        raise ValueError(f"Run {run_id!r} is {row.status}, not paused.")
+    graph_id = mas.describe()["id"]
+    if row.system_id != graph_id:
+        raise ValueError(f"Run {run_id!r} paused in system {row.system_id}, not {graph_id}: resume with that system.")
+    if answers:
+        answer(mas, run_id, answers)
+    if not _answered(store, list(row.paused)):
+        open_ = ", ".join(repr(question) for question in row.paused)
+        raise ValueError(f"Run {run_id!r} waits on {open_}: none is answered or past its deadline.")
+    meter = RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id)
+    if row.totals is not None:
+        meter.seed(row.totals)
+    asking = _Asking(store, getattr(mas, "asker", None), run_id, run_id, run_id, resumed=frozenset(row.paused))
+    snapshot = mas.compiled.copy(update={"checkpointer": store}).get_state(_run_config(mas, meter, asking=asking))
+    meter.records.extend(snapshot.values["records"])
+    store.save_run(run_id, graph_id, "running", row.paused)
+    query = _query({name: snapshot.values["values"][name] for name in mas.inputs})
+    return _advance(mas, query, Command(resume=_ready(store, snapshot.interrupts)), meter, asking)
+
+
+def answer(mas: MAS, run_id: str, answers: Mapping[str, Mapping[str, Any]]) -> None:
+    """Keep answers to a run's questions, ``{question id: answer}``, whether the run is paused or still running.
+
+    Each answer is checked against its question (:func:`~xmas.human.answer_value`);
+    a running run takes it when it reaches the question's wait.
+
+    Raises:
+        ValueError: Listing every problem, keeping none of the answers: an id
+            that is no open question of the run, an answer that does not fit.
+    """
+    store = _store(mas)
+    checked: list[tuple[Question, Mapping[str, Any]]] = []
+    problems: list[str] = []
+    for question_id_, given in answers.items():
+        row = store.question(question_id_)
+        if row is None or row.run_id != run_id or row.payload is None:
+            problems.append(f"{question_id_!r} is no question of run {run_id!r}")
+        elif row.answer is not None:
+            problems.append(f"{question_id_!r} is answered already")
+        else:
+            question = Question.from_dict(row.payload)
+            try:
+                answer_value(question, given, now=datetime.now(UTC))
+            except ValueError as error:
+                problems.append(str(error))
+            checked.append((question, given))
+    if problems:
+        raise ValueError("The answers were not kept:\n" + "\n".join(f"- {problem}" for problem in problems))
+    for question, given in checked:
+        _keep(store, question, given)
+
+
+def _store(mas: MAS) -> Store:
+    """Return the system's run store, opening it on first use: the file named, else ``XMAS_RUNS``, else memory."""
+    store = getattr(mas, "store", None)
+    if not isinstance(store, Store):
+        store = open_store(None if store is None else str(store))
+        mas.store = store  # type: ignore[attr-defined]
+    return store
+
+
+def _advance(mas: MAS, query: str, start: MASState | Command[Any], meter: RunMeter, asking: _Asking) -> Trace:
+    """Run or resume a run that can pause on its thread, until it ends or waits on questions nobody answered yet.
+
+    Answers that arrive before the run returns (from the asker, or through
+    :func:`answer`) resume it here. The run's row keeps its status, the
+    questions it waits on and the meter's totals.
+    """
+    store = asking.store
+    graph = mas.compiled.copy(update={"checkpointer": store})
+    config = _run_config(mas, meter, asking=asking)
+    waiting: list[str] = []
+    try:
+        result = graph.invoke(start, config=config, durability="exit")
+        while "__interrupt__" in result and (ready := _ready(store, result["__interrupt__"])):
+            result = graph.invoke(Command(resume=ready), config=config, durability="exit")
+    except Exception as error:
+        trace = _failed_trace(mas, query, error, meter)
+    else:
+        if "__interrupt__" in result:
+            waiting = _open(result)
+            questions = tuple(
+                Question.from_dict(cast("dict[str, Any]", row.payload))
+                for row in store.questions(asking.run_id)
+                if row.question_id in waiting
+            )
+            for question in questions:
+                if question.id not in asking.resumed:
+                    where = {"item": question.item, "item_key": question.item_key, "visit": question.visit}
+                    meter.emit("pause", question.node, question=question.id, **where)
+            trace = _trace(mas, query, result["records"], meter, output="", pause=Pause(asking.run_id, questions))
+        else:
+            trace = trace_from_state(mas, query, result, meter)
+    finally:
+        meter.close()
+    store.save_run(asking.run_id, cast("str", meter.graph_id), trace.status.value, waiting, meter.totals())
+    return trace
+
+
+def _query(values: Mapping[str, Any]) -> str:
+    """Return a run's query: the ``query`` text, else the values as one line of JSON."""
+    return values["query"] if isinstance(values.get("query"), str) else render_value(plain(dict(values)), JSON)
 
 
 def _check_inputs(mas: MAS, values: Mapping[str, Any]) -> None:
@@ -1148,15 +1680,30 @@ def _run_all(
     queries: list[str],
     prompts: list[dict[str, str]],
     on_event: Callable[[Event], None] | None = None,
+    run_id: str | None = None,
 ) -> list[Trace]:
-    """Run each start (a query or the input values) with its prompt set, on a meter of its own."""
+    """Run each start (a query or the input values) with its prompt set, on a meter of its own.
+
+    A system that can pause runs unattended here: its questions go to its
+    asker, and its chains and boxes keep their threads in a store of the
+    batch's own, in memory.
+    """
     if not starts:
         return []
     graph_id = mas.describe()["id"] if mas.version == 2 else None
-    meters = [RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id) for _ in starts]
+    meters = [RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id) for _ in starts]
     states = [_initial_state(start, prompt_set) for start, prompt_set in zip(starts, prompts, strict=True)]
-    configs = [_run_config(mas, meter) for meter in meters]
-    results: list[Any] = mas.compiled.batch(states, config=configs, return_exceptions=True)
+    graph, configs, durable = mas.compiled, [_run_config(mas, meter) for meter in meters], {}
+    if pauses(mas):
+        store, asker = Store(), getattr(mas, "asker", None)
+        askings = [_Asking(store, asker, m.run_id, m.run_id, m.run_id, unattended=True) for m in meters]
+        configs = [_run_config(mas, meter, asking=asking) for meter, asking in zip(meters, askings, strict=True)]
+        graph, durable = graph.copy(update={"checkpointer": store}), {"durability": "exit"}
+    try:
+        results: list[Any] = graph.batch(states, config=configs, return_exceptions=True, **durable)
+    finally:
+        for meter in meters:
+            meter.close()
     return [
         trace_from_state(mas, query, result, meter)
         for query, result, meter in zip(queries, results, meters, strict=True)
