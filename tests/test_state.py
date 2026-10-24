@@ -1,8 +1,6 @@
 """State in, several outputs out: ``run_state``, declared outputs, retries, the reserved reads, events and caps.
 
-The models are scripted doubles. Systems are built through ``conftest.build``
-and run through ``conftest.run_values``, which call ``MAS(..., outputs=...)``
-and ``MAS.run_state`` once ``MAS`` takes them.
+The models are scripted doubles, so no test spends money.
 """
 
 from __future__ import annotations
@@ -20,14 +18,12 @@ from xmas.edges import Edge, EdgeKind
 from xmas.nodes import Step
 from xmas.tools import tool
 
-from .conftest import MockLLM, build, needs_fields, run_values
-
-pytestmark = needs_fields
+from .conftest import MockLLM
 
 
 def deck_notes(llm: MockLLM) -> MAS:
     """``summarizer`` and ``noter`` run in parallel on the plan; END joins them; both are outputs."""
-    return build(
+    return MAS(
         [
             Agent("summarizer", "Summarize {plan} in the style {house}", "summary", ["plan", "house"]),
             Agent("noter", "Write notes for {plan}", "notes", ["plan"]),
@@ -44,42 +40,42 @@ def test_run_state_checks_inputs_and_returns_outputs() -> None:
 
     # every problem at once, before any call
     with pytest.raises(ValueError, match="do not fit the system's inputs") as caught:
-        run_values(mas, {"plan": {1, 2}, "query": "x"})
+        mas.run_state({"plan": {1, 2}, "query": "x"})
     lines = str(caught.value).splitlines()[1:]
     assert len(lines) == 3 and llm.calls == []
     assert lines[0] == "- input 'house' is missing"
     assert lines[1].startswith("- 'query' is no input") and lines[2].startswith("- input 'plan' is not json")
 
     values = {"plan": {"slides": 2}, "house": "plain"}
-    trace = run_values(mas, values)
+    trace = mas.run_state(values)
     assert trace.error is None
     assert trace.outputs == {"summary": "A summary.", "notes": "Some notes."}
     assert trace.output == "A summary."  # the first output, which a task scores
     assert sorted(trace.agents) == ["noter", "summarizer"]  # END joined both branches
     assert trace.query == json.dumps(values)
-    assert re.fullmatch("[0-9a-f]{32}", trace.run_id) and trace.graph_id == mas.describe()["id"]
-    again = run_values(mas, values)
+    assert re.fullmatch("[0-9a-f]{32}", trace.run_id or "") and trace.graph_id == mas.describe()["id"]
+    again = mas.run_state(values)
     assert again.run_id != trace.run_id and again.graph_id == trace.graph_id
     assert again == trace  # the run id is left out of ==
 
     # a failure is a failed trace, with no outputs
     broken = deck_notes(MockLLM(answers=[RuntimeError("boom"), RuntimeError("boom")]))
-    failed = run_values(broken, values)
+    failed = broken.run_state(values)
     assert failed.error is not None and failed.outputs == {}
 
     # version 1: text values, a preset beside the query; equal to run(query) record for record
     v1 = MAS([Agent("a", "Answer {query} {style}", "answer", ["query", "style"])], llm=MockLLM())
-    plain = run_values(v1, {"query": "cats"})
+    plain = v1.run_state({"query": "cats"})
     assert plain.records == v1.run("cats").records and plain.query == "cats"
     assert plain.run_id is None and plain.graph_id is None and plain.records[0].visit is None
-    assert run_values(v1, {"query": "cats", "style": "tersely"}).output == "echo:Answer cats tersely"
+    assert v1.run_state({"query": "cats", "style": "tersely"}).output == "echo:Answer cats tersely"
     assert v1("cats") == "echo:Answer cats "
     with pytest.raises(ValueError, match="'query' is not text"):
-        run_values(v1, {"query": 3})
+        v1.run_state({"query": 3})
 
     # a box's inner trace is no run of its own
     inner = MAS([Agent("cut", "Cut {page}", "short", ["page"])], inputs={"page": "text"}, llm=MockLLM())
-    boxed = build(
+    boxed = MAS(
         [],
         [("summarize", "fin")],
         boxes=[Box("summarize", inner, reads={"page": "query"}, writes={"short": "short"})],
@@ -116,7 +112,7 @@ def test_retry_and_reserved_reads() -> None:
     # a step whose callable fails once with an outage is run again: one record, one retry
     for fails, ok in ((1, True), (2, False)):
         fetch, calls = down_at_first(fails)
-        mas = build([], steps=[Step("fetch", "fetch")], retry={"fetch": {"outage": 1}}, tools=[fetch])
+        mas = MAS([], steps=[Step("fetch", "fetch")], retry={"fetch": {"outage": 1}}, tools=[fetch])
         trace: Any = mas.run("cats")
         (record,) = trace["fetch"]
         assert (trace.error is None, record.retries, len(calls)) == (ok, 1, 2)
@@ -125,7 +121,7 @@ def test_retry_and_reserved_reads() -> None:
     # a retried agent costs what every attempt paid: a refused answer, a lost call, then a good answer
     judge = Agent("judge", "Judge {query}", "verdict", output_type="json", schema={"fits": {"type": "bool"}})
     llm = MockLLM(answers=["not json", ConnectionError("down"), '{"fits": true}'], meta=True)
-    retried: Any = build([judge], retry={"judge": {"outage": 1}}, llm=llm).run("cats")
+    retried: Any = MAS([judge], retry={"judge": {"outage": 1}}, llm=llm).run("cats")
     (judged,) = retried["judge"]
     assert judged.retries == 1 and judged.outputs == {"verdict": '{"fits": true}'}
     assert judged.cost_usd == pytest.approx(0.02) and judged.tokens == TokenUsage(20, 4)
@@ -137,7 +133,7 @@ def test_retry_and_reserved_reads() -> None:
         raise TimeoutError("the server took too long")
 
     sorry = Agent("sorry", "Sorry: {error}", "answer", ["error"])
-    routed = build(
+    routed = MAS(
         [sorry],
         [Edge("fetch", "sorry", EdgeKind.ERROR, errors=("timeout",))],
         steps=[Step("fetch", "slow")],
@@ -153,7 +149,7 @@ def test_retry_and_reserved_reads() -> None:
         """Keep what the run has spent."""
         return run
 
-    looked = build(
+    looked = MAS(
         [
             Agent("a", "Answer {query}", "answer"),
             Agent("b", "So far: {run}", "note", ["run"]),
@@ -176,7 +172,7 @@ def test_retry_and_reserved_reads() -> None:
     assert spent["elapsed_s"] >= 0 and looked["spend"][0].route == ("fin",)  # three records only after spend
 
     reader = Agent("b", "So far: {run}", "note", ["run"])
-    uncosted = build([Agent("a", "Answer {query}", "answer"), reader], [("a", "b")], llm=MockLLM()).run("cats")
+    uncosted = MAS([Agent("a", "Answer {query}", "answer"), reader], [("a", "b")], llm=MockLLM(), version=2).run("cats")
     assert json.loads(uncosted["b"][0].rendered_prompt.removeprefix("So far: "))["cost_usd"] is None
 
 
@@ -188,7 +184,7 @@ def test_events_and_the_parallel_call_cap() -> None:
 
     mas, _ = pages(writer)
     events: list[Any] = []
-    trace = run_values(mas, plan_of("a", "b"), on_event=events.append)
+    trace = mas.run_state(plan_of("a", "b"), on_event=events.append)
     assert {event.run_id for event in events} == {trace.run_id}
     per_item = [[(e.kind, e.node, e.visit, e.status) for e in events if e.item == item] for item in (0, 1)]
     assert per_item[0] == [
@@ -214,13 +210,13 @@ def test_events_and_the_parallel_call_cap() -> None:
         heard.append(event)
         raise RuntimeError("the viewer broke")
 
-    two = build(
+    two = MAS(
         [Agent("a", "Answer {query}", "answer"), Agent("b", "Check {answer}", "check", ["answer"])],
         [("a", "b")],
         llm=MockLLM(),
     )
     with pytest.warns(RuntimeWarning, match="the viewer broke") as warned:
-        heard_trace = run_values(two, {"query": "cats"}, on_event=broken)
+        heard_trace = two.run_state({"query": "cats"}, on_event=broken)
     assert heard_trace.error is None and len(heard) == 1 and len(warned) == 1
 
     # eight agents in parallel never hold more than two calls at once

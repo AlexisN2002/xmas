@@ -25,7 +25,7 @@ from xmas.nodes import Box, Step
 from xmas.routes import Join
 from xmas.tools import Tool, ToolSource, tool
 
-from .conftest import MockLLM, apology_text, count_words, publish_text
+from .conftest import DECK, MockLLM, apology_text, assemble_deck, count_words, publish_text, render_page
 
 
 @tool
@@ -531,54 +531,6 @@ def test_a_box_maps_its_inner_inputs_and_never_contains_itself() -> None:
         check_system(inner)
 
 
-@tool(writes={"measure": "json"})
-def render_page(draft: str) -> dict[str, int]:
-    """Measure a drawn page."""
-    return {"words": len(draft.split())}
-
-
-@tool(writes={"deck": "json"})
-def assemble_deck(draft: list[str], verdict: list[Any], caption: list[str]) -> dict[str, Any]:
-    """Put the pages and captions of a deck together."""
-    return {"pages": draft, "verdicts": verdict, "captions": caption}
-
-
-# Two chains, one per slide and one per figure; END joins the deck with the notes.
-DECK = """
-version: 2
-inputs: {plan: json, house: text}
-outputs: {deck: json, notes: text}
-agents:
-- {name: drafter, model: writer-model,
-   for each: {item: page, in: plan.slides, at once: 4, key: id, item budget: {cost_usd: 0.05}},
-   reads: {slide: page, rules: house, verdict: verdict}, writes: {draft: text}}
-- {name: checker, model: judge-model, prompt: judge, for each: page in plan.slides,
-   reads: {planned: page, shown: measure}, writes: {verdict: json},
-   schema: {fits: {type: bool, means: the page makes its claim at a glance}, fix: {type: text}}}
-- {name: captioner, model: writer-model, for each: {item: figure, in: plan.figures, key: id},
-   reads: {figure: figure, rules: house}, writes: {caption: text}}
-- {name: figure_checker, model: judge-model, prompt: judge, for each: figure in plan.figures,
-   reads: {planned: figure, shown: caption}, writes: {figure_verdict: json},
-   schema: {fits: {type: bool}, fix: {type: text}}}
-- {name: noter, model: writer-model, reads: [plan], writes: {notes: text}}
-steps:
-- {name: render, uses: render_page, for each: page in plan.slides, retry: {outage: 1}}
-- {name: assemble, uses: assemble_deck}
-edges:
-- drafter -> render -> checker
-- 'checker -> drafter': {when: not verdict.fits, max_visits: 2}
-- 'checker -> assemble': else
-- captioner -> figure_checker -> assemble
-callables:
-  render_page: {kind: python, import: 'tests.test_spec:render_page', reads: {draft: text}, writes: {measure: json}}
-  assemble_deck: {kind: python, import: 'tests.test_spec:assemble_deck',
-                  reads: {draft: json, verdict: json, caption: json}, writes: {deck: json}}
-prompts:
-  drafter: "Draft slide {slide} in this house style: {rules}\\nThe last verdict, empty at first: {verdict}"
-  judge: "Does the page make the claim of its plan?\\nPlan: {planned}\\nAs drawn: {shown}"
-  captioner: "Caption figure {figure} in this house style: {rules}"
-  noter: "Write speaker notes for this plan: {plan}"
-"""
 DECK_DATA: dict[str, Any] = yaml.safe_load(DECK)
 
 
@@ -907,7 +859,6 @@ def test_check_names_every_chain_problem(build: Any, phrase: str) -> None:
     assert re.search(phrase, str(info.value)), str(info.value)
 
 
-@pytest.mark.xfail(strict=True, reason="the engine renders a prompt from its read map (runtime._agent_body)")
 def test_agent_read_maps_and_dicts() -> None:
     drafter = Agent("drafter", "Draft {slide} in {rules}", "draft", inputs={"slide": "page", "rules": "house"})
     assert (drafter.reads, drafter.inputs, drafter.renamed) == (

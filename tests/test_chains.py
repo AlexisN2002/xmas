@@ -1,8 +1,6 @@
 """``for each`` chains in the engine: one inner run per item behind ``Send``, gathered in item order.
 
-The models are scripted doubles. Systems are built through ``conftest.build``
-and run through ``conftest.run_values``, which call ``MAS(..., each=...)`` and
-``MAS.run_state`` once ``MAS`` takes them.
+The models are scripted doubles, so no test spends money.
 """
 
 from __future__ import annotations
@@ -11,6 +9,7 @@ import json
 from typing import Any, cast
 
 import pytest
+import yaml
 
 from xmas import MAS, Agent, Box, Budget, ErrorKind, RunStatus
 from xmas.edges import Edge, EdgeKind
@@ -19,20 +18,14 @@ from xmas.tools import tool
 
 from .conftest import (
     DECK,
-    HAS_EACH,
     LONG_PAGE,
     PLAN,
     MockLLM,
     assemble_deck,
-    build,
     deck,
     deck_llms,
-    needs_fields,
     render_page,
-    run_values,
 )
-
-pytestmark = needs_fields
 
 
 class OutOfMoneyError(Exception):
@@ -54,7 +47,7 @@ def most_in_flight(events: list[Any], head: str) -> int:
 def test_the_deck_runs_per_item_and_gathers_in_order() -> None:
     mas = deck()
     events: list[Any] = []
-    trace = run_values(mas, {"plan": PLAN, "house": "plain"}, on_event=events.append)
+    trace = mas.run_state({"plan": PLAN, "house": "plain"}, on_event=events.append)
     assert trace.error is None
 
     # every write comes back as a list aligned to the items
@@ -99,6 +92,7 @@ def test_the_deck_runs_per_item_and_gathers_in_order() -> None:
     assert 1 < most_in_flight(events, "drafter") <= 4
     assert trace.cost_usd == pytest.approx(0.01 * (5 * 4 + 2 * 2 + 1))
     health = trace.health
+    assert health is not None
     if hasattr(health, "items"):  # P1: Health.items
         assert health.items["drafter"]["items"] == 5 and health.items["drafter"]["failed"] == 0
 
@@ -143,7 +137,7 @@ def pages(
     else:
         edges.append(("count", "fin"))
     head = {"item": "page", "in": "plan.slides", "key": "id"} if key else "page in plan.slides"
-    mas = build(
+    mas = MAS(
         [Agent("writer", "Write page {page}", "draft", ["page"])],
         edges,
         each={"writer": head, "count": "page in plan.slides"},
@@ -170,7 +164,7 @@ def test_a_failed_item_keeps_the_others() -> None:
         return "a broken page" if page == "c" else f"Page {page} in words"
 
     mas, _ = pages(writer)
-    trace = run_values(mas, plan_of("a", "b", "c", "d"))
+    trace = mas.run_state(plan_of("a", "b", "c", "d"))
     assert trace.error is None and trace.status is RunStatus.OK
     assert trace.outputs == {"words": [4, 4, None, 4], "total": {"words": 12, "missing": 1}}
     assert trace["fin"][0].inputs == {"words": "[4, 4, null, 4]"}
@@ -179,12 +173,13 @@ def test_a_failed_item_keeps_the_others() -> None:
     assert failed.error_kind is ErrorKind.UNKNOWN and failed.route is None
     assert [(r.agent, r.item) for r in trace.records][:8] == [(n, i) for i in range(4) for n in ("writer", "count")]
     health = trace.health
+    assert health is not None
     if hasattr(health, "items"):  # P1: Health.items, item_failed
         assert health.items["writer"]["failed"] == 1
 
     # money in one item ends the run: the siblings finished and were paid, and keep their records
     money = {"plan": {"slides": [{"id": n, "say": "money"} for n in "abd"]}}
-    broke = run_values(pages(writer)[0], money)
+    broke = pages(writer)[0].run_state(money)
     assert broke.error == "OutOfMoneyError: Key limit exceeded" and broke.error_kind is ErrorKind.MONEY
     kept = sorted((r.item, r.agent, r.error is None) for r in broke.records)
     assert kept == [
@@ -197,11 +192,9 @@ def test_a_failed_item_keeps_the_others() -> None:
     assert "fin" not in broke.agents
 
     # so does a budget refusal: three calls for four pages
-    over = run_values(pages(budget=Budget(max_calls=3))[0], plan_of("a", "b", "c", "d"))
+    over = pages(budget=Budget(max_calls=3))[0].run_state(plan_of("a", "b", "c", "d"))
     assert over.status is RunStatus.OVER_BUDGET
-    assert (
-        sorted(r.item for r in over["writer"]) == sorted({r.item for r in over["writer"]}) and len(over["writer"]) == 3
-    )
+    assert len({r.item for r in over["writer"]}) == len(over["writer"]) == 3  # one record per item
     assert all(r.item is not None and r.error is None for r in over.records)
 
 
@@ -211,16 +204,16 @@ def test_zero_items_outer_loop_and_key_problems(case: str) -> None:
         empty: list[dict[str, Any]] = [plan_of(), {"plan": {"slides": None}}, {"plan": {}}]
         for values in empty:
             mas, llm = pages()
-            trace = run_values(mas, values)
+            trace = mas.run_state(values)
             assert trace.error is None and llm.calls == []
             assert [r.agent for r in trace.records] == ["fin"]
             assert trace["fin"][0].inputs == {"words": "[]"}
             assert trace.outputs == {"words": [], "total": {"words": 0, "missing": 0}}
-        keyless = run_values(pages(key=False)[0], plan_of("a", "b"))  # without a key, an item is its index
+        keyless = pages(key=False)[0].run_state(plan_of("a", "b"))  # without a key, an item is its index
         assert [(r.item, r.item_key) for r in keyless["writer"]] == [(0, None), (1, None)]
     elif case == "outer loop":
         mas, llm = pages(loop=True)
-        trace = run_values(mas, plan_of("a", "b", "c"))
+        trace = mas.run_state(plan_of("a", "b", "c"))
         assert trace.error is None
         # pass 1 writes three pages, pass 2 the two left; the loop into the head is capped on its passes
         assert [(r.item_key, r.visit) for r in trace["writer"]] == [("a", 1), ("b", 1), ("c", 1), ("a", 1), ("b", 1)]
@@ -239,8 +232,9 @@ def test_zero_items_outer_loop_and_key_problems(case: str) -> None:
         }[case]
         for values, problem in bad:
             mas, llm = pages()
-            trace = run_values(mas, values)
-            assert trace.error.startswith("ValueError: for each page in plan.slides: ") and problem in trace.error
+            trace = mas.run_state(values)
+            assert trace.error is not None and trace.error.startswith("ValueError: for each page in plan.slides: ")
+            assert problem in trace.error
             assert llm.calls == [] and trace.records == ()
 
 
@@ -248,7 +242,7 @@ def test_a_box_and_shared_prompts_in_a_chain() -> None:
     llm = MockLLM(lambda p: p.split(": ", 1)[1].upper() if p.startswith("Cut") else f"draft {json.loads(p[6:])['id']}")
     cutter = Agent("cutter", "Cut: {page}", output="short", inputs=["page"])
     inner = MAS([cutter], inputs={"page": "text"}, llm=llm)
-    mas = build(
+    mas = MAS(
         [Agent("writer", "Write {page}", "draft", ["page"])],
         [("writer", "shorten")],
         each={"writer": {"item": "page", "in": "plan.slides", "key": "id"}, "shorten": "page in plan.slides"},
@@ -257,7 +251,7 @@ def test_a_box_and_shared_prompts_in_a_chain() -> None:
         inputs={"plan": "json"},
         llm=llm,
     )
-    trace = run_values(mas, plan_of("one", "two"))
+    trace = mas.run_state(plan_of("one", "two"))
     assert trace.error is None
     assert trace.outputs == {"short": ["DRAFT ONE", "DRAFT TWO"]}
     # the box's record and the records nested in it carry the item
@@ -277,11 +271,9 @@ def test_a_box_and_shared_prompts_in_a_chain() -> None:
     ]
 
     # a chain inside a box keeps its items' records in the box's inner trace
-    boxed = build(
-        [], boxes=[Box("all", mas, reads={"plan": "plan"}, writes={"short": "short"})], inputs={"plan": "json"}
-    )
-    (whole,) = run_values(boxed, plan_of("one", "two"))["all"]
-    assert whole.outputs == {"short": '["DRAFT ONE", "DRAFT TWO"]'}
+    boxed = MAS([], boxes=[Box("all", mas, reads={"plan": "plan"}, writes={"short": "short"})], inputs={"plan": "json"})
+    (whole,) = boxed.run_state(plan_of("one", "two"))["all"]
+    assert whole.outputs == {"short": '["DRAFT ONE", "DRAFT TWO"]'} and whole.inner is not None
     assert [(r.agent, r.item_key) for r in whole.inner.records] == [
         ("writer", "one"),
         ("shorten", "one"),
@@ -289,20 +281,19 @@ def test_a_box_and_shared_prompts_in_a_chain() -> None:
         ("shorten", "two"),
     ]
 
-    if HAS_EACH:  # P2: shared prompts and the chain system resolving through the outer one
-        import yaml
+    # shared prompts, and the chain system resolving through the outer one
+    shared = deck().copy(prompts={"checker": "Judge {planned} as {shown}"})
+    judged = shared.run_state({"plan": PLAN, "house": "plain"})
+    assert all(r.rendered_prompt.startswith("Judge") for r in [*judged["checker"], *judged["figure_checker"]])
 
-        shared = deck().copy(prompts={"checker": "Judge {planned} as {shown}"})
-        judged = run_values(shared, {"plan": PLAN, "house": "plain"})
-        assert all(r.rendered_prompt.startswith("Judge") for r in [*judged["checker"], *judged["figure_checker"]])
+    asked: list[str] = []
 
-        asked: list[str] = []
+    class Metered(MAS):
+        def resolve_llm(self, agent: Agent) -> Any:
+            asked.append(agent.name)
+            return super().resolve_llm(agent)
 
-        class Metered(MAS):
-            def resolve_llm(self, agent: Agent) -> Any:
-                asked.append(agent.name)
-                return super().resolve_llm(agent)
+    metered = Metered.from_dict(yaml.safe_load(DECK), llms=dict(deck_llms()), tools=[render_page, assemble_deck])
+    assert metered.run_state({"plan": PLAN, "house": "plain"}).error is None
+    assert {"drafter", "checker", "captioner", "figure_checker", "noter"} <= set(asked)
 
-        metered = Metered.from_dict(yaml.safe_load(DECK), llms=dict(deck_llms()), tools=[render_page, assemble_deck])
-        assert run_values(metered, {"plan": PLAN, "house": "plain"}).error is None
-        assert {"drafter", "checker", "captioner", "figure_checker", "noter"} <= set(asked)
