@@ -6,6 +6,7 @@ import base64
 import dataclasses
 import gc
 import json
+import os
 import pickle
 import re
 import select
@@ -59,8 +60,8 @@ class PollingLLM(MockLLM):
         return "done", META
 
     def started(self, count: int) -> None:
-        """Wait until ``count`` calls started."""
-        ends = time.monotonic() + 5
+        """Wait until ``count`` calls started; a slow host may take its time, so the cap is generous."""
+        ends = time.monotonic() + 30
         while len(self.calls) < count and time.monotonic() < ends:
             time.sleep(0.005)
         assert len(self.calls) == count
@@ -86,10 +87,17 @@ def stop_system(model: PollingLLM) -> MAS:
     )
 
 
+@pytest.fixture
+def one_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend the host has one core, where LangGraph's default pool would have five threads for the run's seven."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 1)
+
+
 PAGES = {"pages": list("abcdefgh")}
 LISTED = json.dumps(PAGES["pages"])
 
 
+@pytest.mark.usefixtures("one_core")
 def test_stop_ends_a_run_within_a_second() -> None:
     model = PollingLLM(lambda prompt: 0.0 if prompt.startswith("Plan") else 5.0)
     mas = stop_system(model)
@@ -107,7 +115,7 @@ def test_stop_ends_a_run_within_a_second() -> None:
     returned = time.monotonic()
     presser.join()
 
-    assert returned - pressed[0] < 0.5
+    assert returned - pressed[0] < 1.0  # mostly under 0.01 s; one in ten took 0.2 s on two busy cores
     assert (trace.status, trace.error_kind) == (RunStatus.STOPPED, ErrorKind.STOPPED)
     assert trace.error == "Stopped: Tom pressed Stop"
     # the queued items never started, the box's inner run stopped too, and no error edge routed the stop
@@ -125,6 +133,7 @@ def test_stop_ends_a_run_within_a_second() -> None:
     assert trace.health.budget["cost_usd"]["spent"] == pytest.approx(META_USD + 6 * CUT_USD)
 
 
+@pytest.mark.usefixtures("one_core")
 def test_mas_stop_keeps_cut_records_and_one_event() -> None:
     model = PollingLLM(lambda prompt: 0.0 if prompt.startswith("Plan") else 5.0)
     mas = stop_system(model)
@@ -140,7 +149,7 @@ def test_mas_stop_keeps_cut_records_and_one_event() -> None:
     pressed = time.monotonic()
     assert mas.stop("turn-7", "Tom pressed Stop") is True
     runner.join(5)
-    assert time.monotonic() - pressed < 0.5
+    assert time.monotonic() - pressed < 1.0
     trace = done["trace"]
     assert (trace.status, trace.run_id) == (RunStatus.STOPPED, "turn-7")
     assert [(event.node, event.reason) for event in events if event.kind == "stop"] == [("", "Tom pressed Stop")]

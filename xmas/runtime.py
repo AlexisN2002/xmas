@@ -126,6 +126,15 @@ __all__ = [
 CONTINUE_MARKER = "<continue>"
 """Marker an agent emits to take a back edge instead of moving on."""
 
+BRANCH_THREADS = 64
+"""Threads one graph run (and each query of a batch) may use at once, as LangGraph's ``max_concurrency``.
+
+Model calls wait on the network, not the CPU, and a chain item waiting for its
+``at once`` place holds a thread too, so the pool is sized for waiting branches
+rather than LangGraph's default of the host's cores plus four; threads start
+only when a branch needs one.
+"""
+
 RUN_KEY = "xmas_run"
 """Key of the run's :class:`~xmas.budget.RunMeter` in ``config["configurable"]``."""
 
@@ -1519,7 +1528,7 @@ def initial_state(query: str | Mapping[str, Any], prompts: Mapping[str, str]) ->
 def run_config(
     mas: MAS, meter: RunMeter, item: tuple[int, str | None] | None = None, asking: Asking | None = None
 ) -> dict[str, Any]:
-    """Build one run's config: the step cap, the meter the nodes read, the chain item it works on, if any.
+    """Build one run's config: the step cap, the thread pool, the meter the nodes read, the chain item, if any.
 
     A run that can pause also carries its :class:`Asking` and its checkpoint thread.
     """
@@ -1530,7 +1539,7 @@ def run_config(
         configurable[ITEM_KEY] = item
     if asking is not None:
         configurable.update({ASKING_KEY: asking, "thread_id": asking.thread})
-    return {"recursion_limit": mas.max_steps, "configurable": configurable}
+    return {"recursion_limit": mas.max_steps, "max_concurrency": BRANCH_THREADS, "configurable": configurable}
 
 
 def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> list[Trace]:
