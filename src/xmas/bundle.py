@@ -44,22 +44,11 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.mas import MAS
 
 SUFFIX = ".mas"
-"""The suffix of a bundle's folder or zip file."""
-
 WIRING = "xmas.yaml"
-"""The file holding the spec without its prompts and callables."""
-
 CALLABLES = "callables.yaml"
-"""The file holding the callables section."""
-
 OPTIMIZE = "optimize.yaml"
-"""The optimizers' settings; read and checked, never written."""
-
 LOCK = "xmas.lock"
-"""The checksums file, written last by every save."""
-
 MAX_BYTES = 64 * 2**20
-"""The most a bundle may hold, all files together; a zip is checked before it is read."""
 
 _PROMPTS = "prompts/"
 _BOXES = "boxes/"
@@ -70,36 +59,36 @@ _ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 
 
 def _name(name: str, what: str) -> str:
-    """Return ``name`` when it can be a file name in a bundle, else raise naming ``what``."""
     if not name or name[0] in ".-" or not all(c.isascii() and (c.isalnum() or c in "_.-") for c in name):
         raise ValueError(f"{what} name {name!r} cannot be a file name in a bundle: use letters, digits, _ . and -.")
     return name
 
 
-def _yaml(data: Any) -> bytes:
-    """Dump ``data`` as the bundle writes YAML: key order kept, unicode as is."""
+def dump_yaml(data: Any) -> bytes:
+    """Dump ``data`` as a bundle file holds YAML: key order kept, unicode as is."""
     return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=120).encode("utf-8")
 
 
 def _text(files: Mapping[str, bytes], path: str) -> str:
-    """Return a file's text, refusing bytes that are not UTF-8."""
     try:
         return files[path].decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError(f"{path} is not UTF-8 text: {error}") from None
 
 
-def _mapping(files: Mapping[str, bytes], path: str) -> dict[str, Any]:
-    """Return a YAML file that holds a mapping; an empty file is an empty mapping."""
+def read_yaml(files: Mapping[str, bytes], path: str) -> Any:
+    """Return the YAML file at ``path``; a file that is not UTF-8 or not YAML is a ValueError naming it."""
     try:
-        data = yaml.safe_load(_text(files, path))
+        return yaml.safe_load(_text(files, path))
     except yaml.YAMLError as error:
         raise ValueError(f"{path} is not YAML: {error}") from None
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
+
+
+def _mapping(files: Mapping[str, bytes], path: str) -> dict[str, Any]:
+    data = read_yaml(files, path)
+    if not isinstance(data, dict | None):
         raise ValueError(f"{path} must hold a mapping, not {type(data).__name__}.")
-    return data
+    return data or {}
 
 
 def dump_prompt(text: str, schema: Mapping[str, Any] | None) -> str:
@@ -157,7 +146,6 @@ def files_of(mas: MAS) -> dict[str, bytes]:
 
 
 def _files(spec: dict[str, Any], prefix: str) -> dict[str, bytes]:
-    """Return the files of one system's spec, under ``prefix``; boxes become nested bundles."""
     spec = copy.deepcopy(spec)
     files: dict[str, bytes] = {}
     if spec.get("version") == 2:
@@ -176,12 +164,12 @@ def _files(spec: dict[str, Any], prefix: str) -> dict[str, bytes]:
             box["system"] = path
         callables = spec.pop("callables", None)
         if callables:
-            files[prefix + CALLABLES] = _yaml(callables)
+            files[prefix + CALLABLES] = dump_yaml(callables)
     else:
         for agent in spec["agents"]:
             text = agent.pop("prompt")
             files[f"{prefix}{_PROMPTS}{_name(agent['name'], 'Agent')}.md"] = dump_prompt(text, None).encode("utf-8")
-    files[prefix + WIRING] = _yaml(spec)
+    files[prefix + WIRING] = dump_yaml(spec)
     return files
 
 
@@ -210,14 +198,16 @@ def spec_of(files: Mapping[str, bytes], prefix: str = "") -> dict[str, Any]:
         for path in sorted(files)
         if path.startswith(start) and path.endswith(".md") and "/" not in path[len(start) :]
     }
-    agents = [agent for agent in spec.get("agents") or [] if isinstance(agent, dict)]
     v2 = spec.get("version") == 2
-    used = {agent.get("prompt", agent.get("name")) if v2 else agent.get("name") for agent in agents}
-    stray = sorted(set(texts) - used)
+    agents = [
+        (agent, agent.get("prompt", agent.get("name")) if v2 else agent.get("name"))
+        for agent in spec.get("agents") or []
+        if isinstance(agent, dict)
+    ]
+    stray = sorted(set(texts) - {key for _, key in agents})
     if stray:
         raise ValueError(f"{start}{stray[0]}.md belongs to no agent.")
-    for agent in agents:
-        key = agent.get("prompt", agent.get("name")) if v2 else agent.get("name")
+    for agent, key in agents:
         path = f"{start}{key}.md"
         if key not in texts:
             raise ValueError(f"Agent {agent.get('name')!r} has no prompt file {path}.")
@@ -225,18 +215,12 @@ def spec_of(files: Mapping[str, bytes], prefix: str = "") -> dict[str, Any]:
         if not v2:
             if schema is not None:
                 raise ValueError(f"{path}: a version 1 agent has no answer form, so its file has no schema.")
-            items = list(agent.items())
-            items.insert(1, ("prompt", text))
-            agent.clear()
-            agent.update(items)
+            _insert(agent, 1, "prompt", text)
             continue
         if schema is not None:
             if "schema" in agent:
                 raise ValueError(f"Agent {agent.get('name')!r} has a schema in both {path} and {where}; keep one.")
-            items = list(agent.items())
-            items.insert(len(items) - ("retry" in agent), ("schema", copy.deepcopy(schema)))
-            agent.clear()
-            agent.update(items)
+            _insert(agent, len(agent) - ("retry" in agent), "schema", copy.deepcopy(schema))
         reads = agent.get("reads", ["query"])
         if isinstance(reads, list | dict):
             missing = sorted(extract_placeholders(text) - set(reads))
@@ -254,12 +238,23 @@ def spec_of(files: Mapping[str, bytes], prefix: str = "") -> dict[str, Any]:
     return {**{key: spec[key] for key in V2_KEYS if key in spec}, **{k: v for k, v in spec.items() if k not in V2_KEYS}}
 
 
-def _inner(prefix: str, path: str) -> str:
-    """Return the prefix of a box's nested bundle, refusing a path that leaves the bundle."""
+def _insert(entry: dict[str, Any], index: int, key: str, value: Any) -> None:
+    items = list(entry.items())
+    items.insert(index, (key, value))
+    entry.clear()
+    entry.update(items)
+
+
+def outside(path: str) -> bool:
+    """Whether a posix ``path`` leaves the folder it is relative to: absolute, with ``..``, a drive or a backslash."""
     parts = PurePosixPath(path).parts
-    if not parts or path.startswith("/") or "\\" in path or ".." in parts or ":" in parts[0]:
+    return not parts or path.startswith("/") or "\\" in path or ".." in parts or ":" in parts[0]
+
+
+def _inner(prefix: str, path: str) -> str:
+    if outside(path):
         raise ValueError(f"A box's system {path!r} is outside the bundle; it is a path such as 'boxes/name.mas'.")
-    return f"{prefix}{'/'.join(parts)}/"
+    return f"{prefix}{'/'.join(PurePosixPath(path).parts)}/"
 
 
 def read_optimize(files: Mapping[str, bytes]) -> dict[str, Any]:
@@ -335,7 +330,6 @@ def _sha(data: bytes) -> str:
 
 
 def _digest(digests: Mapping[str, Any]) -> str:
-    """Return the bundle digest: the sha256 over the sorted ``"path sha256"`` lines."""
     return _sha("".join(f"{path} {sha}\n" for path, sha in sorted(digests.items())).encode("utf-8"))
 
 
@@ -345,17 +339,22 @@ def lock_of(files: Mapping[str, bytes], code: Mapping[str, str | None]) -> Lock:
     return Lock(_digest(digests), digests, dict(sorted(code.items())))
 
 
-def _systems(mas: MAS, prefix: str = "") -> Iterator[tuple[str, MAS]]:
+def relock(folder: Path, code: Mapping[str, str | None]) -> None:
+    """Write a bundle folder's lock for the files it holds now."""
+    put(folder / LOCK, lock_of(read(folder), code).to_yaml().encode("utf-8"))
+
+
+def systems(mas: MAS, prefix: str = "") -> Iterator[tuple[str, MAS]]:
     """Yield the system and each box's system at every depth, with the prefix its callables are named under."""
     yield prefix, mas
     for name, box in mas.boxes.items():
-        yield from _systems(box.system, f"{prefix}{name}/")
+        yield from systems(box.system, f"{prefix}{name}/")
 
 
 def code_hashes(mas: MAS) -> dict[str, str | None]:
     """Return the sha256 of each python callable's source, a box's under ``box/name``; ``None`` without source."""
     hashes: dict[str, str | None] = {}
-    for prefix, system in _systems(mas):
+    for prefix, system in systems(mas):
         used = [system.resolve_callable(step)[0] for step in system.steps.values()]
         used += [
             item for agent in system.agents.values() if agent.tools for item, _ in system.resolve_tools(agent).values()
@@ -393,7 +392,7 @@ class LockDiff:
 
 def compare(lock: Lock, files: Mapping[str, bytes], code: Mapping[str, str | None] | None = None) -> LockDiff:
     """Return how ``files`` (a :func:`read`, the lock among them or not) and ``code`` differ from ``lock``."""
-    now = {path: _sha(data) for path, data in files.items() if path != LOCK}
+    now = lock_of(files, {}).files
     return LockDiff(
         changed=tuple(sorted(path for path, sha in now.items() if lock.files.get(path, sha) != sha)),
         added=tuple(sorted(set(now) - set(lock.files))),
@@ -406,6 +405,18 @@ def compare(lock: Lock, files: Mapping[str, bytes], code: Mapping[str, str | Non
             )
         ),
     )
+
+
+def check_lock(files: Mapping[str, bytes], code: Mapping[str, str | None]) -> tuple[Lock | None, LockDiff]:
+    """Return the lock among a bundle's files and how the files and ``code`` differ from it.
+
+    A lock edited by hand is ``None``, and the lock file itself is what changed.
+    """
+    try:
+        lock = Lock.from_yaml(files[LOCK].decode("utf-8", "replace"))
+    except ValueError:
+        return None, LockDiff(changed=(LOCK,))
+    return lock, compare(lock, files, code)
 
 
 def read(path: str | os.PathLike[str]) -> dict[str, bytes]:
@@ -426,7 +437,6 @@ def read(path: str | os.PathLike[str]) -> dict[str, bytes]:
 
 
 def _read_folder(source: Path) -> dict[str, bytes]:
-    """Read a bundle folder."""
     files: dict[str, bytes] = {}
     total = 0
     for item in sorted(source.rglob("*")):
@@ -442,7 +452,6 @@ def _read_folder(source: Path) -> dict[str, bytes]:
 
 
 def _read_zip(source: Path) -> dict[str, bytes]:
-    """Read a zipped bundle, checking every entry and the total size before reading any."""
     try:
         archive = zipfile.ZipFile(source)
     except zipfile.BadZipFile:
@@ -455,8 +464,7 @@ def _read_zip(source: Path) -> dict[str, bytes]:
             if name in seen:
                 raise ValueError(f"{source}: the entry {name!r} is there twice.")
             seen.add(name)
-            parts = PurePosixPath(name).parts
-            if name.startswith("/") or "\\" in name or ".." in parts or (parts and ":" in parts[0]):
+            if outside(name):
                 raise ValueError(f"{source}: the entry {name!r} points outside the bundle.")
             if stat.S_ISLNK(info.external_attr >> 16):
                 raise ValueError(f"{source}: the entry {name!r} is a symlink; a bundle holds plain files.")
@@ -473,31 +481,32 @@ def _read_zip(source: Path) -> dict[str, bytes]:
     return files
 
 
-def _owned(path: str) -> bool:
-    """Whether a save writes, rewrites and deletes the file at ``path``."""
+def owned(path: str) -> bool:
+    """Whether a save writes, rewrites and deletes the bundle file at ``path``."""
     return path in (WIRING, CALLABLES) or path.startswith((_PROMPTS, _BOXES))
 
 
 def _canonical(path: str, data: bytes) -> Any:
-    """Return a file's parsed content: a prompt as text and schema, YAML as canonical JSON."""
     text = data.decode("utf-8")
     if path.endswith(".md"):
         return parse_prompt(text, path)
     return json.dumps(yaml.safe_load(text), sort_keys=True, default=str)
 
 
-def _same(path: str, old: bytes, new: bytes) -> bool:
-    """Whether two versions of a file hold the same parsed content, so the old one stays."""
-    if old == new:
-        return True
+def same(path: str, old: bytes | None, new: bytes | None) -> bool:
+    """Whether two versions of a bundle file hold the same parsed content: YAML as loaded, prompts as text and form."""
+    if old is None or new is None or old == new:
+        return old == new
     try:
         return bool(_canonical(path, old) == _canonical(path, new))
     except (ValueError, yaml.YAMLError):  # UnicodeDecodeError is a ValueError
         return False
 
 
-def _put(path: Path, data: bytes) -> None:
-    """Write a file through a temporary file beside it and a rename, so a reader never sees half of it."""
+def put(path: Path, data: bytes) -> None:
+    """Write a file, unless it holds ``data`` already, through a temporary file beside it and a rename."""
+    if path.is_file() and path.read_bytes() == data:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
@@ -541,31 +550,28 @@ def write(
 
 
 def _write_folder(target: Path, files: Mapping[str, bytes], code: Mapping[str, str | None]) -> Path:
-    """Write a bundle folder, file by file, and its lock last."""
     old: dict[str, bytes] = {}
     if target.is_dir():
         if any(target.iterdir()) and not (target / WIRING).is_file():
             raise ValueError(f"{target} is a folder that holds no {WIRING}; a save writes only into a bundle.")
         old = read(target)
     for name, data in files.items():
-        if name not in old or not _same(name, old[name], data):
-            _put(target / name, data)
+        if not same(name, old.get(name), data):
+            put(target / name, data)
     for name in old:
-        if _owned(name) and name not in files:
+        if owned(name) and name not in files:
             (target / name).unlink()
             for parent in (target / name).parents:
                 if parent == target or any(parent.iterdir()):
                     break
                 parent.rmdir()
-    lock = lock_of(read(target), code).to_yaml().encode("utf-8")
-    if old.get(LOCK) != lock:
-        _put(target / LOCK, lock)
+    relock(target, code)
     return target
 
 
 def _write_zip(target: Path, files: Mapping[str, bytes], code: Mapping[str, str | None]) -> Path:
-    """Write a zipped bundle: sorted entries, a fixed date and mode, deflated; the other entries carried over."""
-    kept = {name: data for name, data in read(target).items() if not _owned(name)} if target.is_file() else {}
+    """Write sorted entries with a fixed date and mode, deflated; the entries a save does not own carried over."""
+    kept = {name: data for name, data in read(target).items() if not owned(name)} if target.is_file() else {}
     entries = {**kept, **files}
     entries[LOCK] = lock_of(entries, code).to_yaml().encode("utf-8")
     buffer = io.BytesIO()
@@ -576,7 +582,5 @@ def _write_zip(target: Path, files: Mapping[str, bytes], code: Mapping[str, str 
             info.create_system = 3
             info.external_attr = (stat.S_IFREG | 0o644) << 16
             archive.writestr(info, entries[name])
-    data = buffer.getvalue()
-    if not target.is_file() or target.read_bytes() != data:
-        _put(target, data)
+    put(target, buffer.getvalue())
     return target

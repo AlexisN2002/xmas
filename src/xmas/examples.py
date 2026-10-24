@@ -29,18 +29,15 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
-import os
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-import yaml
-
 from xmas.agent import Agent
 from xmas.budget import Budget
-from xmas.bundle import LOCK, Lock, code_hashes, compare, lock_of, read
+from xmas.bundle import LOCK, Lock, check_lock, code_hashes, dump_yaml, outside, put, read, read_yaml, relock
 from xmas.media import Ref, store
 from xmas.nodes import Step
 from xmas.runtime import node_owner, node_types
@@ -74,7 +71,7 @@ _STEP = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]")
 
 
 class _Unset:
-    """The ``recorded`` of a case that has none."""
+    pass
 
 
 UNSET = _Unset()
@@ -190,11 +187,6 @@ class ExampleFile:
     per_example: Budget | None = None
 
 
-def _example_paths(files: Iterable[str]) -> list[str]:
-    """Return the examples files among a bundle's paths, ``examples/<name>.yaml``, sorted."""
-    return sorted(path for path in files if re.fullmatch(rf"{FOLDER}/[^/]+\.yaml", path))
-
-
 def parse_examples(
     files: Mapping[str, bytes], root: Path | None = None, *, problems: list[str] | None = None
 ) -> list[ExampleFile]:
@@ -212,12 +204,11 @@ def parse_examples(
     problems = [] if problems is None else problems
     parsed: list[ExampleFile] = []
     seen: dict[str, str] = {}
-    for path in _example_paths(files):
+    for path in sorted(path for path in files if re.fullmatch(rf"{FOLDER}/[^/]+\.yaml", path)):
         try:
-            data = yaml.safe_load(files[path].decode("utf-8"))
-            examples, budgets = _file(data, path, files, root, problems)
-        except (ValueError, TypeError, yaml.YAMLError) as error:
-            problems.append(f"{path}: {error}")
+            examples, budgets = _file(read_yaml(files, path), path, files, root, problems)
+        except (ValueError, TypeError) as error:  # a file that is no YAML is named by its own message
+            problems.append(str(error) if str(error).startswith(path) else f"{path}: {error}")
             continue
         for example in examples:
             if example.name in seen:
@@ -252,14 +243,12 @@ def _file(
 
 
 def _known(data: Mapping[Any, Any], keys: Sequence[str], where: str) -> None:
-    """Refuse keys not in ``keys``; a note belongs in a YAML comment."""
     unknown = [str(key) for key in data if key not in keys]
     if unknown:
         raise ValueError(f"{where} takes {', '.join(keys)}; unknown: {', '.join(unknown)} (a note goes in a # comment)")
 
 
 def _budgets(spec: Any) -> tuple[Budget | None, Budget | None]:
-    """Read ``budget: {cost_usd, wall_s, per example: {cost_usd, wall_s}}``."""
     if spec is None:
         return None, None
     if not isinstance(spec, Mapping):
@@ -270,15 +259,15 @@ def _budgets(spec: Any) -> tuple[Budget | None, Budget | None]:
         raise ValueError(f"budget.per example is a mapping such as {{cost_usd: 0.015}}, got {per!r}")
     if per is not None:
         _known(per, list(_BUDGET_KEYS), "budget.per example")
-    total = {key: value for key, value in spec.items() if key in _BUDGET_KEYS}
-    return (
-        Budget(**{_BUDGET_KEYS[key]: value for key, value in total.items()}) if total else None,
-        None if per is None else Budget(**{_BUDGET_KEYS[key]: value for key, value in per.items()}),
-    )
+    total = _caps(spec)
+    return Budget(**total) if total else None, None if per is None else Budget(**_caps(per))
+
+
+def _caps(spec: Mapping[str, Any]) -> dict[str, Any]:
+    return {_BUDGET_KEYS[key]: value for key, value in spec.items() if key in _BUDGET_KEYS}
 
 
 def _case(case: Any, path: str, index: int, files: Mapping[str, bytes], root: Path | None) -> Example:
-    """Read the case at ``index`` of the file at ``path``."""
     where = f"{path}: example {index + 1}"
     if not isinstance(case, Mapping):
         raise ValueError(f"{where}: a case is a mapping with {', '.join(_CASE_KEYS)}")
@@ -332,11 +321,7 @@ class _Media:
         """Return ``value`` with each ref mapping in it, at any depth, as a :class:`~xmas.media.Ref`."""
         if isinstance(value, Mapping) and {"location", "media_type"} <= set(value) <= _REF_KEYS:
             return self._ref(value)
-        if isinstance(value, Mapping):
-            return {key: self.load(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self.load(item) for item in value]
-        return value
+        return _each(value, self.load)
 
     def _ref(self, spec: Mapping[str, Any]) -> Ref:
         try:
@@ -344,7 +329,7 @@ class _Media:
         except ValueError as error:
             raise ValueError(f"{self.where}: {error}") from error
         location = PurePosixPath(given.location)
-        if "://" in given.location or location.is_absolute() or ".." in location.parts:
+        if outside(given.location):
             raise ValueError(f"{self.where}: media location {given.location!r} is not a path inside the bundle")
         on_disk = None if self.root is None else self.root / location
         if self.root is not None and self.root.joinpath(location).resolve() != self.root.resolve() / location:
@@ -370,12 +355,10 @@ def _parse_path(text: Any, where: str) -> tuple[str | int, ...]:
 
 
 def _path_text(path: Sequence[str | int]) -> str:
-    """Write a path back: ``verdict.orders[0].kind``."""
     return "".join(f"[{step}]" if isinstance(step, int) else f".{step}" if i else step for i, step in enumerate(path))
 
 
 def _pattern_problem(value: Any) -> str | None:
-    """Return why ``value`` is no pattern, or ``None``."""
     if not isinstance(value, str):
         return "matches takes a regular expression"
     try:
@@ -386,12 +369,10 @@ def _pattern_problem(value: Any) -> str | None:
 
 
 def _number(value: Any) -> float | None:
-    """Return ``value`` as a number, ``None`` for anything else, ``bool`` included."""
     return None if isinstance(value, bool) or not isinstance(value, int | float) else float(value)
 
 
 def _show(value: Any) -> str:
-    """Return a value as one short line of JSON."""
     text = json.dumps(plain(value), ensure_ascii=False, default=str)
     return text if len(text) <= 80 else f"{text[:77]}..."
 
@@ -410,14 +391,13 @@ def _same(left: Any, right: Any) -> bool:
 
 
 def _digest(ref: Ref) -> str:
-    """Return a ref's sha256, reading its bytes when it has none."""
     return ref.sha256 or hashlib.sha256(ref.read_bytes()).hexdigest()
 
 
 def _find(values: Mapping[str, Any], path: tuple[str | int, ...]) -> tuple[Any, str]:
     """Return the value at ``path``, or :data:`_MISSING` with why."""
     if not path:
-        return (next(iter(values.values())) if len(values) == 1 else dict(values)), ""
+        return _one_or_all(values), ""
     head = str(path[0])
     if head not in values:
         return _MISSING, f"no value {head!r}; there are {sorted(values)}"
@@ -429,6 +409,10 @@ def _find(values: Mapping[str, Any], path: tuple[str | int, ...]) -> tuple[Any, 
         else:
             return _MISSING, f"nothing at {_path_text(path)}"
     return found, ""
+
+
+def _one_or_all(values: Mapping[str, Any]) -> Any:
+    return next(iter(values.values())) if len(values) == 1 else dict(values)
 
 
 def run_checks(checks: Sequence[Check], values: Mapping[str, Any], record: AgentRecord | None = None) -> list[str]:
@@ -497,8 +481,7 @@ def _parse_rendered(text: str, vtype: ValueType) -> Any:
     if vtype == TEXT:
         return text
     value = json.loads(text)
-    kind = media_kind(vtype.item if vtype.item is not None else vtype)
-    if kind is None:
+    if media_kind(vtype) is None:
         return value
     if vtype.item is not None:
         return [None if item is None else Ref.from_dict(item) for item in value]
@@ -559,12 +542,10 @@ def cases_from_trace(mas: MAS, trace: Trace, nodes: Sequence[str] | None, store_
             for value, text in shown.items()
             if value in reads and value != "run" and text != ""
         }
-        values = written(system, name, record)
-        recorded = next(iter(values.values())) if len(values) == 1 else values
         case: dict[str, Any] = {"name": name, "node": name}
         if trace.run_id is not None:
             case["from"] = f"trace {trace.run_id[:8]}, record {record.step}"
-        case.update(inputs=inputs, recorded=_spec(recorded, store_dir))
+        case.update(inputs=inputs, recorded=_spec(_one_or_all(written(system, name, record)), store_dir))
         must = _default_checks(node)
         if must:
             case["must"] = [check.to_spec() for check in must]
@@ -586,52 +567,35 @@ def _default_checks(node: Agent | Step) -> list[Check]:
 
 def _spec(value: Any, store_dir: Path) -> Any:
     """Return ``value`` as an examples file writes it, each ref's bytes copied into ``store_dir``."""
-    if isinstance(value, Ref):
-        data = value.read_bytes()
-        digest = hashlib.sha256(data).hexdigest()
-        suffix = PurePosixPath(value.name).suffix.lower() if not value.remote else ""
-        target = store_dir / f"{digest[:16]}{suffix}"
-        if not target.is_file():
-            store_dir.mkdir(parents=True, exist_ok=True)
-            _write(target, data)
-        return {"location": f"{MEDIA}/{target.name}", "media_type": value.media_type, "sha256": digest}
+    if not isinstance(value, Ref):
+        return _each(value, lambda item: _spec(item, store_dir))
+    data = value.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    target = store_dir / f"{digest[:16]}{'' if value.remote else PurePosixPath(value.name).suffix.lower()}"
+    put(target, data)
+    return {"location": f"{MEDIA}/{target.name}", "media_type": value.media_type, "sha256": digest}
+
+
+def _each(value: Any, do: Callable[[Any], Any]) -> Any:
     if isinstance(value, Mapping):
-        return {key: _spec(item, store_dir) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_spec(item, store_dir) for item in value]
-    return value
+        return {key: do(item) for key, item in value.items()}
+    return [do(item) for item in value] if isinstance(value, list) else value
 
 
-def _write(path: Path, data: bytes) -> None:
-    """Write a file through a temporary file and a rename."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.part")
-    temporary.write_bytes(data)
-    temporary.replace(path)
-
-
-def _write_cases(folder: Path, file: str, cases: Sequence[Mapping[str, Any]]) -> Path:
-    """Put ``cases`` into ``folder/examples/<file>.yaml``, each replacing the case of its name; return the file.
-
-    The file is checked by :func:`parse_examples` before it is written.
-
-    Raises:
-        ValueError: For a file name that is no plain word, or a result that does not parse.
-    """
+def _write_cases(folder: Path, file: str, cases: Sequence[Mapping[str, Any]]) -> None:
+    """Put ``cases`` into ``folder/examples/<file>.yaml``, each replacing its namesake, once the result parses."""
     if not _NAME.match(file):
         raise ValueError(f"an examples file is named by a plain word, got {file!r}")
-    path = folder / FOLDER / f"{file}.yaml"
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
+    relative = f"{FOLDER}/{file}.yaml"
+    path = folder / relative
+    data = read_yaml({relative: path.read_bytes()}, relative) if path.is_file() else None
     data = dict(data) if isinstance(data, Mapping) else {"version": VERSION, "examples": []}
     kept = [case for case in data.get("examples") or [] if isinstance(case, Mapping)]
     new = {case["name"]: case for case in cases}
-    merged = [dict(new.pop(case.get("name"), case)) for case in kept] + [dict(case) for case in new.values()]
-    data["examples"] = merged
-    text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=120)
-    relative = f"{FOLDER}/{path.name}"
-    parse_examples({relative: text.encode("utf-8")}, folder)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _write(path, text.encode("utf-8"))
-    return path
+    data["examples"] = [dict(new.pop(case.get("name"), case)) for case in kept] + [dict(case) for case in new.values()]
+    text = dump_yaml(data)
+    parse_examples({relative: text}, folder)
+    put(path, text)
 
 
 def save_examples(
@@ -654,20 +618,16 @@ def save_examples(
     if folder.is_file():
         raise ValueError(f"{folder} is a zipped bundle: save_examples writes into a bundle folder")
     cases = cases_from_trace(mas, trace, nodes, folder / MEDIA)
-    clean = (folder / LOCK).is_file() and _unchanged(mas, folder)
+    lock = _clean_lock(mas, folder)
     _write_cases(folder, file, cases)
-    if clean:
-        old = Lock.from_yaml((folder / LOCK).read_text(encoding="utf-8"))
-        files = {name: data for name, data in read(folder).items() if name != LOCK}
-        _write(folder / LOCK, lock_of(files, old.code).to_yaml().encode("utf-8"))
+    if lock is not None:
+        relock(folder, lock.code)
     return [case["name"] for case in cases]
 
 
-def _unchanged(mas: MAS, folder: Path) -> bool:
-    """Whether a bundle folder still matches its lock, code included."""
-    files = read(folder)
-    try:
-        lock = Lock.from_yaml(files.pop(LOCK).decode("utf-8"))
-    except ValueError:  # a lock edited by hand stays, so verify(0) shows it
-        return False
-    return compare(lock, files, code_hashes(mas)).clean
+def _clean_lock(mas: MAS, folder: Path) -> Lock | None:
+    """Return a bundle folder's lock when the folder still matches it, code included."""
+    if not (folder / LOCK).is_file():
+        return None
+    lock, diff = check_lock(read(folder), code_hashes(mas))
+    return lock if diff.clean else None  # a lock edited by hand stays, so verify(0) shows it
