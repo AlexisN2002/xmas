@@ -1219,8 +1219,7 @@ def _items(chain: Chain, values: Mapping[str, Any]) -> list[tuple[Any, str | Non
 
 def _cost(records: list[AgentRecord]) -> float | None:
     """Return the records' costs summed, ``None`` when there is none or any is unknown."""
-    costs = [record.cost_usd for record in records]
-    return None if not costs or None in costs else sum(cast("list[float]", costs))
+    return Trace("", "", tuple(records)).cost_usd
 
 
 def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS, chain: Chain) -> None:

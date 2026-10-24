@@ -68,11 +68,8 @@ class TokenUsage:
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
         }
-        if self.cached_tokens is not None:
-            data["cached_tokens"] = self.cached_tokens
-        if self.reasoning_tokens is not None:
-            data["reasoning_tokens"] = self.reasoning_tokens
-        return data
+        counts = {"cached_tokens": self.cached_tokens, "reasoning_tokens": self.reasoning_tokens}
+        return data | {key: count for key, count in counts.items() if count is not None}
 
 
 def _add_counts(left: int | None, right: int | None) -> int | None:
@@ -269,15 +266,7 @@ class Trace:
     pause: Pause | None = field(default=None, compare=False)
 
     def __getitem__(self, agent: str) -> tuple[AgentRecord, ...]:
-        """Return every record for one agent, in execution order.
-
-        Args:
-            agent: The agent name.
-
-        Returns:
-            Its records. Empty if the agent did not run, which is a legitimate
-            outcome for a conditional branch rather than an error.
-        """
+        """Return every record of one agent, in execution order; empty when it did not run, as on a skipped branch."""
         return tuple(record for record in self.records if record.agent == agent)
 
     def walk(self) -> Iterator[tuple[tuple[str, ...], AgentRecord]]:
