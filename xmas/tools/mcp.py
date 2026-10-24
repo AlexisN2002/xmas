@@ -121,7 +121,7 @@ class MCPTools(ToolSource):
         """
         result = self.session.call_tool(name, arguments)
         result_text(result)  # raises for a failed or refused call, as call does
-        return _media_blocks(result)
+        return media_blocks(result)
 
     def close(self) -> None:
         """Close the session and stop the background loop. Idempotent."""
@@ -141,7 +141,7 @@ class MCPTools(ToolSource):
         return f"MCPTools({self.url!r}{named})"
 
 
-def _media_blocks(result: CallToolResult) -> list[tuple[bytes, str]]:
+def media_blocks(result: CallToolResult) -> list[tuple[bytes, str]]:
     """Return a result's image, audio and embedded blob blocks as ``(bytes, media type)``."""
     encoded: list[tuple[str, str]] = []
     for block in result.content:

@@ -169,7 +169,7 @@ class GraphUpdater:
             budget=mas.budget,
             asker=mas.asker,
             store=mas.store,
-            **mas._v2_kwargs(),
+            **mas.v2_kwargs(),
         )
 
     def output_of(self, mas: MAS, name: str) -> str:
@@ -226,7 +226,7 @@ class GraphUpdater:
         code = {*mas.steps, *mas.boxes, *mas.humans}
         writes: dict[str, set[str]] = {name: {self.output_of(mas, name)} for name in names if name not in code}
         agents = list(writes)
-        for value, writers in mas._checked().writers.items():
+        for value, writers in mas.checked().writers.items():
             for node in code.intersection(writers):
                 writes.setdefault(node, set()).add(value)
 

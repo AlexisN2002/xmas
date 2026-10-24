@@ -8,6 +8,39 @@ not on it is an implementation detail and may change without notice.
 ::: xmas.agent.Agent
 
 ::: xmas.mas.MAS
+    options:
+      members:
+        - compiled
+        - nodes
+        - structure
+        - terminal
+        - while_edges
+        - __call__
+        - __init__
+        - __repr__
+        - answer
+        - capabilities
+        - copy
+        - describe
+        - encode
+        - from_dict
+        - from_yaml
+        - load
+        - predict
+        - prompts
+        - resolve_callable
+        - resolve_llm
+        - resolve_tools
+        - resume
+        - run
+        - run_batch
+        - run_state
+        - save
+        - save_examples
+        - stop
+        - to_dict
+        - to_yaml
+        - verify
 
 ## Topology
 
@@ -99,6 +132,19 @@ prompt with a picture or a sound goes out as content parts, and a prompt
 without one keeps its exact request bytes.
 
 ::: xmas.llms.api_llm.APILLM
+    options:
+      members:
+        - model
+        - __init__
+        - call_params
+        - generate_image_with_meta
+        - generate_parts_with_meta
+        - generate_with_meta
+        - get_response
+        - get_tool_response
+        - get_tool_response_meta
+        - record
+        - score
 
 Per-call records: pass `call_log=CallLog()` and every call leaves a `CallRecord` with a
 `call_id` (UUID4), a `ts` (start time, ISO 8601 with offset), the `params` it was sent
@@ -574,7 +620,6 @@ further; the race fails with the last failure when every contestant failed.
 ::: xmas.human
     options:
       members:
-        - Human
         - Question
         - Pause
         - Asker
@@ -587,25 +632,106 @@ further; the race fails with the last failure when every contestant failed.
         - TIE
         - DEFAULT_LABELS
 
+::: xmas.human.Human
+    options:
+      heading_level: 3
+      show_root_full_path: false
+      members:
+        - answer
+        - renamed
+        - written
+        - __init__
+        - ask
+        - from_dict
+        - problems
+        - state_writes
+        - templates
+        - to_dict
+
 ::: xmas.store
     options:
       members:
-        - Store
-        - RunLog
         - RunRow
         - QuestionRow
         - open_store
         - XMAS_TYPES
 
+::: xmas.store.Store
+    options:
+      heading_level: 3
+      show_root_full_path: false
+      members:
+        - __init__
+        - __repr__
+        - answer
+        - begin
+        - calls
+        - close
+        - delete
+        - delete_thread
+        - due
+        - events
+        - get_next_version
+        - get_tuple
+        - list
+        - prune_runs
+        - put
+        - put_writes
+        - question
+        - questions
+        - run
+        - runs
+        - save_question
+        - save_run
+        - trace
+
+::: xmas.store.RunLog
+    options:
+      heading_level: 3
+      show_root_full_path: false
+      members:
+        - __init__
+        - call
+        - end
+        - event
+        - record
+
 ::: xmas.budget
     options:
       members:
-        - RunMeter
         - CancelFlag
         - cancel_flag
         - contestant
         - RUNNING
         - SLICE_S
+
+::: xmas.budget.RunMeter
+    options:
+      heading_level: 3
+      show_root_full_path: false
+      members:
+        - elapsed_s
+        - __init__
+        - adopt
+        - after_call
+        - before_call
+        - check_boundary
+        - close
+        - emit
+        - fail
+        - flag
+        - gate
+        - keep
+        - metered
+        - owns
+        - race
+        - records_of
+        - seed
+        - slot
+        - start
+        - stop
+        - totals
+        - win
 
 ## Bundles, verify, configuration, the command line
 
@@ -671,12 +797,22 @@ one node case per node from a trace into `examples/<file>.yaml`.
     options:
       members:
         - verify
-        - VerifyReport
         - ExampleResult
         - VerifyWarning
         - VerifyFailed
         - BUDGET_USD
         - PER_EXAMPLE_USD
+
+::: xmas.verify.VerifyReport
+    options:
+      heading_level: 3
+      show_root_full_path: false
+      members:
+        - ok
+        - __str__
+        - lines
+        - to_dict
+        - warn
 
 ::: xmas.config
     options:

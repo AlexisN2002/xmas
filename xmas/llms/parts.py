@@ -23,7 +23,7 @@ from xmas.prompts import safe_format
 Part = str | Ref
 """One piece of a prompt: text, or a media ref sent as a picture or a sound."""
 
-_AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mpeg": "mp3"}
+AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mpeg": "mp3"}
 
 
 def render_parts(
@@ -44,32 +44,32 @@ def render_parts(
     parts: list[Part] = []
     for position, piece in enumerate(pieces):
         if position % 2 == 0:
-            _append(parts, piece)
+            append(parts, piece)
             continue
         name = names[int(piece)]
         value = media[name]
         if isinstance(value, Ref):
             parts.append(value)
         elif value is not None:
-            _items(parts, name, "", value)
+            add_items(parts, name, "", value)
     return parts, record_text(parts)
 
 
-def _items(parts: list[Part], name: str, label: str, items: Sequence[Any]) -> None:
+def add_items(parts: list[Part], name: str, label: str, items: Sequence[Any]) -> None:
     """Add a list's refs, each after its label; a nested list labels its items ``1.0``, ``1.1``."""
     for index, item in enumerate(items):
         here = f"{label}.{index}" if label else str(index)
         if isinstance(item, list):
-            _items(parts, name, here, item)
+            add_items(parts, name, here, item)
             continue
-        _append(parts, f"\n[{name} {here}] ")
+        append(parts, f"\n[{name} {here}] ")
         if item is None:
-            _append(parts, "(none)")
+            append(parts, "(none)")
         else:
             parts.append(item)
 
 
-def _append(parts: list[Part], piece: str) -> None:
+def append(parts: list[Part], piece: str) -> None:
     """Add text, merged into a text part before it; empty text is dropped."""
     if not piece:
         return
@@ -88,11 +88,11 @@ def marker(ref: Ref) -> str:
     """Return the line a record shows for a ref, such as ``[image slide-3.png, image/png, 182 KB]``."""
     fields = [f"{ref.kind} {ref.name}", ref.media_type]
     if ref.size is not None:
-        fields.append(_size(ref.size))
+        fields.append(size(ref.size))
     return f"[{', '.join(fields)}]"
 
 
-def _size(count: int) -> str:
+def size(count: int) -> str:
     """Return a byte count as ``6 B``, ``182 KB`` or ``3.4 MB``."""
     if count < 1024:
         return f"{count} B"
@@ -123,15 +123,15 @@ def to_content(parts: Sequence[Part]) -> list[dict[str, Any]]:
         if isinstance(part, str):
             content.append({"type": "text", "text": part})
         elif part.kind == "image":
-            url = part.location if part.remote else f"data:{part.media_type};base64,{_encoded(part)}"
+            url = part.location if part.remote else f"data:{part.media_type};base64,{encoded(part)}"
             content.append({"type": "image_url", "image_url": {"url": url}})
         elif part.kind == "audio":
-            audio_format = _AUDIO_FORMATS.get(part.media_type)
+            audio_format = AUDIO_FORMATS.get(part.media_type)
             if audio_format is None:
                 raise ValueError(f"{marker(part)}: a model takes wav or mp3 audio, not {part.media_type}")
             if part.remote:
                 raise ValueError(f"{marker(part)}: audio is sent as bytes, and xmas reads no network")
-            content.append({"type": "input_audio", "input_audio": {"data": _encoded(part), "format": audio_format}})
+            content.append({"type": "input_audio", "input_audio": {"data": encoded(part), "format": audio_format}})
         else:
             raise ValueError(
                 f"{marker(part)}: a model reads a {part.kind} through a conversion step, never as a content part"
@@ -139,9 +139,9 @@ def to_content(parts: Sequence[Part]) -> list[dict[str, Any]]:
     return content
 
 
-def _encoded(ref: Ref) -> str:
+def encoded(ref: Ref) -> str:
     """Return a ref's bytes as base64, refusing one over the part limit before or after reading it."""
-    too_big = f"{marker(ref)} is over the {_size(MAX_PART_BYTES)} a content part may carry"
+    too_big = f"{marker(ref)} is over the {size(MAX_PART_BYTES)} a content part may carry"
     if ref.size is not None and ref.size > MAX_PART_BYTES:
         raise ValueError(too_big)
     data = ref.read_bytes()

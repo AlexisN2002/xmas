@@ -68,7 +68,7 @@ TABLE_TYPES = frozenset(
 MAX_PART_BYTES = 20 * 1024 * 1024
 """The largest media value sent to a model in one content part."""
 
-_REMOTE = ("http://", "https://")
+REMOTE = ("http://", "https://")
 
 
 def base_type(media_type: str) -> str:
@@ -123,7 +123,7 @@ class Ref:
     @property
     def remote(self) -> bool:
         """Whether the location is an ``http(s)`` URL."""
-        return self.location.startswith(_REMOTE)
+        return self.location.startswith(REMOTE)
 
     @classmethod
     def from_path(cls, path: str | os.PathLike[str], media_type: str | None = None) -> Ref:
@@ -189,7 +189,7 @@ class Ref:
     def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
         """Validate a ``Ref`` as itself and a mapping through :meth:`from_dict`; serialize through :meth:`to_dict`."""
         return core_schema.no_info_plain_validator_function(
-            _validate_ref,
+            validate_ref,
             serialization=core_schema.plain_serializer_function_ser_schema(lambda ref: ref.to_dict()),
         )
 
@@ -212,7 +212,7 @@ class Ref:
         }
 
 
-def _validate_ref(value: Any) -> Ref:
+def validate_ref(value: Any) -> Ref:
     if isinstance(value, Ref):
         return value
     if isinstance(value, Mapping):
@@ -302,15 +302,15 @@ Table = Annotated[Ref, Kind("table")]
 File = Annotated[Ref, Kind("file")]
 """Any ref."""
 
-_ALWAYS = ("text", "json")
+ALWAYS = ("text", "json")
 
-ACCEPTABLE = (*_ALWAYS, "image", "audio")
+ACCEPTABLE = (*ALWAYS, "image", "audio")
 """The kinds a model may accept."""
 
-PRODUCIBLE = (*_ALWAYS, "image")
+PRODUCIBLE = (*ALWAYS, "image")
 """The kinds a model may produce."""
 
-_KEYS = {"accepts": ("accept", ACCEPTABLE), "produces": ("produce", PRODUCIBLE)}
+KEYS = {"accepts": ("accept", ACCEPTABLE), "produces": ("produce", PRODUCIBLE)}
 
 
 @dataclass(frozen=True)
@@ -327,11 +327,11 @@ class Capabilities:
 
     def takes(self, kind: str) -> bool:
         """Whether the model reads ``kind``; text and json always."""
-        return kind in _ALWAYS or kind in self.accepts
+        return kind in ALWAYS or kind in self.accepts
 
     def gives(self, kind: str) -> bool:
         """Whether the model answers with ``kind``; text and json always."""
-        return kind in _ALWAYS or kind in self.produces
+        return kind in ALWAYS or kind in self.produces
 
     @classmethod
     def parse(cls, entry: Mapping[str, Any], where: str) -> Capabilities:
@@ -344,16 +344,16 @@ class Capabilities:
         if not isinstance(entry, Mapping):
             raise ValueError(f"{where} is a mapping with accepts and produces, not {type(entry).__name__}")
         for key in entry:
-            if key not in _KEYS:
+            if key not in KEYS:
                 raise ValueError(f"{where} has key {key!r}; it takes accepts and produces")
         words: dict[str, tuple[str, ...]] = {}
-        for key, (verb, allowed) in _KEYS.items():
+        for key, (verb, allowed) in KEYS.items():
             given = entry.get(key, [])
             if not isinstance(given, (list, tuple)) or not all(isinstance(word, str) for word in given):
                 raise ValueError(f"{where} {key} is a list of words such as [image], not {given!r}")
             for word in given:
                 if word not in allowed:
-                    media = ", ".join(kind for kind in allowed if kind not in _ALWAYS)
+                    media = ", ".join(kind for kind in allowed if kind not in ALWAYS)
                     raise ValueError(f"{where} {key} {word!r}; a model may {verb} {media}")
             words[key] = tuple(given)
         return cls(words["accepts"], words["produces"])

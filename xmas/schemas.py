@@ -33,12 +33,12 @@ from xmas.values import LIST_PREFIX
 RETRY_NOTE = "Your previous answer did not match the required format: {problem}\nAnswer again with only the JSON."
 """Appended to the prompt of the one retry; ``{problem}`` is the first problem."""
 
-_BASE: dict[str, Any] = {"text": str, "bool": bool, "int": int, "number": float, "json": Any}
-_WORDS = {"text": "text", "bool": "true or false", "int": "integer", "number": "number", "json": "any JSON"}
-_OBJECT = "object"
-_KEYS = frozenset({"type", "means", "optional", "one of", "fields"})
-_FENCE = re.compile(r"\A```[\w-]*[ \t]*\n(.*)\n[ \t]*```\Z", re.S)
-_ANY_JSON: TypeAdapter[Any] = TypeAdapter(Any)
+BASE: dict[str, Any] = {"text": str, "bool": bool, "int": int, "number": float, "json": Any}
+WORDS = {"text": "text", "bool": "true or false", "int": "integer", "number": "number", "json": "any JSON"}
+OBJECT = "object"
+KEYS = frozenset({"type", "means", "optional", "one of", "fields"})
+FENCE = re.compile(r"\A```[\w-]*[ \t]*\n(.*)\n[ \t]*```\Z", re.S)
+ANY_JSON: TypeAdapter[Any] = TypeAdapter(Any)
 
 
 class FormError(ValueError):
@@ -59,8 +59,8 @@ class AnswerForm:
 
     def __init__(self, fields: Mapping[str, Mapping[str, Any]] | None) -> None:
         """Check the form, naming the field that breaks the dialect, and build its pydantic model."""
-        self.fields = None if fields is None else _plain(fields, "")
-        self._model = None if self.fields is None else _model(self.fields, "answer")
+        self.fields = None if fields is None else plain(fields, "")
+        self.model = None if self.fields is None else build_model(self.fields, "answer")
 
     def parse(self, text: str) -> Any:
         """Read an answer, raising :class:`FormError` when it does not match.
@@ -71,12 +71,12 @@ class AnswerForm:
         is ``None``), then any extra fields.
         """
         body = text.strip()
-        if match := _FENCE.match(body):
+        if match := FENCE.match(body):
             body = match.group(1)
         try:
-            if self._model is None:
-                return _ANY_JSON.validate_json(body)
-            return self._model.model_validate_json(body).model_dump(mode="json", by_alias=True)
+            if self.model is None:
+                return ANY_JSON.validate_json(body)
+            return self.model.model_validate_json(body).model_dump(mode="json", by_alias=True)
         except ValidationError as error:
             raise FormError(
                 "; ".join(f"{'.'.join(str(p) for p in e['loc']) or '<root>'}: {e['msg']}" for e in error.errors())
@@ -99,7 +99,7 @@ class AnswerForm:
             return "Answer with one JSON value and nothing else."
         if not self.fields:
             return "Answer with one JSON object and nothing else."
-        return "\n".join(["Answer with one JSON object and nothing else. Its fields:", *_lines(self.fields, "")])
+        return "\n".join(["Answer with one JSON object and nothing else. Its fields:", *format_lines(self.fields, "")])
 
     def paths(self) -> tuple[str, ...]:
         """Return every field path in the form, nested objects as ``a.b``.
@@ -107,7 +107,7 @@ class AnswerForm:
         Fields of a list's objects are not paths, since a path cannot index a
         list. Without a form there are none.
         """
-        return () if self.fields is None else tuple(_paths(self.fields, ""))
+        return () if self.fields is None else tuple(form_paths(self.fields, ""))
 
     def choices(self, path: str) -> tuple[Any, ...] | None:
         """Return the ``one of`` values of a field path, or ``None`` when it has none or is not in the form."""
@@ -117,7 +117,7 @@ class AnswerForm:
             spec = None if fields is None else fields.get(name)
             if spec is None:
                 return None
-            fields = spec.get("fields") if spec["type"] == _OBJECT else None
+            fields = spec.get("fields") if spec["type"] == OBJECT else None
         return None if spec is None or "one of" not in spec else tuple(spec["one of"])
 
     def __repr__(self) -> str:
@@ -130,7 +130,7 @@ def compile_form(fields: Mapping[str, Mapping[str, Any]] | None) -> AnswerForm:
     return AnswerForm(fields)
 
 
-def _plain(fields: Mapping[Any, Any], where: str) -> dict[str, dict[str, Any]]:
+def plain(fields: Mapping[Any, Any], where: str) -> dict[str, dict[str, Any]]:
     """Check one level of a form and return a plain copy of it."""
     if not isinstance(fields, Mapping):
         raise ValueError(f"Answer form{where}: fields must be a mapping, got {type(fields).__name__}.")
@@ -141,11 +141,11 @@ def _plain(fields: Mapping[Any, Any], where: str) -> dict[str, dict[str, Any]]:
             raise ValueError(f"Answer form: field name {name!r} is not a non-empty string.")
         if not isinstance(spec, Mapping):
             raise ValueError(f"Answer form field {path!r}: expected a mapping such as {{type: text}}, got {spec!r}.")
-        unknown = set(spec) - _KEYS
+        unknown = set(spec) - KEYS
         if unknown:
-            raise ValueError(f"Answer form field {path!r}: unknown keys {sorted(unknown)}; known: {sorted(_KEYS)}.")
+            raise ValueError(f"Answer form field {path!r}: unknown keys {sorted(unknown)}; known: {sorted(KEYS)}.")
         kind = spec.get("type")
-        base = _item_kind(kind)
+        base = item_kind(kind)
         if base is None:
             raise ValueError(
                 f"Answer form field {path!r}: unknown type {kind!r}; "
@@ -160,73 +160,73 @@ def _plain(fields: Mapping[Any, Any], where: str) -> dict[str, dict[str, Any]]:
             copy["optional"] = spec["optional"]
         if "one of" in spec:
             choices = spec["one of"]
-            if not isinstance(choices, list) or not choices or base in (_OBJECT, "json"):
+            if not isinstance(choices, list) or not choices or base in (OBJECT, "json"):
                 raise ValueError(f"Answer form field {path!r}: one of needs a non-empty list on a plain type.")
             copy["one of"] = list(choices)
         if "fields" in spec:
-            if base != _OBJECT:
+            if base != OBJECT:
                 raise ValueError(f"Answer form field {path!r}: only an object has fields, not {kind!r}.")
-            copy["fields"] = _plain(spec["fields"], path)
+            copy["fields"] = plain(spec["fields"], path)
         out[name] = copy
     return out
 
 
-def _item_kind(kind: Any) -> str | None:
+def item_kind(kind: Any) -> str | None:
     """Return the base type under any ``list of`` words, or ``None`` if unknown."""
     while isinstance(kind, str) and kind.startswith(LIST_PREFIX):
         kind = kind[len(LIST_PREFIX) :].strip()
-    return kind if isinstance(kind, str) and (kind in _BASE or kind == _OBJECT) else None
+    return kind if isinstance(kind, str) and (kind in BASE or kind == OBJECT) else None
 
 
-def _model(fields: dict[str, dict[str, Any]], name: str) -> type[BaseModel]:
+def build_model(fields: dict[str, dict[str, Any]], name: str) -> type[BaseModel]:
     """Build the pydantic model of one level, fields aliased as in ``tools._build_model``."""
     made: dict[str, Any] = {}
     for index, (key, spec) in enumerate(fields.items()):
         default = None if spec.get("optional") else ...
         extra = {"description": spec["means"]} if "means" in spec else {}
-        made[f"f{index}"] = (_annotation(spec, spec["type"], f"{name}.{key}"), Field(default, alias=key, **extra))
+        made[f"f{index}"] = (annotation(spec, spec["type"], f"{name}.{key}"), Field(default, alias=key, **extra))
     model: type[BaseModel] = create_model(name, __config__=ConfigDict(extra="allow"), **made)
     return model
 
 
-def _annotation(spec: dict[str, Any], kind: str, name: str) -> Any:
+def annotation(spec: dict[str, Any], kind: str, name: str) -> Any:
     """Return the Python type of a field whose (remaining) type words are ``kind``."""
     if kind.startswith(LIST_PREFIX):
-        return list[_annotation(spec, kind[len(LIST_PREFIX) :].strip(), name)]  # type: ignore[misc]
+        return list[annotation(spec, kind[len(LIST_PREFIX) :].strip(), name)]  # type: ignore[misc]
     if "one of" in spec:
         return Literal[tuple(spec["one of"])]
-    if kind == _OBJECT:
-        return _model(spec["fields"], name) if "fields" in spec else dict[str, Any]
-    return _BASE[kind]
+    if kind == OBJECT:
+        return build_model(spec["fields"], name) if "fields" in spec else dict[str, Any]
+    return BASE[kind]
 
 
-def _phrase(spec: dict[str, Any], kind: str) -> str:
+def phrase(spec: dict[str, Any], kind: str) -> str:
     """Return the words for a field's type, such as ``list of text`` or ``one of "a", "b"``."""
     if kind.startswith(LIST_PREFIX):
-        return LIST_PREFIX + _phrase(spec, kind[len(LIST_PREFIX) :].strip())
+        return LIST_PREFIX + phrase(spec, kind[len(LIST_PREFIX) :].strip())
     if "one of" in spec:
         return "one of " + ", ".join(json.dumps(choice, ensure_ascii=False) for choice in spec["one of"])
-    return _OBJECT if kind == _OBJECT else _WORDS[kind]
+    return OBJECT if kind == OBJECT else WORDS[kind]
 
 
-def _lines(fields: dict[str, dict[str, Any]], indent: str) -> list[str]:
+def format_lines(fields: dict[str, dict[str, Any]], indent: str) -> list[str]:
     """Return the format block's lines for one level of a form."""
     lines: list[str] = []
     for key, spec in fields.items():
-        words = _phrase(spec, spec["type"]) + (", optional" if spec.get("optional") else "")
+        words = phrase(spec, spec["type"]) + (", optional" if spec.get("optional") else "")
         means = f": {spec['means']}" if "means" in spec else ""
         lines.append(f"{indent}- {key} ({words}){means}")
         if "fields" in spec:
-            lines.extend(_lines(spec["fields"], indent + "  "))
+            lines.extend(format_lines(spec["fields"], indent + "  "))
     return lines
 
 
-def _paths(fields: dict[str, dict[str, Any]], prefix: str) -> list[str]:
+def form_paths(fields: dict[str, dict[str, Any]], prefix: str) -> list[str]:
     """Return the paths of one level of a form and of its nested objects."""
     paths: list[str] = []
     for key, spec in fields.items():
         path = prefix + key
         paths.append(path)
-        if spec["type"] == _OBJECT and "fields" in spec:
-            paths.extend(_paths(spec["fields"], path + "."))
+        if spec["type"] == OBJECT and "fields" in spec:
+            paths.extend(form_paths(spec["fields"], path + "."))
     return paths

@@ -42,7 +42,7 @@ V2_KEYS: dict[str, Any] = {
 }
 """Every top-level key of a version 2 spec with the type of its value, in the order a dump writes them."""
 
-_ENTRIES: dict[str, tuple[str, frozenset[str], dict[str, Any]]] = {
+ENTRIES: dict[str, tuple[str, frozenset[str], dict[str, Any]]] = {
     "agents": (
         "Agent",
         frozenset({"writes"}),
@@ -87,10 +87,10 @@ _ENTRIES: dict[str, tuple[str, frozenset[str], dict[str, Any]]] = {
         },
     ),
 }
-_CALLABLE = {"kind": str, "import": str, "server": str, "params": dict, "reads": dict, "writes": dict}
-_HEALTH = {"length_factor": (int, float), "min_samples": int, "leak": list}
-_MODEL_KEYS = ("accepts", "produces")
-_WORDS = {
+CALLABLE = {"kind": str, "import": str, "server": str, "params": dict, "reads": dict, "writes": dict}
+HEALTH = {"length_factor": (int, float), "min_samples": int, "leak": list}
+MODEL_KEYS = ("accepts", "produces")
+WORDS = {
     int: "an integer",
     (int, float): "a number",
     str: "a string",
@@ -132,7 +132,7 @@ def validate_spec(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _check_fields(
+def check_fields(
     entry: Any, where: str, fields: dict[str, Any], required: frozenset[str] = frozenset(), note: str = ""
 ) -> None:
     """Refuse a mapping with an unknown or missing key or a value of the wrong type."""
@@ -144,7 +144,7 @@ def _check_fields(
         raise ValueError(f"{where} {problem}; it takes {sorted(fields)}{note if unknown else ''}.")
     for key, value in entry.items():
         if isinstance(value, bool) or not isinstance(value, fields[key]):
-            raise ValueError(f"{where} needs {key!r} to be {_WORDS[fields[key]]}, got {value!r}.")
+            raise ValueError(f"{where} needs {key!r} to be {WORDS[fields[key]]}, got {value!r}.")
 
 
 def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
@@ -154,7 +154,7 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
     are checked by the constructors, and whether the system makes sense by
     :func:`xmas.check.check_system`, both when the MAS is built.
     """
-    _check_fields(data, "Spec", V2_KEYS)
+    check_fields(data, "Spec", V2_KEYS)
     if data.get("version") != 2:
         raise ValueError(f"A version 2 spec needs 'version: 2', not {data.get('version')!r}.")
     for entry in data.get("boxes", []):
@@ -163,13 +163,13 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
                 f"Box {entry.get('name')!r} names its system {entry['system']!r}: MAS.load reads a bundle's boxes; "
                 "from_dict needs the system's spec."
             )
-    for section, (label, required, fields) in _ENTRIES.items():
+    for section, (label, required, fields) in ENTRIES.items():
         for index, entry in enumerate(data.get(section, [])):
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 raise ValueError(f"{label} {index} must be a mapping with a string 'name'.")
-            _check_fields(entry, f"{label} {entry['name']!r}", fields, required)
+            check_fields(entry, f"{label} {entry['name']!r}", fields, required)
     for name, entry in data.get("callables", {}).items():
-        _check_fields(entry, f"Callable {name!r}", _CALLABLE, frozenset({"kind"}), " (use a YAML comment for a note)")
+        check_fields(entry, f"Callable {name!r}", CALLABLE, frozenset({"kind"}), " (use a YAML comment for a note)")
         if entry["kind"] not in ("python", "mcp"):
             raise ValueError(f"Callable {name!r} needs 'kind' to be 'python' or 'mcp', not {entry['kind']!r}.")
         if "params" in entry and entry["kind"] != "python":
@@ -179,9 +179,9 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
                 f"Callable {name!r} names the server {entry['server']!r}: a callable names its server, and its "
                 "address goes to the configuration ([tools.<name>] url)."
             )
-    _check_fields(data.get("health", {}), "Spec 'health'", _HEALTH)
+    check_fields(data.get("health", {}), "Spec 'health'", HEALTH)
     for name, entry in data.get("models", {}).items():  # other keys are refused, with why, where the MAS reads them
-        if not isinstance(entry, dict) or any(not isinstance(entry.get(key, []), list) for key in _MODEL_KEYS):
+        if not isinstance(entry, dict) or any(not isinstance(entry.get(key, []), list) for key in MODEL_KEYS):
             raise ValueError(f"Spec 'models' entry {name!r} must map accepts and produces to lists, got {entry!r}.")
         if not isinstance(entry.get("model", name), str):
             raise ValueError(

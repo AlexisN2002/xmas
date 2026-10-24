@@ -38,6 +38,8 @@ plugins:
             show_source: true
             show_root_heading: true
             docstring_style: google
+            # A module's __all__ says what is public; nothing is hidden by a leading underscore.
+            filters: public
 
 nav:
   - Home: index.md

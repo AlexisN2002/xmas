@@ -63,7 +63,7 @@ class Agent:
             raise ValueError("An agent needs a name.")
         if not output:
             raise ValueError(f"Agent {name!r} needs an output variable.")
-        reads = _reads_map(name, inputs if inputs is not None else ["query"])
+        reads = reads_map(name, inputs if inputs is not None else ["query"])
         try:
             answers_json = parse_type(output_type) == JSON
             if schema is not None:
@@ -89,7 +89,7 @@ class Agent:
 
     @inputs.setter
     def inputs(self, names: list[str]) -> None:
-        self.reads = _reads_map(self.name, names)
+        self.reads = reads_map(self.name, names)
 
     @property
     def renamed(self) -> bool:
@@ -181,7 +181,7 @@ class Agent:
         return f"Agent(name={self.name!r}, inputs={self.inputs!r}, output={self.output!r}, model={self.model!r})"
 
 
-def _reads_map(name: str, inputs: Any) -> dict[str, str]:
+def reads_map(name: str, inputs: Any) -> dict[str, str]:
     """Return an agent's ``{placeholder: value}`` map from a list of value names or a map."""
     pairs = (
         list(inputs.items())

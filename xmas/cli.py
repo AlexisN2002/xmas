@@ -18,7 +18,7 @@ import json
 import sys
 import time
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
@@ -34,7 +34,7 @@ from xmas.store import open_store
 from xmas.values import TEXT, ValueType, media_kind, plain
 from xmas.verify import VerifyWarning
 
-_EXAMPLES = """\
+EXAMPLES = """\
 version: 1
 # Warm-up cases: verify(2) and `xmas verify --level 2` run them under a small budget.
 examples:
@@ -44,7 +44,7 @@ examples:
     answer: [{not empty: true}]
 """
 
-_OPTIMIZE = """\
+OPTIMIZE = """\
 # Optional: what an optimizer may tune, for example
 # task: {examples: examples/warmup.yaml}
 # tune: [prompts, models]
@@ -52,11 +52,11 @@ _OPTIMIZE = """\
 """
 
 
-class _UsageError(Exception):
+class UsageError(Exception):
     """A command line that cannot be carried out: exit status 2."""
 
 
-def _parser() -> argparse.ArgumentParser:
+def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xmas", description="Make, check, run and verify .mas bundles; read the run log."
     )
@@ -101,24 +101,24 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one ``xmas`` command and return its exit status."""
-    args = _parser().parse_args(argv)
+    args = parser().parse_args(argv)
     here = str(Path.cwd())
     joined = getattr(args, "trust", False) and here not in sys.path
     if joined:
         sys.path.insert(0, here)
     try:
-        with _warnings_as_lines():
-            return int(globals()[f"_{args.command}"](args))
-    except (_UsageError, ValueError) as error:
+        with warnings_as_lines():
+            return COMMANDS[args.command](args)
+    except (UsageError, ValueError) as error:
         print(f"xmas {args.command}: {error}", file=sys.stderr)
-        return 2 if isinstance(error, _UsageError) else 1
+        return 2 if isinstance(error, UsageError) else 1
     finally:
         if joined:
             sys.path.remove(here)
 
 
 @contextmanager
-def _warnings_as_lines() -> Iterator[None]:
+def warnings_as_lines() -> Iterator[None]:
     """Print each warning as one ``warning:`` line; a verify report already holds its own."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -130,21 +130,21 @@ def _warnings_as_lines() -> Iterator[None]:
                     print(f"warning: {item.message}", file=sys.stderr)
 
 
-def _load(args: argparse.Namespace, **options: Any) -> MAS:
+def load(args: argparse.Namespace, **options: Any) -> MAS:
     if not Path(args.bundle).exists():
-        raise _UsageError(f"no bundle at {args.bundle}")
+        raise UsageError(f"no bundle at {args.bundle}")
     return MAS.load(args.bundle, trust=args.trust, **options)
 
 
-def _init(args: argparse.Namespace) -> int:
+def init(args: argparse.Namespace) -> int:
     path = Path(args.bundle)
     if path.exists():
-        raise _UsageError(f"{path} exists; init writes a new bundle")
+        raise UsageError(f"{path} exists; init writes a new bundle")
     if path.suffix != ".mas":
-        raise _UsageError(f"a bundle is named name.mas, not {path.name!r}")
+        raise UsageError(f"a bundle is named name.mas, not {path.name!r}")
     names = [name.strip() for name in args.agents.split(",") if name.strip()]
     if not names:
-        raise _UsageError("--agents names at least one agent")
+        raise UsageError("--agents names at least one agent")
     agents, previous = [], None
     for index, name in enumerate(names):
         output = "answer" if index == len(names) - 1 else f"{name}_draft"
@@ -163,50 +163,50 @@ def _init(args: argparse.Namespace) -> int:
     )
     mas.save(path)
     (path / "examples").mkdir()
-    (path / "examples" / "warmup.yaml").write_text(_EXAMPLES, encoding="utf-8")
-    (path / "optimize.yaml").write_text(_OPTIMIZE, encoding="utf-8")
+    (path / "examples" / "warmup.yaml").write_text(EXAMPLES, encoding="utf-8")
+    (path / "optimize.yaml").write_text(OPTIMIZE, encoding="utf-8")
     mas.save(path)  # the lock now covers the examples
     print(f"wrote {path}: edit its prompts/ and the models in xmas.yaml, then run: xmas check {path}")
     return 0
 
 
-def _summary(description: Mapping[str, Any]) -> str:
+def summary(description: Mapping[str, Any]) -> str:
     edges = [edge for edge in description["edges"] if not edge.get("implicit")]
     chains = [group for group in description.get("groups", []) if "for each" in group]
     counts = {"node": len(description["nodes"]), "edge": len(edges), "chain": len(chains)}
     return ", ".join(f"{n} {word}{'s' * (n != 1)}" for word, n in counts.items())
 
 
-def _check(args: argparse.Namespace) -> int:
-    mas = _load(args, resolve=False)
+def check(args: argparse.Namespace) -> int:
+    mas = load(args, resolve=False)
     problems: list[str] = []
     parse_examples(read(args.bundle), Path(args.bundle) if Path(args.bundle).is_dir() else None, problems=problems)
     for problem in problems:
         print(f"- {problem}")
-    print(f"{len(problems)} problem(s)" if problems else f"ok: {_summary(mas.describe())}")
+    print(f"{len(problems)} problem(s)" if problems else f"ok: {summary(mas.describe())}")
     return 1 if problems else 0
 
 
-def _words(values: Mapping[str, str]) -> str:
+def words(values: Mapping[str, str]) -> str:
     return ", ".join(f"{name} {vtype}" for name, vtype in values.items())
 
 
-def _show(args: argparse.Namespace) -> int:
-    description = _load(args, resolve=False).describe()
+def show(args: argparse.Namespace) -> int:
+    description = load(args, resolve=False).describe()
     if args.json:
         print(json.dumps(description, indent=2))
         return 0
-    lines = [f"{Path(args.bundle).name}: version {description['version']}, {_summary(description)}"]
-    lines.append(f"inputs: {_words(description['inputs'])}")
+    lines = [f"{Path(args.bundle).name}: version {description['version']}, {summary(description)}"]
+    lines.append(f"inputs: {words(description['inputs'])}")
     if description.get("outputs"):
-        lines.append(f"outputs: {_words(description['outputs'])}")
+        lines.append(f"outputs: {words(description['outputs'])}")
     nodes = description["nodes"]
     width = max(len(node["name"]) for node in nodes)
     lines.append("nodes:")
     for node in nodes:
         what = node.get("model") or node.get("uses") or node.get("form") or ""
-        row = f"  {node['name']:<{width}}  {node['kind']:<5}  {what}  {_words(node.get('reads', {}))}"
-        row += f" -> {_words(node.get('writes', {}))}"
+        row = f"  {node['name']:<{width}}  {node['kind']:<5}  {what}  {words(node.get('reads', {}))}"
+        row += f" -> {words(node.get('writes', {}))}"
         if node.get("for each"):
             row += f"  for each {node['for each']}"
         lines.append(row)
@@ -222,7 +222,7 @@ def _show(args: argparse.Namespace) -> int:
     return 0
 
 
-def _value(text: str, vtype: ValueType) -> Any:
+def value(text: str, vtype: ValueType) -> Any:
     if vtype == TEXT:
         return text
     if vtype.item is None and media_kind(vtype) is not None:
@@ -230,21 +230,21 @@ def _value(text: str, vtype: ValueType) -> Any:
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
-        raise _UsageError(f"a {vtype} input is JSON, not {text!r}") from None
+        raise UsageError(f"a {vtype} input is JSON, not {text!r}") from None
     return [Path(item) for item in value] if media_kind(vtype) is not None and isinstance(value, list) else value
 
 
-def _run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace) -> int:
     config = Config.load()
     if not config.base_url:
         raise ValueError(f"no endpoint: set XMAS_BASE_URL, or base_url under [endpoint] in {config_path()}")
-    mas = _load(args, config=config)
+    mas = load(args, config=config)
     values: dict[str, Any] = {} if args.query is None else {"query": args.query}
     for pair in args.input:
         name, sep, text = pair.partition("=")
         if not sep or name not in mas.inputs:
-            raise _UsageError(f"--input takes NAME=VALUE with NAME one of {', '.join(mas.inputs)}, not {pair!r}")
-        values[name] = _value(text, mas.inputs[name])
+            raise UsageError(f"--input takes NAME=VALUE with NAME one of {', '.join(mas.inputs)}, not {pair!r}")
+        values[name] = value(text, mas.inputs[name])
     if args.budget is not None:
         mas.budget = Budget(max_cost_usd=args.budget)
     started = time.perf_counter()
@@ -263,9 +263,9 @@ def _run(args: argparse.Namespace) -> int:
     return 1 if trace.failed else 0
 
 
-def _diff(args: argparse.Namespace) -> int:
+def diff(args: argparse.Namespace) -> int:
     if not Path(args.bundle).exists() or (args.other and not Path(args.other).exists()):
-        raise _UsageError(f"no bundle at {args.bundle if not Path(args.bundle).exists() else args.other}")
+        raise UsageError(f"no bundle at {args.bundle if not Path(args.bundle).exists() else args.other}")
     left = read(args.bundle)
     if args.other is None:
         if LOCK not in left:
@@ -298,26 +298,28 @@ def _diff(args: argparse.Namespace) -> int:
     return 1 if report["added"] or report["removed"] or changed else 0
 
 
-def _verify(args: argparse.Namespace) -> int:
-    mas = _load(args, resolve=False)
+def verify(args: argparse.Namespace) -> int:
+    mas = load(args, resolve=False)
     report = mas.verify(args.level, budget=args.budget, only=args.only)
     print(json.dumps(report.to_dict(), indent=2) if args.json else str(report))
     return 1 if args.strict and not report.ok else 0
 
 
-def _cost(totals: Mapping[str, Any] | None) -> float | None:
+def run_cost(totals: Mapping[str, Any] | None) -> float | None:
     return None if not totals or totals["uncosted_calls"] else float(totals["cost_usd"])
 
 
-def _runs(args: argparse.Namespace) -> int:
+def runs(args: argparse.Namespace) -> int:
     store = open_store()
     rows = store.runs(args.status, args.system, args.limit)
     if args.json:
         keys = ("run_id", "status", "system_id", "created_at", "ended_at")
-        print(json.dumps([{**{key: getattr(row, key) for key in keys}, "cost_usd": _cost(row.totals)} for row in rows]))
+        print(
+            json.dumps([{**{key: getattr(row, key) for key in keys}, "cost_usd": run_cost(row.totals)} for row in rows])
+        )
         return 0
     for row in rows:
-        cost = _cost(row.totals)
+        cost = run_cost(row.totals)
         shown = "cost unknown" if cost is None else f"{cost:.4f} USD"
         print(f"{row.run_id}  {row.status:<11}  {row.system_id}  {row.created_at[:19]}  {shown}")
     if not rows:
@@ -325,7 +327,7 @@ def _runs(args: argparse.Namespace) -> int:
     return 0
 
 
-def _trace(args: argparse.Namespace) -> int:
+def trace(args: argparse.Namespace) -> int:
     store = open_store()
     try:
         trace = store.trace(args.run_id)
@@ -349,6 +351,19 @@ def _trace(args: argparse.Namespace) -> int:
     if trace.failed:
         print(f"{trace.error_kind or 'error'}: {trace.error}", file=sys.stderr)
     return 0
+
+
+COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
+    "init": init,
+    "check": check,
+    "show": show,
+    "run": run,
+    "diff": diff,
+    "verify": verify,
+    "runs": runs,
+    "trace": trace,
+}
+"""Each command's function, by the name typed after ``xmas``."""
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -187,10 +187,10 @@ def meta_from_completion(completion: ChatCompletion, latency_s: float, price: To
     reported cost.
     """
     usage = completion.usage
-    tokens = _tokens(usage) if usage is not None else None
-    cost = _reported_cost(usage.model_extra) if usage is not None else None
+    tokens = provider_usage(usage) if usage is not None else None
+    cost = reported_cost(usage.model_extra) if usage is not None else None
     if cost is None:
-        cost = _reported_cost(completion.model_extra)
+        cost = reported_cost(completion.model_extra)
     if cost is None and price is not None and tokens is not None:
         cost = price.cost_usd(tokens)
 
@@ -220,7 +220,7 @@ def cut_meta(
     return CallMeta(latency_s=latency_s, tokens=tokens, cost_usd=cost, served_model=served_model)
 
 
-def _tokens(usage: CompletionUsage) -> TokenUsage | None:
+def provider_usage(usage: CompletionUsage) -> TokenUsage | None:
     """Return the provider's counts, with cache reads and reasoning when it sent them.
 
     ``None`` when a count is missing: the client does not validate responses, so
@@ -240,7 +240,7 @@ def _tokens(usage: CompletionUsage) -> TokenUsage | None:
     )
 
 
-def _reported_cost(extra: dict[str, Any] | None) -> float | None:
+def reported_cost(extra: dict[str, Any] | None) -> float | None:
     """Return a ``cost`` field when it is a non-negative number, else ``None``.
 
     A bool is an int to Python but never a cost, and a string is not trusted.

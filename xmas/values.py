@@ -23,7 +23,7 @@ from xmas.media import MEDIA_KINDS, Kind, Ref, Store, fits_kind
 KINDS = ("text", "json", *MEDIA_KINDS)
 """Every value kind of the format; ``list of <kind>`` builds on them."""
 
-_LIST = "list"
+LIST = "list"
 LIST_PREFIX = "list of "
 """How a list type starts, in value types and in answer forms alike."""
 
@@ -37,7 +37,7 @@ class ValueType:
 
     def __post_init__(self) -> None:
         """Refuse unknown kinds and an item on anything but a list."""
-        if self.kind == _LIST:
+        if self.kind == LIST:
             if self.item is None:
                 raise ValueError("A list type needs an item type.")
         elif self.kind not in KINDS:
@@ -69,7 +69,7 @@ def parse_type(text: str) -> ValueType:
         raise ValueError(f"A value type is a string such as 'text', not {text!r}.")
     words = text.strip()
     if words.startswith(LIST_PREFIX):
-        return ValueType(_LIST, parse_type(words[len(LIST_PREFIX) :]))
+        return ValueType(LIST, parse_type(words[len(LIST_PREFIX) :]))
     return ValueType(words)
 
 
@@ -93,7 +93,7 @@ def type_of_hint(hint: Any) -> ValueType:
     ``str | None`` parameter), and json otherwise.
     """
     if isinstance(hint, dict):
-        return _type_of_schema(hint)
+        return type_of_schema(hint)
     if typing.get_origin(hint) is typing.Annotated:
         hint, *extras = typing.get_args(hint)
         if hint is Ref:
@@ -103,11 +103,11 @@ def type_of_hint(hint: Any) -> ValueType:
     if typing.get_origin(hint) is list and len(args := typing.get_args(hint)) == 1:
         item = type_of_hint(args[0])
         if media_kind(item) is not None:
-            return ValueType(_LIST, item)
+            return ValueType(LIST, item)
     return TEXT if hint is str else JSON
 
 
-def _type_of_schema(schema: dict[str, Any]) -> ValueType:
+def type_of_schema(schema: dict[str, Any]) -> ValueType:
     """Read a parameter's JSON schema as :func:`type_of_hint` describes."""
     options = [
         option
@@ -115,7 +115,7 @@ def _type_of_schema(schema: dict[str, Any]) -> ValueType:
         if not (isinstance(option, dict) and option.get("type") == "null")
     ]
     if len(options) == 1 and isinstance(option := options[0], dict):
-        media = _media_of_schema(option)
+        media = media_of_schema(option)
         if media is not None:
             return media
     kinds: set[Any] = set()
@@ -125,15 +125,15 @@ def _type_of_schema(schema: dict[str, Any]) -> ValueType:
     return TEXT if "string" in kinds and kinds <= {"string", "null"} else JSON
 
 
-def _media_of_schema(schema: dict[str, Any]) -> ValueType | None:
+def media_of_schema(schema: dict[str, Any]) -> ValueType | None:
     """Return the media type a schema marks, a list of one for an array of marked items, else ``None``."""
     kind = schema.get("x-xmas-kind")
     if kind in MEDIA_KINDS:
         return ValueType(kind)
     items = schema.get("items")
     if schema.get("type") == "array" and isinstance(items, dict):
-        item = _type_of_schema(items)  # items may be null too, as a gathered list's failed ones are
-        return ValueType(_LIST, item) if media_kind(item) is not None else None
+        item = type_of_schema(items)  # items may be null too, as a gathered list's failed ones are
+        return ValueType(LIST, item) if media_kind(item) is not None else None
     return None
 
 
@@ -195,7 +195,7 @@ def check_value(value: Any, vtype: ValueType) -> str | None:
     :class:`~xmas.media.Ref` of its kind (``"expected image, got a Ref of
     text/csv"``); a file takes any ref.
     """
-    return _problem(value, vtype, "")
+    return fit_problem(value, vtype, "")
 
 
 def fits(value: ValueType, wanted: ValueType) -> bool:
@@ -206,25 +206,25 @@ def fits(value: ValueType, wanted: ValueType) -> bool:
     return value == wanted or (wanted == JSON and value.item is not None) or (wanted == FILE and value in MEDIA)
 
 
-def _problem(value: Any, vtype: ValueType, path: str) -> str | None:
+def fit_problem(value: Any, vtype: ValueType, path: str) -> str | None:
     """Return where ``value`` stops fitting ``vtype``, or ``None``."""
     where = f" at {path}" if path else ""
     if vtype.item is not None:
         if not isinstance(value, list):
             return f"expected {vtype}{where}, got {type(value).__name__}"
         for index, item in enumerate(value):
-            problem = None if item is None else _problem(item, vtype.item, _join(path, index))
+            problem = None if item is None else fit_problem(item, vtype.item, join(path, index))
             if problem is not None:
                 return problem
         return None
     if vtype == TEXT:
         return None if isinstance(value, str) else f"expected text{where}, got {type(value).__name__}"
     if vtype in MEDIA:
-        return _media_problem(value, vtype.kind, where)
-    return _json_problem(value, path)
+        return media_problem(value, vtype.kind, where)
+    return json_problem(value, path)
 
 
-def _media_problem(value: Any, kind: str, where: str) -> str | None:
+def media_problem(value: Any, kind: str, where: str) -> str | None:
     """Return why ``value`` is not a ref of ``kind``, or ``None``."""
     if isinstance(value, Ref):
         return None if fits_kind(value, kind) else f"expected {kind}{where}, got a Ref of {value.media_type}"
@@ -233,7 +233,7 @@ def _media_problem(value: Any, kind: str, where: str) -> str | None:
     return f"expected {kind}{where}, got {type(value).__name__}"
 
 
-def _json_problem(value: Any, path: str) -> str | None:
+def json_problem(value: Any, path: str) -> str | None:
     """Return where ``value`` stops being plain JSON data, or ``None``."""
     where = f" at {path}" if path else ""
     if value is None or isinstance(value, (str, bool, int)):
@@ -242,7 +242,7 @@ def _json_problem(value: Any, path: str) -> str | None:
         return None if math.isfinite(value) else f"not JSON{where}: {value!r}"
     if isinstance(value, list):
         for index, item in enumerate(value):
-            problem = _json_problem(item, _join(path, index))
+            problem = json_problem(item, join(path, index))
             if problem is not None:
                 return problem
         return None
@@ -250,13 +250,13 @@ def _json_problem(value: Any, path: str) -> str | None:
         for key, item in value.items():
             if not isinstance(key, str):
                 return f"not JSON{where}: key {key!r} is not a string"
-            problem = _json_problem(item, _join(path, key))
+            problem = json_problem(item, join(path, key))
             if problem is not None:
                 return problem
         return None
     return f"not JSON{where}: {type(value).__name__}"
 
 
-def _join(path: str, step: int | str) -> str:
+def join(path: str, step: int | str) -> str:
     """Return ``path`` one item or key deeper, such as ``counts.words``."""
     return f"{path}.{step}" if path else str(step)

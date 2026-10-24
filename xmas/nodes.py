@@ -42,7 +42,7 @@ class Step:
         if not self.uses:
             raise ValueError(f"Step {self.name!r} needs the name of the callable it uses.")
         for label in ("reads", "writes"):
-            object.__setattr__(self, label, _names_map(f"Step {self.name!r}", label, getattr(self, label)))
+            object.__setattr__(self, label, names_map(f"Step {self.name!r}", label, getattr(self, label)))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form; ``reads`` and ``writes`` only when not empty."""
@@ -54,7 +54,7 @@ class Step:
         return data
 
 
-def _names_map(owner: str, label: str, mapping: Any) -> dict[str, str]:
+def names_map(owner: str, label: str, mapping: Any) -> dict[str, str]:
     """Return a plain copy of a ``{name: name}`` map, refusing anything else."""
     if not isinstance(mapping, Mapping) or not all(
         isinstance(k, str) and k and isinstance(v, str) and v for k, v in mapping.items()
@@ -90,9 +90,9 @@ class Box:
         if not self.name:
             raise ValueError("A box needs a name.")
         where = f"Box {self.name!r}"
-        info = self.system._checked(f"{where}: the system in a box must be version 2.")
-        reads = _names_map(where, "reads", self.reads)
-        writes = _names_map(where, "writes", self.writes)
+        info = self.system.checked(f"{where}: the system in a box must be version 2.")
+        reads = names_map(where, "reads", self.reads)
+        writes = names_map(where, "writes", self.writes)
         inputs = sorted(self.system.inputs)
         if sorted(reads) != inputs:
             raise ValueError(f"{where}: reads must map exactly the inner inputs {inputs}, got {sorted(reads)}.")
@@ -104,7 +104,7 @@ class Box:
 
     def types(self) -> tuple[dict[str, ValueType], dict[str, ValueType]]:
         """Return the outer reads and writes, each with the type of its inner value: ``{outer: type}``."""
-        inner = self.system._checked().types
+        inner = self.system.checked().types
         reads = {outer: self.system.inputs[name] for name, outer in self.reads.items()}
         return reads, {outer: inner[name] for name, outer in self.writes.items()}
 

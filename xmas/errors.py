@@ -30,11 +30,11 @@ if TYPE_CHECKING:  # pragma: no cover
 try:  # openai 3.x and the MCP client raise httpx2's errors, which httpx's types do not match
     import httpx2
 except ImportError:  # pragma: no cover (httpx2 is optional here, not a dependency)
-    _HTTPX2_TIMEOUTS: tuple[type[BaseException], ...] = ()
-    _HTTPX2_OUTAGES: tuple[type[BaseException], ...] = ()
+    HTTPX2_TIMEOUTS: tuple[type[BaseException], ...] = ()
+    HTTPX2_OUTAGES: tuple[type[BaseException], ...] = ()
 else:
-    _HTTPX2_TIMEOUTS = (httpx2.TimeoutException,)
-    _HTTPX2_OUTAGES = (httpx2.TransportError,)
+    HTTPX2_TIMEOUTS = (httpx2.TimeoutException,)
+    HTTPX2_OUTAGES = (httpx2.TransportError,)
 
 
 class ErrorKind(enum.StrEnum):
@@ -83,7 +83,7 @@ class XmasError(RuntimeError):
 
     kind: ErrorKind = ErrorKind.UNKNOWN
     meta: CallMeta | None = None
-    _pickled: tuple[str, ...] = ("message", "status", "retry_after")
+    pickled: tuple[str, ...] = ("message", "status", "retry_after")
     """The constructor's arguments, as attributes (``message`` is the message), that a pickle keeps."""
 
     def __init__(self, message: str, status: int | None = None, retry_after: float | None = None) -> None:
@@ -94,7 +94,7 @@ class XmasError(RuntimeError):
 
     def __reduce__(self) -> tuple[Any, ...]:
         """Pickle by the constructor's arguments, which the message alone would lose."""
-        return type(self), tuple(str(self) if name == "message" else getattr(self, name) for name in self._pickled)
+        return type(self), tuple(str(self) if name == "message" else getattr(self, name) for name in self.pickled)
 
 
 class BudgetExceeded(XmasError):
@@ -110,7 +110,7 @@ class BudgetExceeded(XmasError):
     """
 
     kind = ErrorKind.BUDGET
-    _pickled = ("limit", "spent", "allowed", "calls")
+    pickled = ("limit", "spent", "allowed", "calls")
 
     def __init__(
         self, limit: Literal["cost_usd", "wall_s", "calls", "cost_unknown"], spent: float, allowed: float, calls: int
@@ -141,7 +141,7 @@ class Stopped(XmasError):
     """
 
     kind = ErrorKind.STOPPED
-    _pickled = ("reason", "meta", "text")
+    pickled = ("reason", "meta", "text")
 
     def __init__(self, reason: str = "stopped", meta: CallMeta | None = None, text: str = "") -> None:
         """Keep the reason as the message, and the cut call's meta and partial answer."""
@@ -175,7 +175,7 @@ class EmptyResponse(XmasError):
         kind: Why the answer was empty, such as ``LENGTH_CUT`` or ``REFUSAL``.
     """
 
-    _pickled = ("message", "kind", "meta")
+    pickled = ("message", "kind", "meta")
 
     def __init__(self, message: str, kind: ErrorKind = ErrorKind.UNKNOWN, meta: CallMeta | None = None) -> None:
         """Keep the message, the kind and the paid attempts' metadata."""
@@ -196,7 +196,7 @@ class BadFormat(XmasError):
     """
 
     kind = ErrorKind.BAD_FORMAT
-    _pickled = ("node", "problems", "meta")
+    pickled = ("node", "problems", "meta")
 
     def __init__(self, node: str, problems: tuple[str, ...], meta: CallMeta | None = None) -> None:
         """Build the message that names the node and every problem."""
@@ -216,7 +216,7 @@ MONEY_WORDS = re.compile(
 MODERATION_WORDS = re.compile(r"flagged|moderation", re.I)
 """Provider texts that mean a moderation filter refused the request."""
 
-_MAX_DEPTH = 8
+MAX_DEPTH = 8
 
 
 def classify(error: BaseException) -> ErrorKind:
@@ -246,17 +246,17 @@ def classify(error: BaseException) -> ErrorKind:
     queue: deque[tuple[BaseException, int]] = deque([(error, 0)])
     while queue:
         exc, depth = queue.popleft()
-        if id(exc) in seen or depth >= _MAX_DEPTH:
+        if id(exc) in seen or depth >= MAX_DEPTH:
             continue
         seen.add(id(exc))
-        kind = _own_kind(exc)
+        kind = own_kind(exc)
         if kind is not None:
             return kind
         queue.extend((linked, depth + 1) for linked in (exc.__cause__, exc.__context__) if linked is not None)
     return ErrorKind.UNKNOWN
 
 
-def _own_kind(exc: BaseException) -> ErrorKind | None:
+def own_kind(exc: BaseException) -> ErrorKind | None:
     """Return the kind of one exception by rules 0 to 5, or ``None`` if none matches."""
     if isinstance(exc, XmasError) and exc.status is not None:
         status_kind = kind_of_status(exc.status, str(exc))
@@ -269,9 +269,9 @@ def _own_kind(exc: BaseException) -> ErrorKind | None:
     if isinstance(exc, openai.APIStatusError):
         text = str(exc) if exc.body is None else f"{exc} {exc.body}"
         return kind_of_status(exc.status_code, text)
-    if isinstance(exc, (openai.APITimeoutError, TimeoutError, httpx.TimeoutException, *_HTTPX2_TIMEOUTS)):
+    if isinstance(exc, (openai.APITimeoutError, TimeoutError, httpx.TimeoutException, *HTTPX2_TIMEOUTS)):
         return ErrorKind.TIMEOUT
-    if isinstance(exc, (openai.APIConnectionError, ConnectionError, httpx.TransportError, *_HTTPX2_OUTAGES)):
+    if isinstance(exc, (openai.APIConnectionError, ConnectionError, httpx.TransportError, *HTTPX2_OUTAGES)):
         return ErrorKind.OUTAGE
     if isinstance(exc, pydantic.ValidationError | json.JSONDecodeError):
         return ErrorKind.BAD_FORMAT

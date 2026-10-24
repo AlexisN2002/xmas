@@ -111,10 +111,10 @@ def terminals(names: list[str], edges: Edges) -> list[str]:
 
 def cycles(names: list[str], edges: Edges) -> int:
     """Count the non-trivial strongly connected components among the agents."""
-    return sum(1 for component in nx.strongly_connected_components(_digraph(names, edges)) if len(component) > 1)
+    return sum(1 for component in nx.strongly_connected_components(digraph(names, edges)) if len(component) > 1)
 
 
-def _digraph(names: list[str], edges: Edges) -> nx.DiGraph[str]:
+def digraph(names: list[str], edges: Edges) -> nx.DiGraph[str]:
     graph: nx.DiGraph[str] = nx.DiGraph()
     graph.add_nodes_from(names)
     graph.add_edges_from(edges)
@@ -152,13 +152,13 @@ def mas_edges(names: list[str], edges: Edges, entry: str | None = None) -> Edges
     if not sources(names, edges):
         wiring = [(START, entry if entry in names else sorted(names)[0]), *wiring]
     if not terminals(names, edges):
-        wiring = [*wiring, (_exit_agent(names, wiring), END)]
+        wiring = [*wiring, (exit_agent(names, wiring), END)]
     return wiring
 
 
-def _exit_agent(names: list[str], wiring: Edges) -> str:
+def exit_agent(names: list[str], wiring: Edges) -> str:
     """Return the source of a cycle-closing edge of ``wiring``, else the last agent by name."""
-    closing = sorted(back_edges(_digraph([START, *names], wiring)))
+    closing = sorted(back_edges(digraph([START, *names], wiring)))
     return closing[0][0] if closing else sorted(names)[-1]
 
 
@@ -338,13 +338,13 @@ def mutate(
     for _ in range(3):
         current_names, current_edges = list(names), list(edges)
         for _ in range(max(1, operations)):
-            current_names, current_edges = _apply_one(current_names, current_edges, budget, rng, fixed)
+            current_names, current_edges = apply_one(current_names, current_edges, budget, rng, fixed)
         if is_valid(current_names, current_edges, budget, entry, fixed):
             return current_names, current_edges
     return list(names), list(edges)
 
 
-def _apply_one(
+def apply_one(
     names: list[str],
     edges: Edges,
     budget: TopologyBudget,
@@ -428,17 +428,17 @@ def repair(names: list[str], edges: Edges, budget: TopologyBudget, rng: random.R
     if they are done the other way round.
     """
     current = [(source, target) for source, target in edges if source != target]
-    terminal = _pick_terminal(names, current, rng)
+    terminal = pick_terminal(names, current, rng)
     current = [(source, target) for source, target in current if source != terminal]
 
     # Every other agent needs a way onward, and a way that ends at the terminal.
     for name in names:
         if name != terminal and not any(source == name for source, _ in current):
             current.append((name, terminal))
-    current = _connect_to_terminal(names, current, terminal)
+    current = connect_to_terminal(names, current, terminal)
 
     if budget.max_cycles == 0:
-        current = _break_cycles(names, current, terminal)
+        current = break_cycles(names, current, terminal)
 
     while len(current) > budget.max_edges:
         shorter = remove_edge(names, current, rng)
@@ -454,30 +454,30 @@ def repair(names: list[str], edges: Edges, budget: TopologyBudget, rng: random.R
     return sorted(set(current))
 
 
-def _pick_terminal(names: list[str], edges: Edges, rng: random.Random) -> str:
+def pick_terminal(names: list[str], edges: Edges, rng: random.Random) -> str:
     """Choose the one agent that will feed END, preferring an inherited terminal."""
     inherited = terminals(names, edges)
     return inherited[0] if inherited else rng.choice(sorted(names))
 
 
-def _connect_to_terminal(names: list[str], edges: Edges, terminal: str) -> Edges:
+def connect_to_terminal(names: list[str], edges: Edges, terminal: str) -> Edges:
     """Add edges until every agent has a path to the terminal."""
     current = list(edges)
     while True:
-        graph = _digraph(names, current)
+        graph = digraph(names, current)
         stranded = [name for name in names if name != terminal and not nx.has_path(graph, name, terminal)]
         if not stranded:
             return current
         current.append((stranded[0], terminal))
 
 
-def _break_cycles(names: list[str], edges: Edges, terminal: str) -> Edges:
+def break_cycles(names: list[str], edges: Edges, terminal: str) -> Edges:
     """Drop edges until the topology is acyclic, keeping the terminal reachable."""
     current = list(edges)
     while True:
         try:
-            cycle = nx.find_cycle(_digraph(names, current))
+            cycle = nx.find_cycle(digraph(names, current))
         except nx.NetworkXNoCycle:
-            return _connect_to_terminal(names, current, terminal)
+            return connect_to_terminal(names, current, terminal)
         source, target = cycle[-1][0], cycle[-1][1]
         current = [edge for edge in current if edge != (source, target)]

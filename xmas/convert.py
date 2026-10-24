@@ -17,16 +17,16 @@ from html.parser import HTMLParser
 from xmas.media import Document, Table, base_type
 from xmas.tools import tool
 
-_BLOCKS = frozenset({
+BLOCKS = frozenset({
     "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "figcaption", "footer", "h1", "h2",
     "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "td", "th",
     "title", "tr", "ul",
 })  # fmt: skip
-_HIDDEN = frozenset({"script", "style"})
-_DELIMITERS = {"text/csv": ",", "text/tab-separated-values": "\t"}
+HIDDEN = frozenset({"script", "style"})
+DELIMITERS = {"text/csv": ",", "text/tab-separated-values": "\t"}
 
 
-class _HTMLText(HTMLParser):
+class HTMLText(HTMLParser):
     """Collect an html page's text, one line per block, without scripts and styles."""
 
     def __init__(self) -> None:
@@ -35,15 +35,15 @@ class _HTMLText(HTMLParser):
         self.hidden = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:  # noqa: ARG002
-        if tag in _HIDDEN:
+        if tag in HIDDEN:
             self.hidden += 1
-        elif tag in _BLOCKS:
+        elif tag in BLOCKS:
             self.pieces.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in _HIDDEN:
+        if tag in HIDDEN:
             self.hidden = max(0, self.hidden - 1)
-        elif tag in _BLOCKS:
+        elif tag in BLOCKS:
             self.pieces.append("\n")
 
     def handle_data(self, data: str) -> None:
@@ -69,7 +69,7 @@ def document_text(source: Document) -> str:
     if media_type in ("text/plain", "text/markdown"):
         return source.read_bytes().decode("utf-8")
     if media_type == "text/html":
-        parser = _HTMLText()
+        parser = HTMLText()
         parser.feed(source.read_bytes().decode("utf-8"))
         parser.close()
         return parser.text()
@@ -85,7 +85,7 @@ def table_rows(table: Table) -> list[dict[str, str]]:
     Args:
         table: The table to read.
     """
-    delimiter = _DELIMITERS.get(base_type(table.media_type))
+    delimiter = DELIMITERS.get(base_type(table.media_type))
     if delimiter is None:
         raise ValueError(f"table_rows reads csv and tsv; convert {table.media_type} with a step of your own")
     reader = csv.DictReader(io.StringIO(table.read_bytes().decode("utf-8-sig"), newline=""), delimiter=delimiter)

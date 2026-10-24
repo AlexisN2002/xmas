@@ -51,7 +51,7 @@ PER_EXAMPLE_USD = 0.02
 STATUSES = ("pass", "fail", "skipped", "error")
 """How an example ended: its checks passed or failed, it was not run, or it could not run."""
 
-_PLACEHOLDER_TYPES = {"image": "image/png", "audio": "audio/wav", "document": "application/pdf", "table": "text/csv"}
+PLACEHOLDER_TYPES = {"image": "image/png", "audio": "audio/wav", "document": "application/pdf", "table": "text/csv"}
 
 
 class VerifyWarning(UserWarning):
@@ -96,7 +96,7 @@ class ExampleResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form."""
-        return _lists(asdict(self))
+        return lists(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -139,26 +139,27 @@ class VerifyReport:
 
     def lines(self) -> list[str]:
         """Return the report as lines: one block per level, then the verdict."""
-        lines = self._level0()
+        lines = self.level0()
         if self.level >= 1:
             count = len(self.problems)
             head = "no problems" if not count else f"{count} problem{'s' * (count > 1)}"
-            lines.append(f"level 1: {head}; {self._names()}")
+            lines.append(f"level 1: {head}; {self.names()}")
             lines += [f"  - {problem}" for problem in self.problems]
         if self.level >= 2:
             width = max((len(result.name) for result in self.examples), default=0)
             status = max((len(result.status) for result in self.examples), default=0)
             for result in self.examples:
-                cost = _usd(result.cost_usd)
+                cost = usd(result.cost_usd)
                 took = "<0.1 s" if result.latency_s < 0.1 else f"{result.latency_s:.1f} s"
                 lines.append(f"level 2: {result.name:<{width}}  {result.status:<{status}}  {cost}  {took}")
                 lines += [f"  - {failure}" for failure in result.failures]
                 lines += [f"  note: {note}" for note in result.notes]
             lines += [f"level 2: {note}" for note in self.notes]
-        lines.append(self._verdict())
+        lines.append(self.verdict())
         return lines
 
-    def _level0(self) -> list[str]:
+    def level0(self) -> list[str]:
+        """Return the level 0 lines: whether the bundle changed since its lock was saved."""
         if self.lock is None:
             return ["level 0: not saved: no lock"]
         if self.lock.clean and not self.unsaved:
@@ -166,7 +167,8 @@ class VerifyReport:
         found = [*asdict(self.lock).items(), ("in memory, not saved", self.unsaved)]
         return [f"level 0: {label.replace('_', ' ')}: {', '.join(paths)}" for label, paths in found if paths]
 
-    def _names(self) -> str:
+    def names(self) -> str:
+        """Return the line on whether the model names were checked, and against what."""
         catalogue = self.catalogue
         if catalogue is None or catalogue.ids is None:
             why = "" if catalogue is None else catalogue.note.removesuffix("; model names not checked")
@@ -174,9 +176,10 @@ class VerifyReport:
         tail = f" ({catalogue.note})" if catalogue.note else ""
         return f"model names checked against the {catalogue.source} catalogue{tail}"
 
-    def _verdict(self) -> str:
+    def verdict(self) -> str:
+        """Return the one-line verdict: ok or not, the examples passed and the cost."""
         counts = {status: sum(r.status == status for r in self.examples) for status in STATUSES}
-        cost = _usd(self.cost_usd)
+        cost = usd(self.cost_usd)
         tally = ", ".join(f"{n} {status}" for status, n in counts.items() if n and status != "pass")
         examples = f"{counts['pass']} example{'s' * (counts['pass'] != 1)} passed" + (f", {tally}" if tally else "")
         if self.ok:
@@ -195,7 +198,7 @@ class VerifyReport:
             "ok": self.ok,
             "level": self.level,
             "bundle": None if self.bundle is None else str(self.bundle),
-            "lock": None if self.lock is None else _lists(asdict(self.lock)),
+            "lock": None if self.lock is None else lists(asdict(self.lock)),
             "digest": self.digest,
             "files": self.files,
             "unsaved": list(self.unsaved),
@@ -219,11 +222,11 @@ class VerifyReport:
         return "\n".join(self.lines())
 
 
-def _usd(cost: float | None) -> str:
+def usd(cost: float | None) -> str:
     return "cost unknown" if cost is None else f"{cost:.4f} USD"
 
 
-def _lists(data: dict[str, Any]) -> dict[str, Any]:
+def lists(data: dict[str, Any]) -> dict[str, Any]:
     return {key: list(value) if isinstance(value, tuple) else value for key, value in data.items()}
 
 
@@ -266,7 +269,7 @@ def verify(
     catalogue = None
     wanted = set(only)
     if level >= 1:
-        parsed, problems, misses, catalogue = _level1(mas, _sources(examples, bundle, files), config)
+        parsed, problems, misses, catalogue = level1(mas, sources(examples, bundle, files), config)
         named = {name for file in parsed for example in file.examples for name in (example.name, example.node)}
         problems += [f"only names no example or node: {name!r}" for name in sorted(wanted - named)]
     results: tuple[ExampleResult, ...] = ()
@@ -275,12 +278,12 @@ def verify(
     if level == 2 and problems:
         notes = ("not run: level 1 found problems",)
     elif level == 2:
-        results, cost = _level2(mas, parsed, wanted, budget)
+        results, cost = level2(mas, parsed, wanted, budget)
         notes = () if results else ("no examples to run",)
     report = VerifyReport(
         level,
         bundle,
-        **_level0(mas, files),
+        **level0(mas, files),
         problems=tuple(problems),
         misses=misses,
         catalogue=catalogue,
@@ -295,7 +298,7 @@ def verify(
     return report
 
 
-def _level0(mas: MAS, files: Mapping[str, bytes]) -> dict[str, Any]:
+def level0(mas: MAS, files: Mapping[str, bytes]) -> dict[str, Any]:
     """Compare the bundle's files with its lock, and the system in memory with the files."""
     if LOCK not in files:
         return {}
@@ -308,7 +311,7 @@ def _level0(mas: MAS, files: Mapping[str, bytes]) -> dict[str, Any]:
     return found if saved is None else {**found, "digest": saved.bundle[:16], "files": len(saved.files)}
 
 
-def _sources(
+def sources(
     examples: str | Path | None, bundle: Path | None, files: Mapping[str, bytes]
 ) -> tuple[dict[str, bytes], Path | None]:
     """Return the examples files keyed by their paths in a bundle, and the folder their media paths start from."""
@@ -328,7 +331,7 @@ def _sources(
     return {item.relative_to(root).as_posix(): item.read_bytes() for item in inside}, root
 
 
-def _level1(
+def level1(
     mas: MAS, sources: tuple[dict[str, bytes], Path | None], config: Config | None
 ) -> tuple[list[ExampleFile], list[str], dict[str, tuple[str, ...]], Catalogue]:
     """Check the system, read the examples, render every prompt and look up every model name; no model call."""
@@ -342,10 +345,10 @@ def _level1(
     parsed = parse_examples(*sources, problems=problems)
     cases = [example for file in parsed for example in file.examples]
     for example in cases:
-        problems += [f"example {example.name!r}: {line}" for line in _case_problems(mas, example)]
+        problems += [f"example {example.name!r}: {line}" for line in case_problems(mas, example)]
     found = list(problems)  # a form the check refused already is not named twice
-    problems += [line for line in _render_problems(mas, cases) if not any(line.partition(": ")[2] in f for f in found)]
-    names = _model_names(mas)
+    problems += [line for line in render_problems(mas, cases) if not any(line.partition(": ")[2] in f for f in found)]
+    names = model_names(mas)
     if not names:
         return parsed, problems, {}, Catalogue(None, "none", "no model is named")
     config = Config.load() if config is None else config
@@ -354,14 +357,14 @@ def _level1(
     return parsed, problems, dict(resolution.suggestions), resolution.catalogue
 
 
-def _case_problems(mas: MAS, example: Example) -> list[str]:
+def case_problems(mas: MAS, example: Example) -> list[str]:
     """Return what does not fit in a case: its node, its inputs, its recorded writes, its check paths."""
     if example.node is None:
         lines = [f"input {name!r} is missing" for name in mas.inputs if name not in example.inputs]
-        lines += _fit(example.inputs, mas.inputs, "input")
+        lines += fit(example.inputs, mas.inputs, "input")
         for key, checks in example.expect.items():
             if key in mas.outputs:
-                lines += _paths(checks, {key: mas.outputs[key]}, f"output {key!r}")
+                lines += paths(checks, {key: mas.outputs[key]}, f"output {key!r}")
                 lines += [
                     f"{check}: form judges a node's answer, and {key!r} is an output"
                     for check in checks
@@ -373,7 +376,7 @@ def _case_problems(mas: MAS, example: Example) -> list[str]:
             except ValueError:
                 lines.append(f"expect names {key!r}, which is no output or node of the system")
                 continue
-            lines += _paths(checks, node_types(system, system.nodes[key])[1], f"node {key!r}")
+            lines += paths(checks, node_types(system, system.nodes[key])[1], f"node {key!r}")
         return lines
     try:
         system = node_owner(mas, example.node)
@@ -383,17 +386,17 @@ def _case_problems(mas: MAS, example: Example) -> list[str]:
     if isinstance(node, Human):
         return [f"node {example.node!r} is a human node: it asks a person and takes no example"]
     reads, writes = node_types(system, node)
-    lines = _fit(example.inputs, reads, "read")
+    lines = fit(example.inputs, reads, "read")
     if example.recorded is not UNSET:
         recorded = example.recorded if len(writes) != 1 else {next(iter(writes)): example.recorded}
         if not isinstance(recorded, Mapping):
             lines.append(f"recorded holds the writes {sorted(writes)} as a mapping, got {recorded!r}")
         else:
-            lines += [f"recorded {line}" for line in _fit(recorded, writes, "write")]
-    return lines + _paths(example.must, writes, f"node {example.node!r}")
+            lines += [f"recorded {line}" for line in fit(recorded, writes, "write")]
+    return lines + paths(example.must, writes, f"node {example.node!r}")
 
 
-def _fit(values: Mapping[str, Any], types: Mapping[str, ValueType], word: str) -> list[str]:
+def fit(values: Mapping[str, Any], types: Mapping[str, ValueType], word: str) -> list[str]:
     """Return a line per value that is not one of ``types``, or does not fit its type."""
     lines = [f"{name!r} is no {word}; the {word}s are {sorted(types)}" for name in values if name not in types]
     return lines + [
@@ -403,7 +406,7 @@ def _fit(values: Mapping[str, Any], types: Mapping[str, ValueType], word: str) -
     ]
 
 
-def _paths(checks: Iterable[Check], writes: Mapping[str, ValueType], what: str) -> list[str]:
+def paths(checks: Iterable[Check], writes: Mapping[str, ValueType], what: str) -> list[str]:
     """Return a line per check whose path starts at no value ``what`` writes."""
     return [
         f"{check}: {what} writes {sorted(writes)}, not {check.path[0]!r}"
@@ -412,7 +415,7 @@ def _paths(checks: Iterable[Check], writes: Mapping[str, ValueType], what: str) 
     ]
 
 
-def _render_problems(mas: MAS, cases: Iterable[Example]) -> list[str]:
+def render_problems(mas: MAS, cases: Iterable[Example]) -> list[str]:
     """Render every agent's prompt on empty values and on its cases' inputs, and compile its answer form."""
     inputs: dict[str, list[Mapping[str, Any]]] = {}
     for example in cases:
@@ -423,8 +426,8 @@ def _render_problems(mas: MAS, cases: Iterable[Example]) -> list[str]:
         for agent in system.agents.values():
             owner = node_owner(system, agent.name)
             types = owner.info.types if owner.info is not None else {}
-            reads, _writes = node_types(owner, agent)
-            trials: list[Mapping[str, Any]] = [{name: _empty(vtype) for name, vtype in reads.items()}]
+            reads, _ = node_types(owner, agent)
+            trials: list[Mapping[str, Any]] = [{name: empty(vtype) for name, vtype in reads.items()}]
             trials += inputs.get(agent.name, []) if system is mas else []
             try:
                 for values in trials:
@@ -436,16 +439,16 @@ def _render_problems(mas: MAS, cases: Iterable[Example]) -> list[str]:
     return lines
 
 
-def _empty(vtype: ValueType) -> Any:
+def empty(vtype: ValueType) -> Any:
     """Return a placeholder value of a type: ``""`` for text, ``{}`` for json, a ref to nothing for media."""
     kind = media_kind(vtype)
     if kind is not None:
-        ref = Ref(f"example.{kind}", _PLACEHOLDER_TYPES.get(kind, "application/octet-stream"))
+        ref = Ref(f"example.{kind}", PLACEHOLDER_TYPES.get(kind, "application/octet-stream"))
         return [ref] if vtype.item is not None else ref
     return [] if vtype.item is not None else "" if vtype == TEXT else {}
 
 
-def _model_names(mas: MAS) -> dict[str, str]:
+def model_names(mas: MAS) -> dict[str, str]:
     """Return each catalogue id the agents bind, at every depth, with who binds it: ``{id: "agents a, b"}``."""
     bound: dict[str, list[str]] = {}
     for _, system in systems(mas):
@@ -457,7 +460,7 @@ def _model_names(mas: MAS) -> dict[str, str]:
     return {model_id: f"agent{'s' * (len(who) > 1)} {', '.join(who)}" for model_id, who in bound.items()}
 
 
-def _level2(
+def level2(
     mas: MAS, parsed: list[ExampleFile], wanted: set[str], budget: Budget | float | None
 ) -> tuple[tuple[ExampleResult, ...], float | None]:
     """Run the examples in file order under the budget; return their results and what they cost together."""
@@ -484,13 +487,13 @@ def _level2(
                 max_calls=limits.max_calls,
                 max_parallel_calls=limits.max_parallel_calls,
             )
-            result = _run(mas, example, cap)
+            result = run(mas, example, cap)
             results.append(result)
             spent = None if spent is None or result.cost_usd is None else spent + result.cost_usd
     return tuple(results), spent
 
 
-def _run(mas: MAS, example: Example, cap: Budget) -> ExampleResult:
+def run(mas: MAS, example: Example, cap: Budget) -> ExampleResult:
     """Run one example under ``cap`` and judge it."""
     started = time.perf_counter()
     try:
@@ -504,7 +507,7 @@ def _run(mas: MAS, example: Example, cap: Budget) -> ExampleResult:
         return ExampleResult(example.name, example.node, "error", (str(error),), 0.0, time.perf_counter() - started)
     took = time.perf_counter() - started
     cost = trace.cost_usd if trace.records else 0.0
-    failures = _failures(mas, example, trace)
+    failures = example_failures(mas, example, trace)
     if cost is None:
         failures.append("cost_unknown: a call reported no cost and its model has no price, so the cap cannot bind")
     notes = tuple(
@@ -515,7 +518,7 @@ def _run(mas: MAS, example: Example, cap: Budget) -> ExampleResult:
     return ExampleResult(example.name, example.node, "fail" if failures else "pass", tuple(failures), cost, took, notes)
 
 
-def _failures(mas: MAS, example: Example, trace: Trace) -> list[str]:
+def example_failures(mas: MAS, example: Example, trace: Trace) -> list[str]:
     """Return what failed in an example's trace: the run's error, else the checks that did not hold."""
     if trace.pause is not None:
         return ["the run paused on a question: examples run without people"]

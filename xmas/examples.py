@@ -51,24 +51,24 @@ if TYPE_CHECKING:  # pragma: no cover
 VERSION = 1
 FOLDER = "examples"
 MEDIA = "examples/media"
-_FILE_KEYS = ("version", "budget", "examples")
-_CASE_KEYS = ("name", "node", "from", "inputs", "recorded", "must", "expect")
-_BUDGET_KEYS = {"cost_usd": "max_cost_usd", "wall_s": "max_wall_s"}
-_PER_EXAMPLE = "per example"
-_REF_KEYS = frozenset(item.name for item in fields(Ref))
-_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
-_PATH = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*)\Z")
-_STEP = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]")
+FILE_KEYS = ("version", "budget", "examples")
+CASE_KEYS = ("name", "node", "from", "inputs", "recorded", "must", "expect")
+BUDGET_KEYS = {"cost_usd": "max_cost_usd", "wall_s": "max_wall_s"}
+PER_EXAMPLE = "per example"
+REF_KEYS = frozenset(item.name for item in fields(Ref))
+NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+PATH = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*)\Z")
+STEP = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]")
 
 
-class _Unset:
+class Unset:
     pass
 
 
-UNSET = _Unset()
+UNSET = Unset()
 """What :attr:`Example.recorded` holds when the case records no reference."""
 
-_MISSING = object()
+MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -104,13 +104,13 @@ class Check:
         if len(kinds) != 1:
             raise ValueError(f"{where}: a check holds one kind, got {kinds or 'none'}")
         kind, value = kinds[0], spec[kinds[0]]
-        path = _parse_path(spec["path"], where) if "path" in spec else ()
+        path = parse_path(spec["path"], where) if "path" in spec else ()
         within = spec.get("within")
         if (within is not None) != (kind == "near"):
             raise ValueError(f"{where}: 'within' goes with 'near', and 'near' needs it")
-        if kind == "near" and ((number := _number(within)) is None or number < 0):
+        if kind == "near" and ((number := as_number(within)) is None or number < 0):
             raise ValueError(f"{where}: within is a number of at least 0, got {within!r}")
-        if kind == "near" and _number(value) is None and not isinstance(value, str):
+        if kind == "near" and as_number(value) is None and not isinstance(value, str):
             raise ValueError(f"{where}: near takes a number or a text, got {value!r}")
         problem = {
             "form": value != "valid" and "form takes 'valid'",
@@ -118,7 +118,7 @@ class Check:
             "exists": value is not True and "exists takes true",
             "len": (isinstance(value, bool) or not isinstance(value, int) or value < 0) and "len takes a count",
             "line": not isinstance(value, str) and "line takes a text",
-            "matches": _pattern_problem(value),
+            "matches": pattern_problem(value),
         }.get(kind)
         if problem:
             raise ValueError(f"{where}: {problem}, got {value!r}")
@@ -126,7 +126,7 @@ class Check:
 
     def to_spec(self) -> dict[str, Any]:
         """Return the mapping :meth:`parse` reads."""
-        spec: dict[str, Any] = {"path": _path_text(self.path)} if self.path else {}
+        spec: dict[str, Any] = {"path": path_text(self.path)} if self.path else {}
         spec[self.kind] = self.value
         if self.within is not None:
             spec["within"] = self.within
@@ -136,8 +136,8 @@ class Check:
         """Return the check as one line, such as ``verdict.fits equals false``."""
         tail = f" within {self.within:g}" if self.within is not None else ""
         bare = self.kind in ("not empty", "exists")
-        shown = " valid" if self.kind == "form" else "" if bare else f" {_show(self.value)}"
-        return f"{_path_text(self.path) + ' ' if self.path else ''}{self.kind}{shown}{tail}"
+        shown = " valid" if self.kind == "form" else "" if bare else f" {show(self.value)}"
+        return f"{path_text(self.path) + ' ' if self.path else ''}{self.kind}{shown}{tail}"
 
 
 @dataclass(frozen=True)
@@ -197,7 +197,7 @@ def parse_examples(
     seen: dict[str, str] = {}
     for path in sorted(path for path in files if re.fullmatch(rf"{FOLDER}/[^/]+\.yaml", path)):
         try:
-            examples, budgets = _file(read_yaml(files, path), path, files, root, problems)
+            examples, budgets = file(read_yaml(files, path), path, files, root, problems)
         except (ValueError, TypeError) as error:  # a file that is no YAML is named by its own message
             problems.append(str(error) if str(error).startswith(path) else f"{path}: {error}")
             continue
@@ -211,62 +211,62 @@ def parse_examples(
     return parsed
 
 
-def _file(
+def file(
     data: Any, path: str, files: Mapping[str, bytes], root: Path | None, problems: list[str]
 ) -> tuple[list[Example], tuple[Budget | None, Budget | None]]:
     """Read one file's mapping; a bad case adds its problem and is left out."""
     if not isinstance(data, Mapping):
-        raise ValueError(f"an examples file is a mapping with {', '.join(_FILE_KEYS)}")
-    _known(data, _FILE_KEYS, "the file")
+        raise ValueError(f"an examples file is a mapping with {', '.join(FILE_KEYS)}")
+    known(data, FILE_KEYS, "the file")
     if data.get("version") != VERSION:
         raise ValueError(f"version is {VERSION}, got {data.get('version')!r}")
-    budgets = _budgets(data.get("budget"))
+    budgets = read_budgets(data.get("budget"))
     cases = data.get("examples")
     if not isinstance(cases, list):
         raise ValueError("examples is a list of cases")
     examples = []
     for index, case in enumerate(cases):
         try:
-            examples.append(_case(case, path, index, files, root))
+            examples.append(read_case(case, path, index, files, root))
         except ValueError as error:
             problems.append(str(error))
     return examples, budgets
 
 
-def _known(data: Mapping[Any, Any], keys: Sequence[str], where: str) -> None:
+def known(data: Mapping[Any, Any], keys: Sequence[str], where: str) -> None:
     unknown = [str(key) for key in data if key not in keys]
     if unknown:
         raise ValueError(f"{where} takes {', '.join(keys)}; unknown: {', '.join(unknown)} (a note goes in a # comment)")
 
 
-def _budgets(spec: Any) -> tuple[Budget | None, Budget | None]:
+def read_budgets(spec: Any) -> tuple[Budget | None, Budget | None]:
     if spec is None:
         return None, None
     if not isinstance(spec, Mapping):
         raise ValueError(f"budget is a mapping such as {{cost_usd: 0.03}}, got {spec!r}")
-    _known(spec, [*_BUDGET_KEYS, _PER_EXAMPLE], "budget")
-    per = spec.get(_PER_EXAMPLE)
+    known(spec, [*BUDGET_KEYS, PER_EXAMPLE], "budget")
+    per = spec.get(PER_EXAMPLE)
     if per is not None and not isinstance(per, Mapping):
         raise ValueError(f"budget.per example is a mapping such as {{cost_usd: 0.015}}, got {per!r}")
     if per is not None:
-        _known(per, list(_BUDGET_KEYS), "budget.per example")
-    total = _caps(spec)
-    return Budget(**total) if total else None, None if per is None else Budget(**_caps(per))
+        known(per, list(BUDGET_KEYS), "budget.per example")
+    total = caps(spec)
+    return Budget(**total) if total else None, None if per is None else Budget(**caps(per))
 
 
-def _caps(spec: Mapping[str, Any]) -> dict[str, Any]:
-    return {_BUDGET_KEYS[key]: value for key, value in spec.items() if key in _BUDGET_KEYS}
+def caps(spec: Mapping[str, Any]) -> dict[str, Any]:
+    return {BUDGET_KEYS[key]: value for key, value in spec.items() if key in BUDGET_KEYS}
 
 
-def _case(case: Any, path: str, index: int, files: Mapping[str, bytes], root: Path | None) -> Example:
+def read_case(case: Any, path: str, index: int, files: Mapping[str, bytes], root: Path | None) -> Example:
     where = f"{path}: example {index + 1}"
     if not isinstance(case, Mapping):
-        raise ValueError(f"{where}: a case is a mapping with {', '.join(_CASE_KEYS)}")
+        raise ValueError(f"{where}: a case is a mapping with {', '.join(CASE_KEYS)}")
     name = case.get("name")
-    if not isinstance(name, str) or not _NAME.match(name):
+    if not isinstance(name, str) or not NAME.match(name):
         raise ValueError(f"{where}: name is a word of letters, digits, '_', '.' and '-', got {name!r}")
     where = f"{path}: example {name!r}"
-    _known(case, _CASE_KEYS, where)
+    known(case, CASE_KEYS, where)
     node = case.get("node")
     if node is not None and not isinstance(node, str):
         raise ValueError(f"{where}: node is a node's name, got {node!r}")
@@ -285,7 +285,7 @@ def _case(case: Any, path: str, index: int, files: Mapping[str, bytes], root: Pa
     expect = case.get("expect", {})
     if not isinstance(expect, Mapping) or not all(isinstance(checks, list) for checks in expect.values()):
         raise ValueError(f"{where}: expect maps an output or a node to a list of checks")
-    media = _Media(files, root, where)
+    media = Media(files, root, where)
     return Example(
         name=name,
         inputs={key: media.load(value) for key, value in inputs.items()},
@@ -301,7 +301,7 @@ def _case(case: Any, path: str, index: int, files: Mapping[str, bytes], root: Pa
 
 
 @dataclass(frozen=True)
-class _Media:
+class Media:
     """Where a case's media come from: the bundle's files, else its folder."""
 
     files: Mapping[str, bytes]
@@ -310,11 +310,11 @@ class _Media:
 
     def load(self, value: Any) -> Any:
         """Return ``value`` with each ref mapping in it, at any depth, as a :class:`~xmas.media.Ref`."""
-        if isinstance(value, Mapping) and {"location", "media_type"} <= set(value) <= _REF_KEYS:
-            return self._ref(value)
-        return _each(value, self.load)
+        if isinstance(value, Mapping) and {"location", "media_type"} <= set(value) <= REF_KEYS:
+            return self.ref(value)
+        return each(value, self.load)
 
-    def _ref(self, spec: Mapping[str, Any]) -> Ref:
+    def ref(self, spec: Mapping[str, Any]) -> Ref:
         try:
             given = Ref.from_dict(spec)
         except ValueError as error:
@@ -336,20 +336,20 @@ class _Media:
         return ref
 
 
-def _parse_path(text: Any, where: str) -> tuple[str | int, ...]:
+def parse_path(text: Any, where: str) -> tuple[str | int, ...]:
     """Read ``verdict.orders[0].kind`` into ``("verdict", "orders", 0, "kind")``."""
-    match = _PATH.match(text) if isinstance(text, str) else None
+    match = PATH.match(text) if isinstance(text, str) else None
     if match is None:
         raise ValueError(f"{where}: path is a value name, then .field or [i] steps, got {text!r}")
-    steps = [name if name else int(index) for name, index in _STEP.findall(match.group(2))]
+    steps = [name if name else int(index) for name, index in STEP.findall(match.group(2))]
     return (match.group(1), *steps)
 
 
-def _path_text(path: Sequence[str | int]) -> str:
+def path_text(path: Sequence[str | int]) -> str:
     return "".join(f"[{step}]" if isinstance(step, int) else f".{step}" if i else step for i, step in enumerate(path))
 
 
-def _pattern_problem(value: Any) -> str | None:
+def pattern_problem(value: Any) -> str | None:
     if not isinstance(value, str):
         return "matches takes a regular expression"
     try:
@@ -359,50 +359,50 @@ def _pattern_problem(value: Any) -> str | None:
     return None
 
 
-def _number(value: Any) -> float | None:
+def as_number(value: Any) -> float | None:
     return None if isinstance(value, bool) or not isinstance(value, int | float) else float(value)
 
 
-def _show(value: Any) -> str:
+def show(value: Any) -> str:
     text = json.dumps(plain(value), ensure_ascii=False, default=str)
     return text if len(text) <= 80 else f"{text[:77]}..."
 
 
-def _same(left: Any, right: Any) -> bool:
+def same(left: Any, right: Any) -> bool:
     """Whether two values are equal: refs by their bytes' sha256, a bool only to a bool."""
     if isinstance(left, Ref) or isinstance(right, Ref):
-        return isinstance(left, Ref) and isinstance(right, Ref) and _digest(left) == _digest(right)
+        return isinstance(left, Ref) and isinstance(right, Ref) and digest(left) == digest(right)
     if isinstance(left, bool) or isinstance(right, bool):
         return type(left) is type(right) and left == right
     if isinstance(left, Mapping) and isinstance(right, Mapping):
-        return left.keys() == right.keys() and all(_same(left[key], right[key]) for key in left)
+        return left.keys() == right.keys() and all(same(left[key], right[key]) for key in left)
     if isinstance(left, list | tuple) and isinstance(right, list | tuple):
-        return len(left) == len(right) and all(_same(a, b) for a, b in zip(left, right, strict=True))
+        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right, strict=True))
     return bool(left == right)
 
 
-def _digest(ref: Ref) -> str:
+def digest(ref: Ref) -> str:
     return ref.sha256 or hashlib.sha256(ref.read_bytes()).hexdigest()
 
 
-def _find(values: Mapping[str, Any], path: tuple[str | int, ...]) -> tuple[Any, str]:
-    """Return the value at ``path``, or :data:`_MISSING` with why."""
+def find(values: Mapping[str, Any], path: tuple[str | int, ...]) -> tuple[Any, str]:
+    """Return the value at ``path``, or :data:`MISSING` with why."""
     if not path:
-        return _one_or_all(values), ""
+        return one_or_all(values), ""
     head = str(path[0])
     if head not in values:
-        return _MISSING, f"no value {head!r}; there are {sorted(values)}"
+        return MISSING, f"no value {head!r}; there are {sorted(values)}"
     found = values[head]
     for step in path[1:]:
         listed = isinstance(step, int) and isinstance(found, list) and step < len(found)
         if listed or (isinstance(step, str) and isinstance(found, Mapping) and step in found):
             found = found[step]
         else:
-            return _MISSING, f"nothing at {_path_text(path)}"
+            return MISSING, f"nothing at {path_text(path)}"
     return found, ""
 
 
-def _one_or_all(values: Mapping[str, Any]) -> Any:
+def one_or_all(values: Mapping[str, Any]) -> Any:
     return next(iter(values.values())) if len(values) == 1 else dict(values)
 
 
@@ -414,68 +414,66 @@ def run_checks(checks: Sequence[Check], values: Mapping[str, Any], record: Agent
     """
     failed = []
     for check in checks:
-        found, why = _find(values, check.path)
-        problem = _JUDGES[check.kind](found, check, record) if found is not _MISSING else why
+        found, why = find(values, check.path)
+        problem = JUDGES[check.kind](found, check, record) if found is not MISSING else why
         if problem:
             failed.append(f"{check}: {problem}")
     return failed
 
 
-def _contains(found: Any, want: Any, wanted: bool) -> str | None:
+def contains(found: Any, want: Any, wanted: bool) -> str | None:
     if isinstance(found, str) and isinstance(want, str):
         held = want in found
     elif isinstance(found, list):
-        held = any(_same(item, want) for item in found)
+        held = any(same(item, want) for item in found)
     else:
-        return f"got {_show(found)}, not a text or a list"
-    return None if held == wanted else f"got {_show(found)}"
+        return f"got {show(found)}, not a text or a list"
+    return None if held == wanted else f"got {show(found)}"
 
 
-def _length(found: Any, want: int) -> str | None:
+def length(found: Any, want: int) -> str | None:
     if not isinstance(found, str | list | Mapping):
-        return f"got {_show(found)}, which has no length"
+        return f"got {show(found)}, which has no length"
     return None if len(found) == want else f"has length {len(found)}"
 
 
-def _in_text(found: Any, held: Callable[[str], bool], miss: str = "got") -> str | None:
+def in_text(found: Any, held: Callable[[str], bool], miss: str = "got") -> str | None:
     if not isinstance(found, str):
-        return f"got {_show(found)}, not a text"
-    return None if held(found) else f"{miss} {_show(found)}"
+        return f"got {show(found)}, not a text"
+    return None if held(found) else f"{miss} {show(found)}"
 
 
-def _near(found: Any, want: Any, within: float) -> str | None:
+def near(found: Any, want: Any, within: float) -> str | None:
     """Judge ``near``: numbers by their distance, texts by their share of difference."""
-    if _number(want) is not None:
-        number = _number(found)
+    if as_number(want) is not None:
+        number = as_number(found)
         if number is None:
-            return f"got {_show(found)}, not a number"
+            return f"got {show(found)}, not a number"
         off = abs(number - float(want))
     elif isinstance(found, str):
         off = 1 - difflib.SequenceMatcher(None, found, want).ratio()
     else:
-        return f"got {_show(found)}, not a text"
-    return None if off <= within else f"got {_show(found)}, off by {off:.3g}"
+        return f"got {show(found)}, not a text"
+    return None if off <= within else f"got {show(found)}, off by {off:.3g}"
 
 
-_JUDGES: dict[str, Callable[[Any, Check, AgentRecord | None], str | None]] = {
-    "form": lambda _found, _check, record: "no visit to judge" if record is None else record.error,
-    "equals": lambda found, check, _record: None if _same(found, check.value) else f"got {_show(found)}",
-    "contains": lambda found, check, _record: _contains(found, check.value, True),
-    "not contains": lambda found, check, _record: _contains(found, check.value, False),
-    "matches": lambda found, check, _record: _in_text(found, lambda text: bool(re.search(check.value, text, re.M))),
-    "line": lambda found, check, _record: _in_text(
-        found, lambda text: check.value in text.splitlines(), "no such line in"
-    ),
-    "len": lambda found, check, _record: _length(found, check.value),
-    "not empty": lambda found, _check, _record: "empty" if found is None or found in ("", [], {}) else None,
-    "exists": lambda found, _check, _record: "absent" if found is None else None,
-    "near": lambda found, check, _record: _near(found, check.value, float(check.within or 0)),
+JUDGES: dict[str, Callable[[Any, Check, AgentRecord | None], str | None]] = {
+    "form": lambda found, check, record: "no visit to judge" if record is None else record.error,  # noqa: ARG005 (one signature for every kind)
+    "equals": lambda found, check, *_: None if same(found, check.value) else f"got {show(found)}",
+    "contains": lambda found, check, *_: contains(found, check.value, True),
+    "not contains": lambda found, check, *_: contains(found, check.value, False),
+    "matches": lambda found, check, *_: in_text(found, lambda text: bool(re.search(check.value, text, re.M))),
+    "line": lambda found, check, *_: in_text(found, lambda text: check.value in text.splitlines(), "no such line in"),
+    "len": lambda found, check, *_: length(found, check.value),
+    "not empty": lambda found, *_: "empty" if found is None or found in ("", [], {}) else None,
+    "exists": lambda found, *_: "absent" if found is None else None,
+    "near": lambda found, check, *_: near(found, check.value, float(check.within or 0)),
 }
-CHECK_KINDS = tuple(_JUDGES)
+CHECK_KINDS = tuple(JUDGES)
 """The kinds of check, one per check mapping."""
 
 
-def _parse_rendered(text: str, vtype: ValueType) -> Any:
+def parse_rendered(text: str, vtype: ValueType) -> Any:
     """Return a value from the line a record shows for it (:func:`~xmas.values.render_value`'s inverse)."""
     if vtype == TEXT:
         return text
@@ -489,9 +487,9 @@ def _parse_rendered(text: str, vtype: ValueType) -> Any:
 
 def written(system: MAS, name: str, record: AgentRecord) -> dict[str, Any]:
     """Return the writes of a node's visit, typed from the record's rendered outputs."""
-    _reads, writes = node_types(system, system.nodes[name])
+    _, writes = node_types(system, system.nodes[name])
     return {
-        value: _parse_rendered(record.outputs[value], vtype)
+        value: parse_rendered(record.outputs[value], vtype)
         for value, vtype in writes.items()
         if value in record.outputs
     }
@@ -532,27 +530,27 @@ def cases_from_trace(mas: MAS, trace: Trace, nodes: Sequence[str] | None, store_
         node = system.nodes[name]
         if not isinstance(node, Agent | Step):
             raise ValueError(f"node {name!r} is no agent or step: only those are recorded")
-        reads, _writes = node_types(system, node)
+        reads, _ = node_types(system, node)
         shown = (
             {node.reads[key]: text for key, text in record.inputs.items()} if isinstance(node, Agent) else record.inputs
         )
         inputs = {
-            value: _spec(_parse_rendered(text, reads[value]), store_dir)
+            value: spec(parse_rendered(text, reads[value]), store_dir)
             for value, text in shown.items()
             if value in reads and value != "run" and text != ""
         }
         case: dict[str, Any] = {"name": name, "node": name}
         if trace.run_id is not None:
             case["from"] = f"trace {trace.run_id[:8]}, record {record.step}"
-        case.update(inputs=inputs, recorded=_spec(_one_or_all(written(system, name, record)), store_dir))
-        must = _default_checks(node)
+        case.update(inputs=inputs, recorded=spec(one_or_all(written(system, name, record)), store_dir))
+        must = default_checks(node)
         if must:
             case["must"] = [check.to_spec() for check in must]
         cases.append(case)
     return cases
 
 
-def _default_checks(node: Agent | Step) -> list[Check]:
+def default_checks(node: Agent | Step) -> list[Check]:
     """Return a recorded node's checks: a json agent's form and its fields, a text agent's non-empty answer."""
     if isinstance(node, Step):
         return []
@@ -564,10 +562,10 @@ def _default_checks(node: Agent | Step) -> list[Check]:
     return [Check("form", value="valid")]
 
 
-def _spec(value: Any, store_dir: Path) -> Any:
+def spec(value: Any, store_dir: Path) -> Any:
     """Return ``value`` as an examples file writes it, each ref's bytes copied into ``store_dir``."""
     if not isinstance(value, Ref):
-        return _each(value, lambda item: _spec(item, store_dir))
+        return each(value, lambda item: spec(item, store_dir))
     data = value.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     target = store_dir / f"{digest[:16]}{'' if value.remote else PurePosixPath(value.name).suffix.lower()}"
@@ -575,15 +573,15 @@ def _spec(value: Any, store_dir: Path) -> Any:
     return {"location": f"{MEDIA}/{target.name}", "media_type": value.media_type, "sha256": digest}
 
 
-def _each(value: Any, do: Callable[[Any], Any]) -> Any:
+def each(value: Any, do: Callable[[Any], Any]) -> Any:
     if isinstance(value, Mapping):
         return {key: do(item) for key, item in value.items()}
     return [do(item) for item in value] if isinstance(value, list) else value
 
 
-def _write_cases(folder: Path, file: str, cases: Sequence[Mapping[str, Any]]) -> None:
+def write_cases(folder: Path, file: str, cases: Sequence[Mapping[str, Any]]) -> None:
     """Put ``cases`` into ``folder/examples/<file>.yaml``, each replacing its namesake, once the result parses."""
-    if not _NAME.match(file):
+    if not NAME.match(file):
         raise ValueError(f"an examples file is named by a plain word, got {file!r}")
     relative = f"{FOLDER}/{file}.yaml"
     path = folder / relative
@@ -617,14 +615,14 @@ def save_examples(
     if folder.is_file():
         raise ValueError(f"{folder} is a zipped bundle: save_examples writes into a bundle folder")
     cases = cases_from_trace(mas, trace, nodes, folder / MEDIA)
-    lock = _clean_lock(mas, folder)
-    _write_cases(folder, file, cases)
+    lock = clean_lock(mas, folder)
+    write_cases(folder, file, cases)
     if lock is not None:
         relock(folder, lock.code)
     return [case["name"] for case in cases]
 
 
-def _clean_lock(mas: MAS, folder: Path) -> Lock | None:
+def clean_lock(mas: MAS, folder: Path) -> Lock | None:
     """Return a bundle folder's lock when the folder still matches it, code included."""
     if not (folder / LOCK).is_file():
         return None

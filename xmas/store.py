@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 XMAS_TYPES: tuple[type, ...] = (AgentRecord, TokenUsage, ToolCall, Rejected, Trace, Event, ErrorKind, Health, Flag, Ref)
 """The xmas classes a checkpoint may hold besides LangGraph's own safe types."""
 
-_SCHEMA = """
+SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -183,37 +183,37 @@ CREATE TABLE IF NOT EXISTS xmas_calls (
 );
 CREATE INDEX IF NOT EXISTS xmas_calls_run ON xmas_calls (run_id);
 """
-_LOGGED = ("xmas_records", "xmas_events", "xmas_calls")
-_RUN_COLUMNS = "run_id, system_id, status, created_at, updated_at, paused, totals, ended_at"
-_CALL_COLUMNS = (
+LOGGED = ("xmas_records", "xmas_events", "xmas_calls")
+RUN_COLUMNS = "run_id, system_id, status, created_at, updated_at, paused, totals, ended_at"
+CALL_COLUMNS = (
     "call_id", "run_id", "node", "ts", "model", "served_model", "tokens", "cost_usd", "latency_s", "finish_reason",
     "error_kind", "error", "params",
 )  # fmt: skip
-_SECRET = re.compile(r"(^|_)(key|secret|token|password|credentials?)$|auth|header", re.IGNORECASE)
+SECRET = re.compile(r"(^|_)(key|secret|token|password|credentials?)$|auth|header", re.IGNORECASE)
 """The call parameters a call row leaves out: keys, tokens, passwords and headers."""
-_CHECKPOINT_COLUMNS = "thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata"
-_FILTER_KEY = re.compile(r"^[a-zA-Z0-9_.-]+$")
+CHECKPOINT_COLUMNS = "thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata"
+FILTER_KEY = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
 
-class _Serializer(JsonPlusSerializer):
+class Serializer(JsonPlusSerializer):
     """LangGraph's serializer, giving xmas classes back their tuples, which msgpack stores as lists."""
 
     def loads_typed(self, data: tuple[str, bytes]) -> Any:
         """Decode as LangGraph does, then restore the tuple fields of xmas classes."""
-        return _tuples(super().loads_typed(data))
+        return tuples(super().loads_typed(data))
 
 
-def _tuples(value: Any) -> Any:
+def tuples(value: Any) -> Any:
     if isinstance(value, dict):
         for key, item in value.items():
-            value[key] = _tuples(item)
+            value[key] = tuples(item)
     elif isinstance(value, list):
-        value[:] = [_tuples(item) for item in value]
+        value[:] = [tuples(item) for item in value]
     elif isinstance(value, XMAS_TYPES) and is_dataclass(value) and not isinstance(value, type):
         changes = {}
         for field in fields(value):
             item = getattr(value, field.name)
-            fixed = _tuples(item)
+            fixed = tuples(item)
             if isinstance(fixed, list) and str(field.type).startswith("tuple["):
                 fixed = tuple(fixed)
             if fixed is not item:
@@ -222,7 +222,7 @@ def _tuples(value: Any) -> Any:
     return value
 
 
-def _now() -> str:
+def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
@@ -294,22 +294,23 @@ class Store(BaseCheckpointSaver[str]):
 
     def __init__(self, path: str | os.PathLike[str] | None = None, *, serde: SerializerProtocol | None = None) -> None:
         """Open the database file at ``path``, made with its folder if missing; in memory for ``None``, ``:memory:``."""
-        super().__init__(serde=serde or _Serializer(allowed_msgpack_modules=XMAS_TYPES))
+        super().__init__(serde=serde or Serializer(allowed_msgpack_modules=XMAS_TYPES))
         self.path = Path(path).expanduser() if path is not None and str(path) != ":memory:" else None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path or ":memory:", check_same_thread=False)
-        self._lock = threading.Lock()
-        self._conn.executescript(_SCHEMA)
+        self.conn = sqlite3.connect(self.path or ":memory:", check_same_thread=False)
+        self.lock = threading.Lock()
+        self.conn.executescript(SCHEMA)
 
-    def _execute(self, sql: str, params: Sequence[Any] = ()) -> list[Any]:
-        with self._lock, self._conn:
-            return self._conn.execute(sql, params).fetchall()
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> list[Any]:
+        """Run one statement in its own transaction and return its rows."""
+        with self.lock, self.conn:
+            return self.conn.execute(sql, params).fetchall()
 
     def close(self) -> None:
         """Close the connection."""
-        with self._lock:
-            self._conn.close()
+        with self.lock:
+            self.conn.close()
 
     def __repr__(self) -> str:
         """Name the file, or say it is in memory."""
@@ -317,9 +318,10 @@ class Store(BaseCheckpointSaver[str]):
 
     # LangGraph's saver interface
 
-    def _tuple(self, row: Sequence[Any]) -> CheckpointTuple:
+    def checkpoint_tuple(self, row: Sequence[Any]) -> CheckpointTuple:
+        """Build LangGraph's checkpoint tuple from a row of ``checkpoints``, with its pending writes."""
         thread_id, checkpoint_ns, checkpoint_id, parent_id, type_, checkpoint, metadata = row
-        writes = self._execute(
+        writes = self.execute(
             "SELECT task_id, channel, type, value, task_path, idx FROM writes"
             " WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
             (thread_id, checkpoint_ns, checkpoint_id),
@@ -364,7 +366,7 @@ class Store(BaseCheckpointSaver[str]):
                 wheres.append("checkpoint_id = ?")
                 params.append(checkpoint_id)
         for key, value in (filter or {}).items():
-            if not _FILTER_KEY.match(key):
+            if not FILTER_KEY.match(key):
                 raise ValueError(f"A metadata filter key is letters, digits, '_', '.' and '-', not {key!r}")
             if value is None:
                 wheres.append(f"json_extract(CAST(metadata AS TEXT), '$.{key}') IS NULL")
@@ -375,13 +377,13 @@ class Store(BaseCheckpointSaver[str]):
         if before is not None:
             wheres.append("checkpoint_id < ?")
             params.append(get_checkpoint_id(before))
-        sql = f"SELECT {_CHECKPOINT_COLUMNS} FROM checkpoints"
+        sql = f"SELECT {CHECKPOINT_COLUMNS} FROM checkpoints"
         sql += (" WHERE " + " AND ".join(wheres) if wheres else "") + " ORDER BY checkpoint_id DESC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
-        for row in self._execute(sql, params):
-            yield self._tuple(row)
+        for row in self.execute(sql, params):
+            yield self.checkpoint_tuple(row)
 
     def put(
         self,
@@ -394,8 +396,8 @@ class Store(BaseCheckpointSaver[str]):
         ids = config["configurable"]
         type_, blob = self.serde.dumps_typed(checkpoint)
         meta = json.dumps(get_checkpoint_metadata(config, metadata), ensure_ascii=False).encode("utf-8", "ignore")
-        self._execute(
-            f"INSERT OR REPLACE INTO checkpoints ({_CHECKPOINT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        self.execute(
+            f"INSERT OR REPLACE INTO checkpoints ({CHECKPOINT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 str(ids["thread_id"]),
                 ids["checkpoint_ns"],
@@ -425,8 +427,8 @@ class Store(BaseCheckpointSaver[str]):
             (*key, WRITES_IDX_MAP.get(channel, idx), channel, *self.serde.dumps_typed(value))
             for idx, (channel, value) in enumerate(writes)
         ]
-        with self._lock, self._conn:
-            self._conn.executemany(
+        with self.lock, self.conn:
+            self.conn.executemany(
                 f"INSERT OR {verb} INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, task_path, idx,"
                 " channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
@@ -434,7 +436,7 @@ class Store(BaseCheckpointSaver[str]):
 
     def delete_thread(self, thread_id: str) -> None:
         """Delete a thread's checkpoints and writes."""
-        self._delete("thread_id = ?", (str(thread_id),))
+        self.delete_rows("thread_id = ?", (str(thread_id),))
 
     def get_next_version(self, current: str | int | None, channel: None) -> str:  # noqa: ARG002
         """Return the next channel version, in ``SqliteSaver``'s format: a padded count, a dot, a random tail."""
@@ -452,21 +454,21 @@ class Store(BaseCheckpointSaver[str]):
         totals: Mapping[str, Any] | None = None,
     ) -> RunRow:
         """Create or update a run's row; ``created_at`` stays as first saved, ``totals`` as last given."""
-        now = _now()
-        self._execute(
+        now = now_iso()
+        self.execute(
             "INSERT INTO xmas_runs (run_id, system_id, status, created_at, updated_at, paused, totals)"
             " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET"
             " system_id = excluded.system_id, status = excluded.status, updated_at = excluded.updated_at,"
             " paused = excluded.paused, totals = COALESCE(excluded.totals, totals)",
-            (run_id, system_id, status, now, now, json.dumps(list(paused)), _json(totals)),
+            (run_id, system_id, status, now, now, json.dumps(list(paused)), dump_json(totals)),
         )
         return cast(RunRow, self.run(run_id))
 
     def begin(self, run_id: str, system_id: str, query: str) -> RunRow:
         """Save a starting run's row, ``running``; a ``run_id`` saved already is refused with ``ValueError``."""
-        now = _now()
+        now = now_iso()
         try:
-            self._execute(
+            self.execute(
                 "INSERT INTO xmas_runs (run_id, system_id, status, created_at, updated_at, query)"
                 " VALUES (?, ?, 'running', ?, ?, ?)",
                 (run_id, system_id, now, now, query),
@@ -477,8 +479,8 @@ class Store(BaseCheckpointSaver[str]):
 
     def run(self, run_id: str) -> RunRow | None:
         """Return a run's row, or ``None`` for an unknown id."""
-        rows = self._execute(f"SELECT {_RUN_COLUMNS} FROM xmas_runs WHERE run_id = ?", (run_id,))
-        return _run_row(rows[0]) if rows else None
+        rows = self.execute(f"SELECT {RUN_COLUMNS} FROM xmas_runs WHERE run_id = ?", (run_id,))
+        return run_row(rows[0]) if rows else None
 
     def runs(
         self, status: str | None = None, system_id: str | None = None, limit: int | None = None
@@ -486,12 +488,12 @@ class Store(BaseCheckpointSaver[str]):
         """Return the runs' rows, oldest first: with ``status`` and ``system_id`` when given; the last ``limit``."""
         wheres = [f"{name} = ?" for name, value in (("status", status), ("system_id", system_id)) if value is not None]
         params: list[Any] = [value for value in (status, system_id) if value is not None]
-        sql = f"SELECT {_RUN_COLUMNS} FROM xmas_runs WHERE {' AND '.join(wheres) or '1'}"
+        sql = f"SELECT {RUN_COLUMNS} FROM xmas_runs WHERE {' AND '.join(wheres) or '1'}"
         sql += " ORDER BY created_at DESC, rowid DESC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
-        return tuple(_run_row(row) for row in reversed(self._execute(sql, params)))
+        return tuple(run_row(row) for row in reversed(self.execute(sql, params)))
 
     def trace(self, run_id: str) -> Trace:
         """Rebuild a run's trace from its rows, its health summarized again from its records.
@@ -503,7 +505,7 @@ class Store(BaseCheckpointSaver[str]):
         Raises:
             KeyError: For an unknown ``run_id``.
         """
-        rows = self._execute(
+        rows = self.execute(
             "SELECT system_id, status, paused, query, output, error, error_kind, steps, result"
             " FROM xmas_runs WHERE run_id = ?",
             (run_id,),
@@ -511,13 +513,13 @@ class Store(BaseCheckpointSaver[str]):
         if not rows:
             raise KeyError(f"no run {run_id!r} in {self!r}")
         system_id, status, paused, query, output, error, error_kind, steps, result = rows[0]
-        kept = self._kept(run_id)
+        kept = self.own_records(run_id)
         if status == "running" or steps is None:
             order, error = list(kept), "the run has no end in the store: it still runs, or its process ended first"
         else:
             order = json.loads(steps)
         records = tuple(replace(kept[position], step=index) for index, position in enumerate(order))
-        ending = self._load(result) if result is not None else {"outputs": {}, "graph_id": system_id}
+        ending = self.load(result) if result is not None else {"outputs": {}, "graph_id": system_id}
         waits = set(json.loads(paused))
         questions = tuple(
             Question.from_dict(row.payload)
@@ -539,7 +541,7 @@ class Store(BaseCheckpointSaver[str]):
 
     def events(self, run_id: str) -> tuple[Event, ...]:
         """Return a run's events in the order they happened."""
-        rows = self._execute(
+        rows = self.execute(
             "SELECT kind, node, run_id, at_s, item, item_key, visit, status, cost_usd, question, wait_s, reason"
             " FROM xmas_events WHERE run_id = ? ORDER BY rowid",
             (run_id,),
@@ -548,28 +550,28 @@ class Store(BaseCheckpointSaver[str]):
 
     def calls(self, run_id: str) -> tuple[dict[str, Any], ...]:
         """Return a run's model calls in the order they ended: each row by column, ``tokens`` and ``params`` read."""
-        rows = self._execute(
-            f"SELECT {', '.join(_CALL_COLUMNS)} FROM xmas_calls WHERE run_id = ? ORDER BY rowid", (run_id,)
+        rows = self.execute(
+            f"SELECT {', '.join(CALL_COLUMNS)} FROM xmas_calls WHERE run_id = ? ORDER BY rowid", (run_id,)
         )
-        calls = [dict(zip(_CALL_COLUMNS, row, strict=True)) for row in rows]
+        calls = [dict(zip(CALL_COLUMNS, row, strict=True)) for row in rows]
         for call in calls:
-            call["tokens"], call["params"] = _loads(call["tokens"]), _loads(call["params"])
+            call["tokens"], call["params"] = loads(call["tokens"]), loads(call["params"])
         return tuple(calls)
 
-    def _kept(self, run_id: str, before: int | None = None) -> dict[int, AgentRecord]:
+    def own_records(self, run_id: str, before: int | None = None) -> dict[int, AgentRecord]:
         """Return the run's own records (not a box's inner ones) by position, in the order kept; those ``before``."""
-        rows = self._execute(
+        rows = self.execute(
             "SELECT position, record FROM xmas_records WHERE run_id = ? AND boxed = 0 AND position < ?"
             " ORDER BY position",
             (run_id, before if before is not None else 2**62),
         )
-        return {position: self._load(blob) for position, blob in rows}
+        return {position: self.load(blob) for position, blob in rows}
 
-    def _load(self, blob: bytes) -> Any:
-        """Read back what :meth:`_dump` wrote."""
+    def load(self, blob: bytes) -> Any:
+        """Read back what :meth:`dump` wrote."""
         return self.serde.loads_typed(("msgpack", blob))
 
-    def _dump(self, value: Any) -> bytes:
+    def dump(self, value: Any) -> bytes:
         """Return the msgpack of a record, or of a trace's ending: dataclasses and plain values."""
         return self.serde.dumps_typed(value)[1]
 
@@ -587,7 +589,7 @@ class Store(BaseCheckpointSaver[str]):
     ) -> QuestionRow:
         """Record a question as asked, ``asked_at`` now unless given; an id already saved is refused."""
         try:
-            self._execute(
+            self.execute(
                 "INSERT INTO xmas_questions (question_id, run_id, node, form, shown, asked_at, deadline, payload)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -596,9 +598,9 @@ class Store(BaseCheckpointSaver[str]):
                     node,
                     form,
                     json.dumps(dict(shown)),
-                    asked_at or _now(),
+                    asked_at or now_iso(),
                     deadline,
-                    _json(payload),
+                    dump_json(payload),
                 ),
             )
         except sqlite3.IntegrityError:
@@ -609,25 +611,26 @@ class Store(BaseCheckpointSaver[str]):
         self, question_id: str, answer: Mapping[str, Any], who: str | None = None, answered_at: str | None = None
     ) -> QuestionRow:
         """Record a question's answer, ``answered_at`` now unless given; raises ``KeyError`` for an unknown id."""
-        rows = self._execute(
+        rows = self.execute(
             "UPDATE xmas_questions SET answer = ?, who = ?, answered_at = ? WHERE question_id = ? RETURNING *",
-            (json.dumps(dict(answer)), who, answered_at or _now(), question_id),
+            (json.dumps(dict(answer)), who, answered_at or now_iso(), question_id),
         )
         if not rows:
             raise KeyError(f"no question {question_id!r}")
-        return _question_row(rows[0])
+        return question_row(rows[0])
 
     def question(self, question_id: str) -> QuestionRow | None:
         """Return a question's row, or ``None`` for an unknown id."""
-        return next(iter(self._questions("question_id = ?", question_id)), None)
+        return next(iter(self.select_questions("question_id = ?", question_id)), None)
 
     def questions(self, run_id: str) -> tuple[QuestionRow, ...]:
         """Return a run's questions in the order asked."""
-        return self._questions("run_id = ?", run_id)
+        return self.select_questions("run_id = ?", run_id)
 
-    def _questions(self, where: str, *params: Any) -> tuple[QuestionRow, ...]:
-        rows = self._execute(f"SELECT * FROM xmas_questions WHERE {where} ORDER BY asked_at, rowid", params)
-        return tuple(_question_row(row) for row in rows)
+    def select_questions(self, where: str, *params: Any) -> tuple[QuestionRow, ...]:
+        """Return the questions ``where`` matches, in the order asked."""
+        rows = self.execute(f"SELECT * FROM xmas_questions WHERE {where} ORDER BY asked_at, rowid", params)
+        return tuple(question_row(row) for row in rows)
 
     def due(self, now: datetime | None = None) -> tuple[RunRow, ...]:
         """Return the paused runs with an open question whose deadline has passed at ``now``, oldest first.
@@ -635,7 +638,7 @@ class Store(BaseCheckpointSaver[str]):
         A ``now`` without a zone is local time, as ``datetime.now()`` gives it.
         """
         moment = (now or datetime.now(UTC)).astimezone()
-        rows = self._execute(
+        rows = self.execute(
             "SELECT DISTINCT run_id, deadline FROM xmas_questions WHERE answer IS NULL AND deadline IS NOT NULL"
         )
         late = {run_id for run_id, deadline in rows if datetime.fromisoformat(deadline) <= moment}
@@ -656,15 +659,15 @@ class Store(BaseCheckpointSaver[str]):
     def delete(self, run_id: str) -> None:
         """Delete a run's rows (run, questions, records, events, calls) and threads (``run_id``, ``run_id/...``)."""
         prefix = run_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
-        self._delete("thread_id = ? OR thread_id LIKE ? ESCAPE '\\'", (run_id, prefix), run_id)
+        self.delete_rows("thread_id = ? OR thread_id LIKE ? ESCAPE '\\'", (run_id, prefix), run_id)
 
-    def _delete(self, threads: str, params: Sequence[Any], run_id: str | None = None) -> None:
+    def delete_rows(self, threads: str, params: Sequence[Any], run_id: str | None = None) -> None:
         """Delete the checkpoints and writes of the threads ``threads`` matches, and the rows of ``run_id``."""
-        with self._lock, self._conn:
-            for table in ("xmas_runs", "xmas_questions", *_LOGGED) if run_id is not None else ():
-                self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+        with self.lock, self.conn:
+            for table in ("xmas_runs", "xmas_questions", *LOGGED) if run_id is not None else ():
+                self.conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             for table in ("checkpoints", "writes"):
-                self._conn.execute(f"DELETE FROM {table} WHERE {threads}", params)
+                self.conn.execute(f"DELETE FROM {table} WHERE {threads}", params)
 
 
 class RunLog:
@@ -679,19 +682,20 @@ class RunLog:
         """Log ``run_id``, whose row the store holds, counting positions on from its last record."""
         self.store = store
         self.run_id = run_id
-        (last,) = store._execute("SELECT MAX(position) FROM xmas_records WHERE run_id = ?", (run_id,))[0]
-        self._first = 0 if last is None else last + 1
-        self._positions = itertools.count(self._first)
-        self._kept: dict[_Visit, list[tuple[int, AgentRecord]]] = {}
-        self._failed = False
+        (last,) = store.execute("SELECT MAX(position) FROM xmas_records WHERE run_id = ?", (run_id,))[0]
+        self.first = 0 if last is None else last + 1
+        self.positions = itertools.count(self.first)
+        self.kept: dict[Visit, list[tuple[int, AgentRecord]]] = {}
+        self.failed = False
 
-    def _write(self, sql: str, params: Sequence[Any]) -> None:
-        if self._failed:
+    def write(self, sql: str, params: Sequence[Any]) -> None:
+        """Run one statement on the log; the first failure warns once and turns the log off."""
+        if self.failed:
             return
         try:
-            self.store._execute(sql, params)
+            self.store.execute(sql, params)
         except sqlite3.Error as error:
-            self._failed = True
+            self.failed = True
             warnings.warn(
                 f"The run log of {self.run_id!r} in {self.store!r} failed ({error}); the run goes on unlogged.",
                 RuntimeWarning,
@@ -700,17 +704,17 @@ class RunLog:
 
     def record(self, record: AgentRecord, *, boxed: bool = False) -> None:
         """Write a visit's record the moment it is kept; ``boxed`` for a record of a box's inner system."""
-        position = next(self._positions)
+        position = next(self.positions)
         if not boxed:
-            self._kept.setdefault(_visit(record), []).append((position, record))
+            self.kept.setdefault(visit(record), []).append((position, record))
         tokens = None if record.tokens is None else json.dumps(record.tokens.to_dict())
-        self._write(
+        self.write(
             f"INSERT INTO xmas_records VALUES ({', '.join('?' * 25)})",
             (
                 self.run_id,
                 position,
                 boxed,
-                _now(),
+                now_iso(),
                 record.agent,
                 record.kind,
                 record.item,
@@ -731,13 +735,13 @@ class RunLog:
                 json.dumps(record.outputs, ensure_ascii=False),
                 record.raw_response,
                 record.rendered_prompt,
-                self.store._dump(record),
+                self.store.dump(record),
             ),
         )
 
     def event(self, event: Event) -> None:
         """Write one event of the run."""
-        self._write(
+        self.write(
             f"INSERT INTO xmas_events VALUES ({', '.join('?' * 12)})",
             (
                 self.run_id,
@@ -770,12 +774,12 @@ class RunLog:
         without any key, token, password or header.
         """
         params = getattr(llm, "call_params", None)
-        sent = {key: value for key, value in params().items() if not _SECRET.search(key)} if callable(params) else None
+        sent = {key: value for key, value in params().items() if not SECRET.search(key)} if callable(params) else None
         kind = meta.error_kind if meta is not None else None
         if kind is None and error is not None:
             kind = classify(error)
-        self._write(
-            f"INSERT INTO xmas_calls ({', '.join(_CALL_COLUMNS)}) VALUES ({', '.join('?' * len(_CALL_COLUMNS))})",
+        self.write(
+            f"INSERT INTO xmas_calls ({', '.join(CALL_COLUMNS)}) VALUES ({', '.join('?' * len(CALL_COLUMNS))})",
             (
                 uuid.uuid4().hex,
                 self.run_id,
@@ -797,53 +801,53 @@ class RunLog:
         """Write how the run ended or paused: its status, totals and outcome, and its records' order in ``trace``."""
         status = trace.status.value
         paused = [] if trace.pause is None else [question.id for question in trace.pause.questions]
-        self._write(
+        self.write(
             "UPDATE xmas_runs SET status = ?, updated_at = ?, paused = ?, totals = ?, ended_at = ?, query = ?,"
             " output = ?, error = ?, error_kind = ?, steps = ?, result = ? WHERE run_id = ?",
             (
                 status,
-                _now(),
+                now_iso(),
                 json.dumps(paused),
-                _json(totals),
-                None if status == "paused" else _now(),
+                dump_json(totals),
+                None if status == "paused" else now_iso(),
                 trace.query,
                 trace.output,
                 trace.error,
                 None if trace.error_kind is None else trace.error_kind.value,
-                json.dumps(self._steps(trace.records)),
-                self.store._dump({"outputs": trace.outputs, "graph_id": trace.graph_id}),
+                json.dumps(self.steps(trace.records)),
+                self.store.dump({"outputs": trace.outputs, "graph_id": trace.graph_id}),
                 self.run_id,
             ),
         )
 
-    def _steps(self, records: Sequence[AgentRecord]) -> list[int]:
+    def steps(self, records: Sequence[AgentRecord]) -> list[int]:
         """Return the position of each of ``records`` in the log: kept by this log, else before it (before a pause)."""
-        earlier: dict[_Visit, list[tuple[int, AgentRecord]]] | None = None
+        earlier: dict[Visit, list[tuple[int, AgentRecord]]] | None = None
         steps = []
         for record in records:
-            position = _take(self._kept.get(_visit(record), []), record)
+            position = take(self.kept.get(visit(record), []), record)
             if position is None:
                 if earlier is None:
                     earlier = {}
-                    for kept, old in self.store._kept(self.run_id, before=self._first).items():
-                        earlier.setdefault(_visit(old), []).append((kept, old))
-                position = _take(earlier.get(_visit(record), []), record)
+                    for kept, old in self.store.own_records(self.run_id, before=self.first).items():
+                        earlier.setdefault(visit(old), []).append((kept, old))
+                position = take(earlier.get(visit(record), []), record)
             if position is None:  # pragma: no cover - every record of a trace was kept
                 self.record(record)
-                position = cast(int, _take(self._kept[_visit(record)], record))
+                position = cast(int, take(self.kept[visit(record)], record))
             steps.append(position)
         return steps
 
 
-_Visit = tuple[str, int | None, int | None]
+Visit = tuple[str, int | None, int | None]
 
 
-def _visit(record: AgentRecord) -> _Visit:
+def visit(record: AgentRecord) -> Visit:
     """Return what tells a record from most others of its run: its node, item and visit."""
     return record.agent, record.item, record.visit
 
 
-def _take(candidates: list[tuple[int, AgentRecord]], record: AgentRecord) -> int | None:
+def take(candidates: list[tuple[int, AgentRecord]], record: AgentRecord) -> int | None:
     """Remove and return the position of the first candidate equal to ``record``, its step aside."""
     for index, (position, kept) in enumerate(candidates):
         if replace(record, step=kept.step) == kept:
@@ -852,22 +856,20 @@ def _take(candidates: list[tuple[int, AgentRecord]], record: AgentRecord) -> int
     return None
 
 
-def _json(value: Mapping[str, Any] | None) -> str | None:
+def dump_json(value: Mapping[str, Any] | None) -> str | None:
     return None if value is None else json.dumps(dict(value))
 
 
-def _loads(text: str | None) -> Any:
+def loads(text: str | None) -> Any:
     return None if text is None else json.loads(text)
 
 
-def _run_row(row: Sequence[Any]) -> RunRow:
+def run_row(row: Sequence[Any]) -> RunRow:
     run_id, system_id, status, created_at, updated_at, paused, totals, ended_at = row
-    return RunRow(
-        run_id, system_id, status, created_at, updated_at, tuple(json.loads(paused)), _loads(totals), ended_at
-    )
+    return RunRow(run_id, system_id, status, created_at, updated_at, tuple(json.loads(paused)), loads(totals), ended_at)
 
 
-def _question_row(row: Sequence[Any]) -> QuestionRow:
+def question_row(row: Sequence[Any]) -> QuestionRow:
     question_id, run_id, node, form, shown, asked_at, answered_at, answer, who, deadline, payload = row
     return QuestionRow(
         question_id,
@@ -884,8 +886,8 @@ def _question_row(row: Sequence[Any]) -> QuestionRow:
     )
 
 
-_OPEN: weakref.WeakValueDictionary[Path, Store] = weakref.WeakValueDictionary()
-_open_lock = threading.Lock()
+OPEN: weakref.WeakValueDictionary[Path, Store] = weakref.WeakValueDictionary()
+open_lock = threading.Lock()
 
 
 def open_store(location: str | os.PathLike[str] | None = None) -> Store:
@@ -902,8 +904,8 @@ def open_store(location: str | os.PathLike[str] | None = None) -> Store:
     if str(location) == ":memory:":
         return Store()
     path = Path(location).expanduser().resolve()
-    with _open_lock:
-        store = _OPEN.get(path)
+    with open_lock:
+        store = OPEN.get(path)
         if store is None:
-            store = _OPEN[path] = Store(path)
+            store = OPEN[path] = Store(path)
         return store

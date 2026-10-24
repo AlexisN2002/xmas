@@ -46,10 +46,10 @@ BUILTINS = frozenset({"exists", "len", "visits", "cost", "elapsed"})
 KEYWORDS = frozenset({"and", "or", "not", "in", "true", "false", "null"})
 """The words of the grammar itself."""
 
-_LITERALS = {"true": True, "false": False, "null": None}
-_ORDER = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
-_COMPARISONS = frozenset({"==", "!=", "in", "not in", *_ORDER})
-_TOKEN = re.compile(
+LITERALS = {"true": True, "false": False, "null": None}
+ORDER = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
+COMPARISONS = frozenset({"==", "!=", "in", "not in", *ORDER})
+TOKEN = re.compile(
     r"""(?P<space>\s+)
     |(?P<number>-?\d+(?:\.\d+)?)
     |(?P<string>"[^"]*"|'[^']*')
@@ -57,7 +57,7 @@ _TOKEN = re.compile(
     |(?P<op>==|!=|<=|>=|<|>|\(|\)|\[|\]|,|\.)""",
     re.VERBOSE,
 )
-_MISSING = object()
+MISSING = object()
 
 
 class PredicateError(ValueError):
@@ -109,22 +109,22 @@ class Predicate:
 
     def paths(self) -> frozenset[tuple[str, ...]]:
         """Return every path the predicate reads, as tuples of names."""
-        return frozenset(node[1] for node in _walk(self.tree) if node[0] in ("path", "exists"))
+        return frozenset(node[1] for node in walk(self.tree) if node[0] in ("path", "exists"))
 
     def calls(self) -> frozenset[tuple[str, int]]:
         """Return each call of a registered callable as ``(name, number of arguments)``."""
-        return frozenset((node[1], len(node[2])) for node in _walk(self.tree) if node[0] == "call")
+        return frozenset((node[1], len(node[2])) for node in walk(self.tree) if node[0] == "call")
 
     def evaluate(self, ctx: Context) -> bool:
         """Return whether the predicate holds in ``ctx``; a call that is not registered or returns no bool raises."""
-        return bool(_eval(self.tree, ctx))
+        return bool(evaluate_tree(self.tree, ctx))
 
 
 def parse_predicate(text: str) -> Predicate:
     """Parse a predicate, raising :class:`PredicateError` with the position of the first problem."""
     if len(text) > MAX_LENGTH:
         raise PredicateError(f"predicate is {len(text)} characters long, {MAX_LENGTH} at most")
-    parser = _Parser(text, _tokenize(text))
+    parser = Parser(text, tokenize(text))
     if not parser.tokens:
         raise PredicateError("predicate is empty")
     tree = parser.expr()
@@ -134,12 +134,12 @@ def parse_predicate(text: str) -> Predicate:
     return Predicate(text, tree)
 
 
-def _tokenize(text: str) -> list[tuple[str, str, int]]:
+def tokenize(text: str) -> list[tuple[str, str, int]]:
     """Split ``text`` into ``(kind, text, position)`` tokens, spaces dropped."""
     tokens: list[tuple[str, str, int]] = []
     position = 0
     while position < len(text):
-        match = _TOKEN.match(text, position)
+        match = TOKEN.match(text, position)
         if match is None:
             raise PredicateError(f"unexpected character {text[position]!r}", position)
         kind = match.lastgroup or ""
@@ -149,7 +149,7 @@ def _tokenize(text: str) -> list[tuple[str, str, int]]:
     return tokens
 
 
-class _Parser:
+class Parser:
     """Recursive descent over the tokens, one method per grammar rule."""
 
     def __init__(self, text: str, tokens: list[tuple[str, str, int]]) -> None:
@@ -222,7 +222,7 @@ class _Parser:
         if op == "not" and self.index + 1 < len(self.tokens) and self.tokens[self.index + 1][1] == "in":
             self.take()
             op = "not in"
-        elif op not in _COMPARISONS:
+        elif op not in COMPARISONS:
             return left
         self.take()
         return ("cmp", op, left, self.atom())
@@ -230,7 +230,7 @@ class _Parser:
     def atom(self) -> tuple[Any, ...]:
         """Parse a literal, a list, a call, a path or a bracketed expression."""
         kind, value, position = self.take()
-        if (literal := _literal(kind, value)) is not _MISSING:
+        if (literal := literal_value(kind, value)) is not MISSING:
             return ("lit", literal)
         if value == "(":
             inner: tuple[Any, ...] = self.nested(position, self.expr)
@@ -255,7 +255,7 @@ class _Parser:
     def literal(self) -> Any:
         """Parse one literal of a list."""
         kind, value, position = self.take()
-        if (literal := _literal(kind, value)) is _MISSING:
+        if (literal := literal_value(kind, value)) is MISSING:
             raise PredicateError(f"a list holds literals only, got {value!r}", position)
         return literal
 
@@ -289,16 +289,16 @@ class _Parser:
         return ("call", name, tuple(args))
 
 
-def _literal(kind: str, value: str) -> Any:
-    """Return the value of a number, string, ``true``, ``false`` or ``null`` token, else ``_MISSING``."""
+def literal_value(kind: str, value: str) -> Any:
+    """Return the value of a number, string, ``true``, ``false`` or ``null`` token, else ``MISSING``."""
     if kind == "number":
         return float(value) if "." in value else int(value)
     if kind == "string":
         return value[1:-1]
-    return _LITERALS.get(value, _MISSING) if kind == "name" else _MISSING
+    return LITERALS.get(value, MISSING) if kind == "name" else MISSING
 
 
-def _walk(tree: tuple[Any, ...]) -> list[tuple[Any, ...]]:
+def walk(tree: tuple[Any, ...]) -> list[tuple[Any, ...]]:
     """Return every subtree of ``tree``, ``tree`` included."""
     head = tree[0]
     if head in ("not", "len"):
@@ -313,22 +313,22 @@ def _walk(tree: tuple[Any, ...]) -> list[tuple[Any, ...]]:
         children = ()
     found = [tree]
     for child in children:
-        found.extend(_walk(child))
+        found.extend(walk(child))
     return found
 
 
-def _eval(tree: tuple[Any, ...], ctx: Context) -> Any:
+def evaluate_tree(tree: tuple[Any, ...], ctx: Context) -> Any:
     """Return the value of one subtree in ``ctx``."""
     head = tree[0]
     if head == "lit":
         return tree[1]
     if head == "path":
-        value = _resolve(tree[1], ctx.values)
-        return None if value is _MISSING else value
+        value = resolve(tree[1], ctx.values)
+        return None if value is MISSING else value
     if head == "exists":
-        return _resolve(tree[1], ctx.values) is not _MISSING
+        return resolve(tree[1], ctx.values) is not MISSING
     if head == "len":
-        value = _eval(tree[1], ctx)
+        value = evaluate_tree(tree[1], ctx)
         return len(value) if isinstance(value, str | list | tuple | dict) else None
     if head == "visits":
         return ctx.visits.get(ctx.node if tree[1] is None else tree[1], 0)
@@ -337,14 +337,14 @@ def _eval(tree: tuple[Any, ...], ctx: Context) -> Any:
     if head == "elapsed":
         return ctx.elapsed_s
     if head == "not":
-        return not _eval(tree[1], ctx)
+        return not evaluate_tree(tree[1], ctx)
     if head == "and":
-        return all(_eval(part, ctx) for part in tree[1])
+        return all(evaluate_tree(part, ctx) for part in tree[1])
     if head == "or":
-        return any(_eval(part, ctx) for part in tree[1])
+        return any(evaluate_tree(part, ctx) for part in tree[1])
     if head == "cmp":
-        return _compare(tree[1], _eval(tree[2], ctx), _eval(tree[3], ctx))
-    name, args = tree[1], tuple(_eval(arg, ctx) for arg in tree[2])
+        return compare(tree[1], evaluate_tree(tree[2], ctx), evaluate_tree(tree[3], ctx))
+    name, args = tree[1], tuple(evaluate_tree(arg, ctx) for arg in tree[2])
     if ctx.call is None:
         raise PredicateError(f"unknown function {name!r}")
     result = ctx.call(name, args)
@@ -353,40 +353,40 @@ def _eval(tree: tuple[Any, ...], ctx: Context) -> Any:
     return result
 
 
-def _resolve(path: tuple[str, ...], values: Mapping[str, Any]) -> Any:
-    """Follow ``path`` through ``values`` and nested mappings, or return ``_MISSING``."""
+def resolve(path: tuple[str, ...], values: Mapping[str, Any]) -> Any:
+    """Follow ``path`` through ``values`` and nested mappings, or return ``MISSING``."""
     current: Any = values
     for name in path:
         if not isinstance(current, Mapping) or name not in current:
-            return _MISSING
+            return MISSING
         current = current[name]
     return current
 
 
-def _compare(op: str, left: Any, right: Any) -> bool:
+def compare(op: str, left: Any, right: Any) -> bool:
     """Apply a comparison: ordering only between two numbers or two strings."""
     if op == "==":
-        return _equal(left, right)
+        return equal(left, right)
     if op == "!=":
-        return not _equal(left, right)
+        return not equal(left, right)
     if op in ("in", "not in"):
         if isinstance(right, list | tuple):
-            found = any(_equal(left, item) for item in right)
+            found = any(equal(left, item) for item in right)
         else:  # a substring of a text, a key of an object
             found = isinstance(right, str | Mapping) and isinstance(left, str) and left in right
         return found if op == "in" else not found
     numbers = all(isinstance(side, int | float) and not isinstance(side, bool) for side in (left, right))
     if not numbers and not (isinstance(left, str) and isinstance(right, str)):
         return False
-    return bool(_ORDER[op](left, right))
+    return bool(ORDER[op](left, right))
 
 
-def _equal(left: Any, right: Any) -> bool:
+def equal(left: Any, right: Any) -> bool:
     """Compare like JSON: a bool never equals a number, and lists and objects compare item by item."""
     if isinstance(left, bool) != isinstance(right, bool):
         return False
     if isinstance(left, list | tuple) and isinstance(right, list | tuple):
-        return len(left) == len(right) and all(_equal(a, b) for a, b in zip(left, right, strict=True))
+        return len(left) == len(right) and all(equal(a, b) for a, b in zip(left, right, strict=True))
     if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(_equal(left[key], right[key]) for key in left)
+        return left.keys() == right.keys() and all(equal(left[key], right[key]) for key in left)
     return bool(left == right)

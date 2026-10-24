@@ -33,7 +33,7 @@ ARROW = "->"
 ANY_ERROR = "any"
 """The ``on error`` spec that routes every error kind."""
 
-_ON_ERROR = "on error"
+ON_ERROR = "on error"
 
 
 class EdgeKind(StrEnum):
@@ -112,7 +112,7 @@ class Edge:
         if self.kind in (EdgeKind.ELSE, EdgeKind.FIRST):
             return self.kind.value
         if self.kind is EdgeKind.ERROR:
-            return {_ON_ERROR: ANY_ERROR if self.errors == (ANY_ERROR,) else list(self.errors)}
+            return {ON_ERROR: ANY_ERROR if self.errors == (ANY_ERROR,) else list(self.errors)}
         if self.kind is EdgeKind.SWITCH:
             data: dict[str, Any] = {"switch": self.switch}
             if self.case != self.target:
@@ -124,7 +124,7 @@ class Edge:
         return data
 
 
-def _names(text: str) -> list[str]:
+def split_names(text: str) -> list[str]:
     """Split ``"a -> b -> c"`` into its names."""
     names = [part.strip() for part in text.split(ARROW)]
     if len(names) < 2 or not all(names):
@@ -132,17 +132,17 @@ def _names(text: str) -> list[str]:
     return names
 
 
-def _conditional(source: str, target: str, spec: Any) -> Edge:
+def conditional(source: str, target: str, spec: Any) -> Edge:
     """Build one edge from the spec of a one-key mapping."""
     where = f"{source} {ARROW} {target}"
     if spec in (EdgeKind.ELSE.value, EdgeKind.FIRST.value):
         return Edge(source, target, EdgeKind(spec))
     if not isinstance(spec, dict):
         raise ValueError(f"Edge {where!r}: its spec is 'else', 'first of' or a mapping, not {spec!r}.")
-    deciders = [key for key in ("when", "switch", _ON_ERROR) if key in spec]
+    deciders = [key for key in ("when", "switch", ON_ERROR) if key in spec]
     if len(deciders) != 1:
         raise ValueError(f"Edge {where!r} needs exactly one of 'when', 'switch' or 'on error', got {sorted(spec)}.")
-    allowed = {"when": {"when", "max_visits"}, "switch": {"switch", "case"}, _ON_ERROR: {_ON_ERROR}}[deciders[0]]
+    allowed = {"when": {"when", "max_visits"}, "switch": {"switch", "case"}, ON_ERROR: {ON_ERROR}}[deciders[0]]
     unknown = set(spec) - allowed
     if unknown:
         raise ValueError(f"Edge {where!r} has unknown keys: {sorted(unknown)}.")
@@ -151,11 +151,11 @@ def _conditional(source: str, target: str, spec: Any) -> Edge:
         visits = spec.get("max_visits")
         if visits is not None and (not isinstance(visits, int) or isinstance(visits, bool)):
             raise ValueError(f"Edge {where!r}: max_visits must be a positive integer, got {visits!r}.")
-        return Edge(source, target, kind, when=_text(spec["when"], where), max_visits=visits)
+        return Edge(source, target, kind, when=text(spec["when"], where), max_visits=visits)
     if "switch" in spec:
         case = spec.get("case")
-        return Edge(source, target, EdgeKind.SWITCH, switch=_text(spec["switch"], where), case=case)
-    errors = spec[_ON_ERROR]
+        return Edge(source, target, EdgeKind.SWITCH, switch=text(spec["switch"], where), case=case)
+    errors = spec[ON_ERROR]
     if isinstance(errors, str):
         errors = [errors]
     if not isinstance(errors, list) or not errors or not all(isinstance(kind, str) and kind for kind in errors):
@@ -163,7 +163,7 @@ def _conditional(source: str, target: str, spec: Any) -> Edge:
     return Edge(source, target, EdgeKind.ERROR, errors=tuple(errors))
 
 
-def _text(value: Any, where: str) -> str:
+def text(value: Any, where: str) -> str:
     """Return a predicate or path, refusing anything but non-empty text."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"Edge {where!r}: expected text, got {value!r}.")
@@ -182,14 +182,14 @@ def parse_edges(items: Iterable[Any]) -> list[Edge]:
     edges: list[Edge] = []
     for item in items:
         if isinstance(item, str):
-            names = _names(item)
+            names = split_names(item)
             edges.extend(Edge(source, target) for source, target in pairwise(names))
         elif isinstance(item, dict) and len(item) == 1:
             ((key, spec),) = item.items()
-            names = _names(key) if isinstance(key, str) else []
+            names = split_names(key) if isinstance(key, str) else []
             if len(names) != 2:
                 raise ValueError(f"A conditional edge names one source and one target, not {key!r}.")
-            edges.append(_conditional(names[0], names[1], spec))
+            edges.append(conditional(names[0], names[1], spec))
         else:
             raise ValueError(f"Edge {item!r} must be a chain such as 'a -> b' or a one-key mapping.")
     return edges

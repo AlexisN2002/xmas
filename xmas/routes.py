@@ -14,10 +14,10 @@ from xmas.graph import END, START
 ROUTE_CAP = 256
 """Most route combinations kept per node; past it a merge or join cannot be proved."""
 
-_Point = str | tuple[str, str, str]
+Point = str | tuple[str, str, str]
 """A node of the route graph: a node name, or a route ``(node, decision, label)``."""
 
-_FAIL, _CHOOSE, _OK = "fail", "choose", ""
+FAIL, CHOOSE, OK = "fail", "choose", ""
 
 
 @dataclass(frozen=True)
@@ -63,14 +63,14 @@ class RouteGraph:
             if edge.kind is EdgeKind.WHILE:
                 self.loops.append((edge.source, edge.target))
                 continue
-            head: _Point = edge.source
+            head: Point = edge.source
             if edge.source in failing and edge.kind is not EdgeKind.ERROR:
-                head = (edge.source, _FAIL, _OK)
+                head = (edge.source, FAIL, OK)
                 graph.add_edge(edge.source, head, kind="route")
             if edge.kind is EdgeKind.PLAIN:
                 graph.add_edge(head, edge.target, kind="plain")
                 continue
-            route = (edge.source, _FAIL if edge.kind is EdgeKind.ERROR else _CHOOSE, edge.target)
+            route = (edge.source, FAIL if edge.kind is EdgeKind.ERROR else CHOOSE, edge.target)
             graph.add_edge(head, route, kind="route")
             graph.add_edge(route, edge.target, kind="plain")
         sources = {edge.source for edge in edges if edge.kind is not EdgeKind.ERROR}
@@ -80,22 +80,22 @@ class RouteGraph:
             if name in sources:
                 continue
             if name in failing:  # only error edges: a visit that succeeds ends the run
-                ok = (name, _FAIL, _OK)
+                ok = (name, FAIL, OK)
                 graph.add_edge(name, ok, kind="route")
                 graph.add_edge(ok, END, kind="plain")
             else:
                 graph.add_edge(name, END, kind="plain")
         self.graph = graph
-        self.choices: dict[_Point, set[frozenset[_Point]] | None] = {START: {frozenset()}}
+        self.choices: dict[Point, set[frozenset[Point]] | None] = {START: {frozenset()}}
         for point in nx.topological_sort(graph):
             if point != START:
-                self.choices[point] = self._choice_sets(point)
-        self._reach: dict[tuple[_Point, tuple[_Point, ...]], bool] = {}
+                self.choices[point] = self.choice_sets(point)
+        self.reach: dict[tuple[Point, tuple[Point, ...]], bool] = {}
 
-    def _choice_sets(self, point: _Point) -> set[frozenset[_Point]] | None:
+    def choice_sets(self, point: Point) -> set[frozenset[Point]] | None:
         """Return the minimal route sets under which ``point`` runs, ``None`` past :data:`ROUTE_CAP`."""
         extra = {point} if isinstance(point, tuple) else set()
-        sets: set[frozenset[_Point]] = set()
+        sets: set[frozenset[Point]] = set()
         for parent in self.graph.predecessors(point):
             known = self.choices.get(parent)
             if known is None:
@@ -104,37 +104,39 @@ class RouteGraph:
         minimal = {choice for choice in sets if not any(other < choice for other in sets)}
         return minimal if len(minimal) <= ROUTE_CAP else None
 
-    def exclusive(self, first: _Point, second: _Point) -> bool:
+    def exclusive(self, first: Point, second: Point) -> bool:
         """Return whether two points never both run in one pass; ``False`` when that cannot be proved."""
         left, right = self.choices.get(first), self.choices.get(second)
         if left is None or right is None:
             return False
-        return all(_clash(one, other) for one in left for other in right)
+        return all(clash(one, other) for one in left for other in right)
 
     def failed_before(self, name: str) -> frozenset[str]:
         """Return the nodes through whose error routes every pass that runs ``name`` goes."""
         sets = self.choices.get(name)
         if not sets:
             return frozenset()
-        failed = [{_name(route) for route in choice if not _every_pass(route) and route[1] == _FAIL} for choice in sets]
+        failed = [
+            {point_node(route) for route in choice if not every_pass(route) and route[1] == FAIL} for choice in sets
+        ]
         return frozenset(set.intersection(*failed))
 
-    def _reaches(self, point: _Point, group: tuple[_Point, ...]) -> bool:
+    def reaches(self, point: Point, group: tuple[Point, ...]) -> bool:
         """Return whether every pass that runs ``point`` also runs a member of ``group``."""
         key = (point, group)
-        if key not in self._reach:
-            plain: list[_Point] = []
-            routes: list[_Point] = []
+        if key not in self.reach:
+            plain: list[Point] = []
+            routes: list[Point] = []
             for child in self.graph.successors(point):
                 (plain if self.graph.edges[point, child]["kind"] == "plain" else routes).append(child)
-            self._reach[key] = (
+            self.reach[key] = (
                 point in group
-                or any(self._reaches(child, group) for child in plain)
-                or (bool(routes) and all(self._reaches(child, group) for child in routes))
+                or any(self.reaches(child, group) for child in plain)
+                or (bool(routes) and all(self.reaches(child, group) for child in routes))
             )
-        return self._reach[key]
+        return self.reach[key]
 
-    def _loop_bodies(self) -> list[tuple[str, str, set[str]]]:
+    def loop_bodies(self) -> list[tuple[str, str, set[str]]]:
         """Return each loop as ``(source, target, the nodes it runs again)``."""
         bodies = []
         for source, target in self.loops:
@@ -148,7 +150,7 @@ class RouteGraph:
         refusals: dict[str, str] = {}
         idom: dict[Any, Any] | None = None
         for name in [*self.nodes, END]:
-            points: list[_Point] = list(self.graph.predecessors(name))
+            points: list[Point] = list(self.graph.predecessors(name))
             if len(points) < 2:
                 continue
             if any(self.choices.get(point) is None for point in points):
@@ -157,19 +159,19 @@ class RouteGraph:
                     "or joins cannot be proved; put part of the system in a box"
                 )
                 continue
-            groups: list[list[_Point]] = []
+            groups: list[list[Point]] = []
             for point in points:
                 fits = [group for group in groups if all(self.exclusive(point, other) for other in group)]
                 if fits:
                     fits[0].append(point)
                 else:
                     groups.append([point])
-            named = tuple(tuple(_name(point) for point in group) for group in groups)
+            named = tuple(tuple(point_node(point) for point in group) for group in groups)
             if len(groups) == 1:
                 joins[name] = Join("merge", named)
                 continue
             idom = idom if idom is not None else nx.immediate_dominators(self.graph, START)
-            problem = self._join_problem(name, groups, idom[name])
+            problem = self.join_problem(name, groups, idom[name])
             if problem:
                 refusals[name] = problem
                 continue
@@ -183,40 +185,40 @@ class RouteGraph:
             joins[name] = Join("join", named, relays)
         return joins, refusals
 
-    def _join_problem(self, name: str, groups: list[list[_Point]], dominator: _Point) -> str | None:
+    def join_problem(self, name: str, groups: list[list[Point]], dominator: Point) -> str | None:
         """Say why ``name`` cannot wait for one edge of every group, or return ``None``."""
 
-        def edges(group: list[_Point]) -> str:
-            return " or ".join(f"{_name(point)} -> {name}" for point in group)
+        def edges(group: list[Point]) -> str:
+            return " or ".join(f"{point_node(point)} -> {name}" for point in group)
 
         for group in groups:
-            if not self._reaches(dominator, tuple(group)):
+            if not self.reaches(dominator, tuple(group)):
                 other = next(rest for rest in groups if rest is not group)
                 return (
                     f"node {name!r} is neither a merge nor a join: {edges(group)} does not run on every pass "
                     f"that runs {edges(other)}; join the alternatives in one node first"
                 )
-        for source, target, inside in self._loop_bodies():
+        for source, target, inside in self.loop_bodies():
             for point in (point for group in groups for point in group):
-                if name not in inside and _every_pass(point) and _name(point) in inside:
+                if name not in inside and every_pass(point) and point_node(point) in inside:
                     return (
-                        f"node {name!r} cannot wait for {_name(point)} -> {name}, which leaves the loop "
+                        f"node {name!r} cannot wait for {point_node(point)} -> {name}, which leaves the loop "
                         f"{target} .. {source} on every pass; leave a loop through its else edge"
                     )
         return None
 
 
-def _name(point: _Point) -> str:
+def point_node(point: Point) -> str:
     """Return the node a point of the route graph belongs to."""
     return point if isinstance(point, str) else point[0]
 
 
-def _every_pass(point: _Point) -> bool:
+def every_pass(point: Point) -> bool:
     """Return whether a point is a node, or the route its node takes whenever it succeeds."""
-    return isinstance(point, str) or point[1:] == (_FAIL, _OK)
+    return isinstance(point, str) or point[1:] == (FAIL, OK)
 
 
-def _clash(first: frozenset[_Point], second: frozenset[_Point]) -> bool:
+def clash(first: frozenset[Point], second: frozenset[Point]) -> bool:
     """Return whether two route sets take different routes of one decision."""
     return any(
         a[:2] == b[:2] and a[2] != b[2] for a in first for b in second if isinstance(a, tuple) and isinstance(b, tuple)

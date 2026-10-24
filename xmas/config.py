@@ -70,16 +70,16 @@ MODELS_ENV = "XMAS_MODELS"
 CATALOGUE_TTL_S = 300.0
 FETCH_TIMEOUT_S = 5.0
 
-_SCALARS: dict[str, dict[str, type]] = {
+SCALARS: dict[str, dict[str, type]] = {
     "endpoint": {"base_url": str, "api_key": str, "api_key_env": str, "catalogue": list, "stream": bool},
     "model": {"price": dict, "stream": bool},
     "price": {"input_per_m": float, "output_per_m": float, "cached_input_per_m": float},
     "tool": {"url": str, "key": str, "key_env": str},
     "store": {"media": str, "runs": str},
 }
-_TABLES = ("endpoint", "models", "tools", "store")
-_SHAPES = {str: "a string", bool: "true or false", float: "a number", dict: "a table", list: "a list of model ids"}
-_PARAM_WORDS: dict[tuple[type, ...], str] = {(str,): "a text", (int,): "a whole number"}
+TABLES = ("endpoint", "models", "tools", "store")
+SHAPES = {str: "a string", bool: "true or false", float: "a number", dict: "a table", list: "a list of model ids"}
+PARAM_WORDS: dict[tuple[type, ...], str] = {(str,): "a text", (int,): "a whole number"}
 
 
 def config_path(environ: Mapping[str, str] | None = None) -> Path:
@@ -110,7 +110,7 @@ class ToolServer:
 
     def __repr__(self) -> str:
         """Show the address without credentials or query, never the key."""
-        return f"ToolServer(url={_shown(self.url)!r})"
+        return f"ToolServer(url={redact_url(self.url)!r})"
 
 
 @dataclass(frozen=True)
@@ -162,7 +162,7 @@ class Config:
             if name == "source" or name not in {f.name for f in fields(cls)}:
                 raise TypeError(f"Config.load takes no argument {name!r}")
         file = Path(path).expanduser() if path is not None else config_path(environ)
-        values = _read_file(file, environ) if file.is_file() else {}
+        values = read_file(file, environ) if file.is_file() else {}
         listed = [name.strip() for name in environ.get(MODELS_ENV, "").split(",") if name.strip()]
         from_env = {
             "base_url": environ.get("XMAS_BASE_URL"),
@@ -185,7 +185,7 @@ class Config:
     def __repr__(self) -> str:
         """Show every field but the key; the endpoint without credentials or query."""
         shown = {item.name: getattr(self, item.name) for item in fields(self) if item.name != "api_key"}
-        shown["base_url"] = None if self.base_url is None else _shown(self.base_url)
+        shown["base_url"] = None if self.base_url is None else redact_url(self.base_url)
         return f"Config({', '.join(f'{name}={value!r}' for name, value in shown.items())})"
 
     def stream_of(self, model: str) -> bool:
@@ -193,7 +193,7 @@ class Config:
         return self.streams.get(model, self.stream)
 
 
-def _read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
+def read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
     """Parse the file into :class:`Config` fields, naming the key of any problem."""
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -205,7 +205,7 @@ def _read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
             raise ValueError(f"{path}: {where} is a table, not {type(table).__name__}")
         if kind is None:  # a table of tables, such as [models."<id>"]
             return table
-        allowed = _SCALARS[kind]
+        allowed = SCALARS[kind]
         for key, value in table.items():
             if key not in allowed:
                 raise ValueError(f"{path}: unknown key '{where}.{key}'; {where} takes {', '.join(allowed)}")
@@ -213,20 +213,20 @@ def _read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
             fits = isinstance(value, (int, float)) if want is float else isinstance(value, want)
             words = key != "catalogue" or all(isinstance(item, str) for item in value)
             if isinstance(value, bool) is not (want is bool) or not fits or not words:
-                raise ValueError(f"{path}: {where}.{key} is {_SHAPES[want]}, not {type(value).__name__}")
+                raise ValueError(f"{path}: {where}.{key} is {SHAPES[want]}, not {type(value).__name__}")
         for key, alias in (("api_key", "api_key_env"), ("key", "key_env")):
             if key in table and alias in table:
                 raise ValueError(f"{path}: {where} takes {key} or {alias}, not both")
         return table
 
     for key in data:
-        if key not in _TABLES:
-            raise ValueError(f"{path}: unknown table '{key}'; the file takes {', '.join(_TABLES)}")
+        if key not in TABLES:
+            raise ValueError(f"{path}: unknown table '{key}'; the file takes {', '.join(TABLES)}")
     endpoint = checked(data.get("endpoint", {}), "endpoint", "endpoint")
     store = checked(data.get("store", {}), "store", "store")
     values: dict[str, Any] = {
         "base_url": endpoint.get("base_url"),
-        "api_key": _secret(endpoint, "api_key", environ),
+        "api_key": secret(endpoint, "api_key", environ),
         "catalogue": endpoint.get("catalogue"),
         "stream": endpoint.get("stream", False),
         "media_store": store.get("media"),
@@ -250,19 +250,19 @@ def _read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
         checked(entry, "tool", where)
         if "url" not in entry:
             raise ValueError(f"{path}: {where} needs url")
-        tools[name] = ToolServer(entry["url"], _secret(entry, "key", environ))
+        tools[name] = ToolServer(entry["url"], secret(entry, "key", environ))
     keyed = "api_key" in endpoint or any("key" in entry for entry in data.get("tools", {}).values())
     if keyed and path.stat().st_mode & (stat.S_IRGRP | stat.S_IROTH):
         warnings.warn(f"{path} holds a key and others can read it; chmod 600 {path}", UserWarning, stacklevel=3)
     return {**{k: v for k, v in values.items() if v is not None}, "prices": prices, "streams": streams, "tools": tools}
 
 
-def _secret(table: Mapping[str, Any], key: str, environ: Mapping[str, str]) -> str | None:
+def secret(table: Mapping[str, Any], key: str, environ: Mapping[str, str]) -> str | None:
     """Return the ``key`` a table states, else the environment variable its ``<key>_env`` names."""
     return table.get(key) or (environ.get(table[f"{key}_env"]) if f"{key}_env" in table else None)
 
 
-def _shown(url: str) -> str:
+def redact_url(url: str) -> str:
     """Return ``url`` without credentials, query or fragment, fit for a message."""
     parts = urlsplit(url)
     return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
@@ -283,14 +283,14 @@ class Catalogue:
     note: str = ""
 
 
-def _cache_file(base_url: str, api_key: str | None) -> Path:
+def cache_file(base_url: str, api_key: str | None) -> Path:
     """Return the file that keeps the answer of ``base_url`` for ``api_key``; the key enters only hashed."""
     folder = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache").expanduser() / "xmas"
     keyed = hashlib.sha256((api_key or "").encode()).hexdigest()
     return folder / f"catalogue-{hashlib.sha256(f'{base_url}\n{keyed}'.encode()).hexdigest()[:16]}.json"
 
 
-def _kept(file: Path) -> tuple[float, tuple[str, ...]] | None:
+def read_cached(file: Path) -> tuple[float, tuple[str, ...]] | None:
     try:
         kept = json.loads(file.read_text(encoding="utf-8"))
         return float(kept["fetched"]), tuple(str(name) for name in kept["ids"])
@@ -320,8 +320,8 @@ def read_catalogue(
         return Catalogue(tuple(config.catalogue), "configured")
     if not config.base_url:
         return Catalogue(None, "none", "no endpoint; model names not checked")
-    file = _cache_file(config.base_url, config.api_key)
-    kept = _kept(file)
+    file = cache_file(config.base_url, config.api_key)
+    kept = read_cached(file)
     now = clock()
     if kept is not None and not refresh and 0 <= now - kept[0] < CATALOGUE_TTL_S:
         return Catalogue(kept[1], "cache")
@@ -339,7 +339,7 @@ def read_catalogue(
         return Catalogue(
             None,
             "none",
-            f"the catalogue of {_shown(config.base_url)} could not be read ({why}); model names not checked",
+            f"the catalogue of {redact_url(config.base_url)} could not be read ({why}); model names not checked",
         )
     with contextlib.suppress(OSError):  # an unwritable cache only costs the next call a fetch
         file.parent.mkdir(parents=True, exist_ok=True)
@@ -349,7 +349,7 @@ def read_catalogue(
     return Catalogue(ids, "endpoint")
 
 
-def _bare(name: str) -> str:
+def bare_id(name: str) -> str:
     return name.rsplit("/", 1)[-1].lower()
 
 
@@ -357,10 +357,10 @@ def closest(name: str, ids: Iterable[str], n: int = 3) -> list[str]:
     """Return up to ``n`` ids nearest ``name``: equal but for case and vendor prefix, else difflib's closest."""
     by_bare: dict[str, list[str]] = {}
     for candidate in ids:
-        by_bare.setdefault(_bare(candidate), []).append(candidate)
-    if _bare(name) in by_bare:
-        return by_bare[_bare(name)][:n]
-    picks = difflib.get_close_matches(_bare(name), list(by_bare), n=n, cutoff=0.6)
+        by_bare.setdefault(bare_id(candidate), []).append(candidate)
+    if bare_id(name) in by_bare:
+        return by_bare[bare_id(name)][:n]
+    picks = difflib.get_close_matches(bare_id(name), list(by_bare), n=n, cutoff=0.6)
     return [candidate for bare in picks for candidate in by_bare[bare]][:n]
 
 
@@ -424,7 +424,7 @@ def resolve_names(
     found = misses(names, catalogue)
     labels = names if isinstance(names, Mapping) else {}
     where = (
-        f"the catalogue of {_shown(config.base_url)}"
+        f"the catalogue of {redact_url(config.base_url)}"
         if catalogue.source != "configured" and config.base_url
         else f"the configured catalogue ({MODELS_ENV} or endpoint.catalogue)"
     )
@@ -446,7 +446,7 @@ PARAMS: dict[str, tuple[type, ...]] = {
 }
 """The model parameters a ``models:`` entry may set, with the types each takes."""
 
-_LLM_PARAMS = {"max_tokens": "max_tokens", "timeout_s": "call_timeout_s"}  # the others go out with each request
+LLM_PARAMS = {"max_tokens": "max_tokens", "timeout_s": "call_timeout_s"}  # the others go out with each request
 
 
 @dataclass(frozen=True)
@@ -488,7 +488,7 @@ class ModelEntry(Capabilities):
         for key, value in entry.items():
             if key in PARAMS:
                 if isinstance(value, bool) or not isinstance(value, PARAMS[key]):
-                    raise ValueError(f"{where} {key} is {_PARAM_WORDS.get(PARAMS[key], 'a number')}, not {value!r}")
+                    raise ValueError(f"{where} {key} is {PARAM_WORDS.get(PARAMS[key], 'a number')}, not {value!r}")
                 params.append((key, value))
         if model is None and not params:
             return stated
@@ -500,8 +500,8 @@ class ModelEntry(Capabilities):
 
     def llm_kwargs(self) -> dict[str, Any]:
         """Return the parameters as :class:`~xmas.llms.APILLM` takes them; ``timeout_s`` is ``call_timeout_s``."""
-        kwargs: dict[str, Any] = {_LLM_PARAMS[key]: value for key, value in self.params if key in _LLM_PARAMS}
-        sent = {key: value for key, value in self.params if key not in _LLM_PARAMS}
+        kwargs: dict[str, Any] = {LLM_PARAMS[key]: value for key, value in self.params if key in LLM_PARAMS}
+        sent = {key: value for key, value in self.params if key not in LLM_PARAMS}
         return {**kwargs, "call_kwargs": sent} if sent else kwargs
 
 
@@ -516,13 +516,14 @@ class Unconfigured(BaseLLM):
         self.model = model
         self.accepts, self.produces = capabilities.accepts, capabilities.produces
 
-    def _fail(self, *_: Any, **__: Any) -> NoReturn:
+    def fail(self, *args: Any, **kwargs: Any) -> NoReturn:  # noqa: ARG002 (stands in for every call method)
+        """Refuse the call: the model has no endpoint to send it to."""
         raise ValueError(
             f"model {self.model!r} has no endpoint: set XMAS_BASE_URL, or base_url under [endpoint] in {config_path()}"
         )
 
-    _get_response = generate_with_meta = get_tool_response = get_tool_response_meta = _fail
-    generate_parts_with_meta = generate_image_with_meta = _fail
+    _get_response = generate_with_meta = get_tool_response = get_tool_response_meta = fail
+    generate_parts_with_meta = generate_image_with_meta = fail
 
 
 def build_llms(names: Iterable[str], models: Mapping[str, Capabilities], config: Config) -> dict[str, BaseLLM]:

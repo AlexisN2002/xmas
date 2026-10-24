@@ -28,7 +28,7 @@ from xmas.llms.meta import CallMeta, TokenPrice, cut_meta, meta_from_completion
 from xmas.llms.parts import Part, prompt_messages, record_text
 from xmas.llms.scoring import ScoredSequence
 from xmas.media import Capabilities
-from xmas.tools import Tool, ToolCallRequest, _turn_usage
+from xmas.tools import Tool, ToolCallRequest, turn_usage
 from xmas.trace import TokenUsage
 from xmas.utils import approximate_tokens, error_message, retry_after_seconds, timestamp
 
@@ -36,14 +36,14 @@ from xmas.utils import approximate_tokens, error_message, retry_after_seconds, t
 # completion id travels to CallRecord.response_id(s) in this per-request slot (each
 # prompt of a batch runs as its own task); a request outside that loop writes to the
 # default slot, which no one reads.
-_completion_id: ContextVar[list[str | None]] = ContextVar("xmas_completion_id", default=[None])  # noqa: B039
+completion_id: ContextVar[list[str | None]] = ContextVar("xmas_completion_id", default=[None])  # noqa: B039
 
-_STREAM = {"stream": True, "stream_options": {"include_usage": True}}
+STREAM = {"stream": True, "stream_options": {"include_usage": True}}
 """What a streamed request adds to the request, after its other keys."""
 
 
 @dataclass
-class _Progress:
+class Progress:
     """What one streamed attempt sent and has received so far, for the meta of a call cut before it finished."""
 
     messages: list[dict[str, Any]] | None = None
@@ -51,22 +51,22 @@ class _Progress:
     model: str | None = None
 
 
-# _ask's thread sets an attempt's progress; the request coroutine, scheduled from
+# ask's thread sets an attempt's progress; the request coroutine, scheduled from
 # that thread, runs in a copy of its context and fills it.
-_progress: ContextVar[_Progress | None] = ContextVar("xmas_progress", default=None)
+current_progress: ContextVar[Progress | None] = ContextVar("xmas_progress", default=None)
 
-_IMAGE_MODALITIES = ("image", "text")
+IMAGE_MODALITIES = ("image", "text")
 """What an image request asks for: OpenRouter's ``modalities``, images first."""
 
-_DATA_URI = re.compile(r"data:([^;,]+);base64,(.*)", re.DOTALL)
+DATA_URI = re.compile(r"data:([^;,]+);base64,(.*)", re.DOTALL)
 
 
-class _Completion(str):
+class Completion(str):
     """A response string that remembers which provider completion it came from."""
 
     completion_id: str | None
 
-    def __new__(cls, text: str, completion_id: str | None) -> _Completion:
+    def __new__(cls, text: str, completion_id: str | None) -> Completion:
         """Wrap ``text``, attaching ``completion_id``."""
         instance = super().__new__(cls, text)
         instance.completion_id = completion_id
@@ -155,7 +155,7 @@ class APILLM(promptolution.APILLM):
             raise ValueError("APILLM needs a base_url, or XMAS_BASE_URL set in the environment.")
         self.call_log = call_log
         self.backend_tag = backend_tag
-        self.full_response: bool = not _overrides_call_path(type(self)) if full_response is None else full_response
+        self.full_response: bool = not overrides_call_path(type(self)) if full_response is None else full_response
         self.price = price
         self.stream = stream
         stated = Capabilities.parse({"accepts": accepts, "produces": produces}, "APILLM")
@@ -168,7 +168,7 @@ class APILLM(promptolution.APILLM):
         if self.call_log is not None:
             self.call_log.record(record)
 
-    def _log(
+    def log(
         self, operation: str, started: float, started_at: str, *, error: BaseException | None = None, **fields: Any
     ) -> None:
         """Record one call that started at ``started``; ``error`` marks it failed."""
@@ -185,13 +185,13 @@ class APILLM(promptolution.APILLM):
             )
         )
 
-    def _log_answer(
+    def log_answer(
         self, started: float, started_at: str, meta: CallMeta, estimate: TokenUsage, **fields: Any
     ) -> TokenUsage:
         """Record an answered ``generate`` call with the provider's token counts, else ``estimate``; return them."""
         tokens = estimate if meta.tokens is None else meta.tokens
         fields.setdefault("params", self.call_params())
-        self._log(
+        self.log(
             "generate",
             started,
             started_at,
@@ -208,24 +208,24 @@ class APILLM(promptolution.APILLM):
         # Headers can carry credentials, so they never reach a record.
         params.pop("extra_headers", None)
         if self.stream:
-            params.update(_STREAM)
+            params.update(STREAM)
         return params
 
     async def _ainvoke_once(self, prompt: str, system_prompt: str) -> ChatCompletion:
         """Make promptolution's request, noting the provider's completion id for the caller."""
-        completion = await self._once(self._request(prompt_messages(prompt, system_prompt)))
-        _completion_id.get()[0] = completion.id
+        completion = await self.once(self.request(prompt_messages(prompt, system_prompt)))
+        completion_id.get()[0] = completion.id
         return completion
 
     async def _ainvoke_with_retries(self, prompt: str, system_prompt: str) -> str:
         """Run promptolution's retry loop and tag the answer with the id of the attempt that returned it."""
         slot: list[str | None] = [None]
-        token = _completion_id.set(slot)
+        token = completion_id.set(slot)
         try:
             content = await super()._ainvoke_with_retries(prompt, system_prompt)
         finally:
-            _completion_id.reset(token)
-        return _Completion(content, slot[0])
+            completion_id.reset(token)
+        return Completion(content, slot[0])
 
     def get_response(
         self,
@@ -245,20 +245,20 @@ class APILLM(promptolution.APILLM):
         try:
             tagged = super().get_response(prompts, system_prompts)
         except Exception as error:
-            self._log(
+            self.log(
                 "generate",
                 started,
                 started_at,
                 error=error,
                 n_prompts=n_prompts,
                 params=params,
-                **self._provenance(prompts, system_prompts, None, None),
+                **self.provenance(prompts, system_prompts, None, None),
             )
             raise
         after = self.get_token_count()
         response_ids = [getattr(response, "completion_id", None) for response in tagged]
         responses = [str(response) for response in tagged]  # plain strings, not the tagged subclass
-        self._log(
+        self.log(
             "generate",
             started,
             started_at,
@@ -266,11 +266,11 @@ class APILLM(promptolution.APILLM):
             output_tokens=after["output_tokens"] - before["output_tokens"],
             n_prompts=n_prompts,
             params=params,
-            **self._provenance(prompts, system_prompts, responses, response_ids),
+            **self.provenance(prompts, system_prompts, responses, response_ids),
         )
         return responses
 
-    def _provenance(
+    def provenance(
         self,
         prompts: str | list[str],
         system_prompts: str | list[str] | None,
@@ -328,15 +328,15 @@ class APILLM(promptolution.APILLM):
             EmptyResponse: If no attempt's response had a choice, or the model
                 was cut or refused before it wrote any text or call.
         """
-        request = self._request(messages)
+        request = self.request(messages)
         if tools:
             request["tools"] = [spec.to_openai() for spec in tools]
         started_at = timestamp()
         started = time.perf_counter()
         try:
-            completion, meta = self._ask(request, "tool turn", tool_turn=True)
+            completion, meta = self.ask(request, "tool turn", tool_turn=True)
         except Exception as error:
-            self._log("generate", started, started_at, error=error, params=self.call_params())
+            self.log("generate", started, started_at, error=error, params=self.call_params())
             raise
         message = completion.choices[0].message
         text = message.content or ""
@@ -345,8 +345,8 @@ class APILLM(promptolution.APILLM):
             for call in message.tool_calls or []
             if call.type == "function"
         ]
-        estimate = _turn_usage(approximate_tokens, messages, text, requests)
-        tokens = self._log_answer(started, started_at, meta, estimate, response_id=completion.id)
+        estimate = turn_usage(approximate_tokens, messages, text, requests)
+        tokens = self.log_answer(started, started_at, meta, estimate, response_id=completion.id)
         self.input_token_count += tokens.input_tokens
         self.output_token_count += tokens.output_tokens
         return text, requests, meta
@@ -363,7 +363,7 @@ class APILLM(promptolution.APILLM):
                 refused; otherwise after the last attempt.
             TimeoutError: If the call outlives ``gather_timeout_s + 5``.
         """
-        _, text, meta = self._generate(prompt, system_prompt)
+        _, text, meta = self.generate(prompt, system_prompt)
         return text, meta
 
     def generate_parts_with_meta(
@@ -381,7 +381,7 @@ class APILLM(promptolution.APILLM):
             EmptyResponse: As :meth:`generate_with_meta`.
             TimeoutError: As :meth:`generate_with_meta`.
         """
-        _, text, meta = self._generate(parts, system_prompt)
+        _, text, meta = self.generate(parts, system_prompt)
         return text, meta
 
     def generate_image_with_meta(
@@ -404,25 +404,25 @@ class APILLM(promptolution.APILLM):
             ValueError: If a part cannot be sent (see :func:`~xmas.llms.parts.to_content`).
             TimeoutError: As :meth:`generate_with_meta`.
         """
-        completion, text, meta = self._generate(prompt, system_prompt, modalities=list(_IMAGE_MODALITIES))
+        completion, text, meta = self.generate(prompt, system_prompt, modalities=list(IMAGE_MODALITIES))
         try:
-            images = [_decode_image(url) for url in _image_urls(completion.choices[0].message)]
+            images = [decode_image(url) for url in image_urls(completion.choices[0].message)]
         except XmasError as error:  # the call was paid: the meta goes with the error to the meter
             raise EmptyResponse(str(error), kind=ErrorKind.BAD_FORMAT, meta=meta) from None
         return text, images, meta
 
-    def _request(self, messages: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+    def request(self, messages: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
         """Return promptolution's request for ``messages``, with ``extra`` keys before ``call_kwargs``."""
         request: dict[str, Any] = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
         request.update(extra)
         request.update(self._call_kwargs)
         return request
 
-    def _generate(
+    def generate(
         self, prompt: str | Sequence[Part], system_prompt: str, **extra: Any
     ) -> tuple[ChatCompletion, str, CallMeta]:
         """Send one generation with ``extra`` request keys, record it, and move the token counters by its text."""
-        request = self._request(prompt_messages(prompt, system_prompt), **extra)
+        request = self.request(prompt_messages(prompt, system_prompt), **extra)
         shown = prompt if isinstance(prompt, str) else record_text(prompt)
         counted = prompt if isinstance(prompt, str) else "".join(part for part in prompt if isinstance(part, str))
         logged = {"params": self.call_params()}
@@ -431,19 +431,19 @@ class APILLM(promptolution.APILLM):
         started_at = timestamp()
         started = time.perf_counter()
         try:
-            completion, meta = self._ask(request, "model call", images="modalities" in extra)
+            completion, meta = self.ask(request, "model call", images="modalities" in extra)
         except Exception as error:
-            fields = self._provenance(shown, system_prompt, None, None)
-            self._log("generate", started, started_at, error=error, **logged, **fields)
+            fields = self.provenance(shown, system_prompt, None, None)
+            self.log("generate", started, started_at, error=error, **logged, **fields)
             raise
         text = completion.choices[0].message.content or ""
         self.update_token_count([counted, system_prompt], [text])
         estimate = TokenUsage(approximate_tokens(counted) + approximate_tokens(system_prompt), approximate_tokens(text))
-        fields = self._provenance(shown, system_prompt, [text], [completion.id])
-        self._log_answer(started, started_at, meta, estimate, **logged, **fields)
+        fields = self.provenance(shown, system_prompt, [text], [completion.id])
+        self.log_answer(started, started_at, meta, estimate, **logged, **fields)
         return completion, text, meta
 
-    def _ask(
+    def ask(
         self, request: dict[str, Any], what: str, *, tool_turn: bool = False, images: bool = False
     ) -> tuple[ChatCompletion, CallMeta]:
         """Send ``request`` until the response has an answer, summing the paid attempts into one meta.
@@ -453,19 +453,19 @@ class APILLM(promptolution.APILLM):
         finished cleanly. An empty answer
         that was cut or refused raises at once, since the same request would
         only repeat it. Inside a metered call the waits end once the call's
-        :func:`~xmas.budget.cancel_flag` is set (:meth:`_wait`).
+        :func:`~xmas.budget.cancel_flag` is set (:meth:`wait`).
         """
         paid: CallMeta | None = None
         flag = cancel_flag()
         for attempt in range(self.max_retries + 1):
             started = time.perf_counter()
-            progress = _Progress()
-            token = _progress.set(progress)
+            progress = Progress()
+            token = current_progress.set(progress)
             try:
-                future = asyncio.run_coroutine_threadsafe(self._send(request), self._loop)
+                future = asyncio.run_coroutine_threadsafe(self.send(request), self._loop)
             finally:
-                _progress.reset(token)
-            completion = self._wait(future, what, flag, started, progress, paid)
+                current_progress.reset(token)
+            completion = self.wait(future, what, flag, started, progress, paid)
             meta = meta_from_completion(completion, time.perf_counter() - started, self.price)
             paid = meta if paid is None else paid.combine(meta)
             if completion.choices:
@@ -473,7 +473,7 @@ class APILLM(promptolution.APILLM):
                 empty = (
                     message.content is None
                     and not (tool_turn and message.tool_calls)
-                    and not (images and _image_urls(message))
+                    and not (images and image_urls(message))
                 )
                 if empty and meta.error_kind is not None:
                     raise EmptyResponse(
@@ -491,13 +491,13 @@ class APILLM(promptolution.APILLM):
                     flag.check(paid)
         raise EmptyResponse(f"Empty content from model after {self.max_retries + 1} attempts", meta=paid)
 
-    def _wait(
+    def wait(
         self,
         future: Future[ChatCompletion],
         what: str,
         flag: CancelFlag | None,
         started: float,
-        progress: _Progress,
+        progress: Progress,
         paid: CallMeta | None,
     ) -> ChatCompletion:
         """Wait for one attempt until promptolution's batch deadline, checking ``flag`` every :data:`SLICE_S`.
@@ -520,7 +520,7 @@ class APILLM(promptolution.APILLM):
                     tokens = (
                         None
                         if progress.messages is None
-                        else _turn_usage(approximate_tokens, progress.messages, received, [])
+                        else turn_usage(approximate_tokens, progress.messages, received, [])
                     )
                     cut = cut_meta(time.perf_counter() - started, tokens, progress.model, self.price)
                     flag.check(cut if paid is None else paid.combine(cut), received)
@@ -528,33 +528,33 @@ class APILLM(promptolution.APILLM):
                     future.cancel()
                     raise TimeoutError(f"{what} timed out after {deadline}s") from None
 
-    async def _send(self, request: dict[str, Any]) -> ChatCompletion:
+    async def send(self, request: dict[str, Any]) -> ChatCompletion:
         """Make ``request``, retrying with promptolution's backoff unless the error is permanent."""
         attempt = 0
         while True:
             try:
-                return await self._once(request)
+                return await self.once(request)
             except Exception as exc:
-                if _is_permanent(exc) or attempt >= self.max_retries:
+                if is_permanent(exc) or attempt >= self.max_retries:
                     raise
                 await asyncio.sleep(self.retry_base_delay_s * (2**attempt))
                 attempt += 1
 
-    async def _once(self, request: dict[str, Any]) -> ChatCompletion:
+    async def once(self, request: dict[str, Any]) -> ChatCompletion:
         """Make ``request`` once, in a slot of promptolution's semaphore, within its per-call timeout."""
         async with self._sem:
-            return await asyncio.wait_for(self._completion(request), timeout=self.call_timeout_s)
+            return await asyncio.wait_for(self.completion(request), timeout=self.call_timeout_s)
 
-    async def _completion(self, kwargs: dict[str, Any]) -> ChatCompletion:
-        """Send ``kwargs``; when streaming, with :data:`_STREAM` added, the chunks assembled (:func:`assemble`)."""
+    async def completion(self, kwargs: dict[str, Any]) -> ChatCompletion:
+        """Send ``kwargs``; when streaming, with :data:`STREAM` added, the chunks assembled (:func:`assemble`)."""
         if not self.stream:
             completion: ChatCompletion = await self.client.chat.completions.create(**kwargs)
             return completion
-        progress = _progress.get() or _Progress()
+        progress = current_progress.get() or Progress()
         progress.messages = kwargs["messages"]
         progress.text.clear()  # a retry starts its answer anew
         chunks: list[ChatCompletionChunk] = []
-        stream = await self.client.chat.completions.create(**{**kwargs, **_STREAM})  # as call_params records it
+        stream = await self.client.chat.completions.create(**{**kwargs, **STREAM})  # as call_params records it
         try:
             async for chunk in stream:
                 chunks.append(chunk)
@@ -598,11 +598,11 @@ class APILLM(promptolution.APILLM):
             )
             scored = parse_score(response)
         except Exception as error:
-            self._log("score", started, started_at, error=error)
+            self.log("score", started, started_at, error=error)
             raise
         # A probe is billed for the prompt and the continuation both, decodes
         # nothing, and measures the continuation alone.
-        self._log(
+        self.log(
             "score",
             started,
             started_at,
@@ -668,7 +668,7 @@ def assemble(chunks: Sequence[ChatCompletionChunk]) -> ChatCompletion:
     return ChatCompletion.construct(**body)
 
 
-def _image_urls(message: ChatCompletionMessage) -> list[str]:
+def image_urls(message: ChatCompletionMessage) -> list[str]:
     """Return the image URLs of an answer's ``images`` list, which the client keeps as an extra field."""
     entries = (message.model_extra or {}).get("images") or []
     urls = []
@@ -680,13 +680,13 @@ def _image_urls(message: ChatCompletionMessage) -> list[str]:
     return urls
 
 
-def _decode_image(url: str) -> tuple[bytes, str]:
+def decode_image(url: str) -> tuple[bytes, str]:
     """Return a ``data:`` URI's bytes and media type.
 
     Raises:
         XmasError: For any other URL, which xmas would have to fetch, or invalid base64.
     """
-    found = _DATA_URI.fullmatch(url)
+    found = DATA_URI.fullmatch(url)
     if found is None:
         raise XmasError(f"llm: an image answer is not a base64 data URI ({url[:40]}...); xmas reads no network")
     try:
@@ -695,7 +695,7 @@ def _decode_image(url: str) -> tuple[bytes, str]:
         raise XmasError(f"llm: an image answer's base64 is invalid: {exc}") from None
 
 
-def _is_permanent(exc: BaseException) -> bool:
+def is_permanent(exc: BaseException) -> bool:
     """Whether retrying cannot help: a 4xx other than 408, 409 and 429, or a 4xx that names money."""
     if not isinstance(exc, openai.APIStatusError) or not 400 <= exc.status_code < 500:
         return False
@@ -703,7 +703,7 @@ def _is_permanent(exc: BaseException) -> bool:
     return exc.status_code not in (408, 409, 429) or MONEY_WORDS.search(text) is not None
 
 
-_CALL_PATH = (
+CALL_PATH = (
     "get_response",
     "_get_response",
     "_aget_batch",
@@ -714,9 +714,9 @@ _CALL_PATH = (
 """The hooks whose override keeps a class on promptolution's path by default."""
 
 
-def _overrides_call_path(cls: type) -> bool:
-    """Whether ``cls`` replaces a hook of :data:`_CALL_PATH`."""
-    return any(getattr(cls, name) is not getattr(APILLM, name) for name in _CALL_PATH)
+def overrides_call_path(cls: type) -> bool:
+    """Whether ``cls`` replaces a hook of :data:`CALL_PATH`."""
+    return any(getattr(cls, name) is not getattr(APILLM, name) for name in CALL_PATH)
 
 
 def parse_score(response: httpx.Response) -> ScoredSequence:

@@ -59,7 +59,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.llms.parts import Part
 
 
-def _return_type(fn: Callable[..., Any] | None) -> ValueType:
+def return_type(fn: Callable[..., Any] | None) -> ValueType:
     """Return the type a callable's single write has: text for a ``str`` return hint or a remote tool, else json."""
     if fn is None:
         return TEXT
@@ -111,7 +111,7 @@ class Tool:
             raise ValueError(
                 f"Tool name {name!r} must match the OpenAI rule: letters, digits, _ and -, at most 64 characters."
             )
-        given = {name: _return_type(fn)} if writes is None else writes
+        given = {name: return_type(fn)} if writes is None else writes
         if not given:
             raise ValueError(f"Tool {name!r} needs at least one write.")
         typed = {key: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for key, vtype in given.items()}
@@ -413,7 +413,7 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
     if spec.fn is not None:
         result = spec.fn(**kwargs)
     elif only is not None and media_kind(only) is not None:
-        result = _stored_blocks(spec.name, source.call_media(spec.name, kwargs), only)
+        result = stored_blocks(spec.name, source.call_media(spec.name, kwargs), only)
     else:
         text = source.call(spec.name, kwargs)
         if only == TEXT:
@@ -440,7 +440,7 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
     return produced
 
 
-def _stored_blocks(name: str, blocks: list[tuple[bytes, str]], vtype: ValueType) -> Any:
+def stored_blocks(name: str, blocks: list[tuple[bytes, str]], vtype: ValueType) -> Any:
     """Store a remote tool's media blocks: the one ref for a single value, every ref for a list."""
     if vtype.item is None and len(blocks) != 1:
         raise BadFormat(name, (f"expected one {vtype} block, got {len(blocks)}",))
@@ -449,7 +449,7 @@ def _stored_blocks(name: str, blocks: list[tuple[bytes, str]], vtype: ValueType)
     return refs if vtype.item is not None else refs[0]
 
 
-def _turn_usage(
+def turn_usage(
     count: Callable[[str], float], messages: list[dict[str, Any]], text: str, requests: Sequence[ToolCallRequest]
 ) -> TokenUsage:
     """Estimate one tool turn's tokens with ``count``: every message's text in, the text and call arguments out."""
@@ -513,7 +513,7 @@ def run_tool_loop(
         (text, requests), turn_meta = meter.metered(lambda: ask(offered), llm=llm)
         if turn_meta is not None:
             meta = turn_meta if meta is None else meta.combine(turn_meta)
-        usage = usage + _turn_usage(count_tokens, messages, text, requests)
+        usage = usage + turn_usage(count_tokens, messages, text, requests)
         return text, requests
 
     def checked(text: str) -> str:

@@ -143,21 +143,21 @@ def summarize(
     record, and an unknown cost or latency is never over.
     """
     settings = settings or HealthSettings()
-    items, over = _items(records, chains or {})
+    items, over = item_health(records, chains or {})
     return Health(
-        flags=_flags(records, settings, None if values is None else frozenset(values), over),
-        loops=_loops(records, while_edges),
-        budget=_budget_use(meter, records),
+        flags=flags(records, settings, None if values is None else frozenset(values), over),
+        loops=loops(records, while_edges),
+        budget=budget_use(meter, records),
         items=items,
     )
 
 
-def _text(record: AgentRecord) -> str:
+def outputs_text(record: AgentRecord) -> str:
     """Return a record's outputs as one text."""
     return "\n".join(record.outputs.values())
 
 
-def _flags(
+def flags(
     records: Sequence[AgentRecord],
     settings: HealthSettings,
     values: frozenset[str] | None,
@@ -168,20 +168,20 @@ def _flags(
     lengths: dict[str, list[int]] = {}
     for record in records:
         if record.error is None:
-            lengths.setdefault(record.agent, []).append(len(_text(record)))
+            lengths.setdefault(record.agent, []).append(len(outputs_text(record)))
     medians = {node: statistics.median(sizes) for node, sizes in lengths.items() if len(sizes) >= settings.min_samples}
     previous: dict[tuple[str, int | None], AgentRecord] = {}
     flags: list[Flag] = []
     for position, record in enumerate(records):
         mine = (record.agent, record.item)
-        found = _record_signals(record, previous.get(mine), leaks, medians.get(record.agent), settings, values)
+        found = record_signals(record, previous.get(mine), leaks, medians.get(record.agent), settings, values)
         found += over.get(position, [])
         flags.extend(Flag(signal, record.agent, record.step, detail) for signal, detail in found)
         previous[mine] = record
     return tuple(flags)
 
 
-def _record_signals(
+def record_signals(
     record: AgentRecord,
     before: AgentRecord | None,
     leaks: list[re.Pattern[str]],
@@ -190,9 +190,9 @@ def _record_signals(
     values: frozenset[str] | None,
 ) -> list[tuple[str, str]]:
     """Return ``(signal, detail)`` for each signal one record shows, in the order of the table."""
-    ok, text = record.error is None, _text(record)
+    ok, text = record.error is None, outputs_text(record)
     failure = f"{'unknown' if record.error_kind is None else record.error_kind.value}: {record.error}"
-    same = before.step if before is not None and before.error is None and _text(before) == text else None
+    same = before.step if before is not None and before.error is None and outputs_text(before) == text else None
     placeholders = extract_placeholders(record.prompt)
     missing = sorted((placeholders if values is None else placeholders & values) - set(record.inputs))
     leak = next((match.group() for pattern in leaks if (match := pattern.search(text))), None)
@@ -205,7 +205,7 @@ def _record_signals(
         # elsewhere an unrouted failure ended the run, and the trace's error says so
         "item_failed": not (ok or record.route)
         and record.item is not None
-        and f"{_item_name(record)} failed: {failure}",
+        and f"{item_name(record)} failed: {failure}",
         "empty": ok and not text.strip() and "the output is empty",
         "stuck": ok and bool(text.strip()) and same is not None and f"the same output as step {same}",
         "unfilled": ok and missing and f"placeholders without a value: {', '.join(missing)}",
@@ -216,7 +216,7 @@ def _record_signals(
     return [(signal, detail) for signal, detail in signals.items() if isinstance(detail, str) and detail]
 
 
-def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]]) -> dict[str, dict[str, Any]]:
+def loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]]) -> dict[str, dict[str, Any]]:
     """Return ``{"source -> target": {"taken", "cap_hit"}}`` for each while edge taken or capped."""
     loops: dict[str, dict[str, Any]] = {}
     for source, target in dict.fromkeys(while_edges):
@@ -228,7 +228,7 @@ def _loops(records: Sequence[AgentRecord], while_edges: Iterable[tuple[str, str]
     return loops
 
 
-def _budget_use(meter: RunMeter | None, records: Sequence[AgentRecord]) -> dict[str, dict[str, float]]:
+def budget_use(meter: RunMeter | None, records: Sequence[AgentRecord]) -> dict[str, dict[str, float]]:
     """Return ``{limit: {"spent", "limit"}}`` for each limit the meter's budget sets, then the time waited."""
     use: dict[str, dict[str, float]] = {}
     budget = None if meter is None else meter.budget
@@ -246,18 +246,18 @@ def _budget_use(meter: RunMeter | None, records: Sequence[AgentRecord]) -> dict[
     return use
 
 
-def _item_name(record: AgentRecord) -> str:
+def item_name(record: AgentRecord) -> str:
     """Return how a flag names a record's item, such as ``item 2 (page-3)``."""
     return f"item {record.item}" + ("" if record.item_key is None else f" ({record.item_key})")
 
 
-def _total(parts: Iterable[float | None]) -> float | None:
+def total(parts: Iterable[float | None]) -> float | None:
     """Return the sum, or ``None`` when any part is unknown."""
     numbers = list(parts)
     return None if None in numbers else sum(number for number in numbers if number is not None)
 
 
-def _items(
+def item_health(
     records: Sequence[AgentRecord], chains: Mapping[str, tuple[Sequence[str], Mapping[str, float]]]
 ) -> tuple[dict[str, dict[str, Any]], dict[int, list[tuple[str, str]]]]:
     """Return ``Health.items`` and the item budget flags keyed by the position of each item's last record."""
@@ -272,12 +272,12 @@ def _items(
         failed = 0
         for item, positions in by_item.items():
             mine = [records[position] for position in positions]
-            costs[item] = cost = _total(record.cost_usd for record in mine)
-            wall = _total(record.latency_s for record in mine)
+            costs[item] = cost = total(record.cost_usd for record in mine)
+            wall = total(record.latency_s for record in mine)
             failed += any(record.error is not None and not record.route for record in mine)
             for limit, spent, said in (("cost_usd", cost, "cost {:g} USD"), ("wall_s", wall, "took {:g} s")):
                 if limit in budget and spent is not None and spent > budget[limit]:
-                    detail = f"{_item_name(mine[-1])} {said.format(spent)}, over its budget of {budget[limit]:g}"
+                    detail = f"{item_name(mine[-1])} {said.format(spent)}, over its budget of {budget[limit]:g}"
                     over.setdefault(positions[-1], []).append(("item_over_budget", detail))
         items[head] = {"items": len(costs), "failed": failed, "cost_usd": costs}
     return items, over

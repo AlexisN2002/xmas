@@ -57,8 +57,8 @@ class TokenUsage:
         return TokenUsage(
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
-            cached_tokens=_add_counts(self.cached_tokens, other.cached_tokens),
-            reasoning_tokens=_add_counts(self.reasoning_tokens, other.reasoning_tokens),
+            cached_tokens=add_counts(self.cached_tokens, other.cached_tokens),
+            reasoning_tokens=add_counts(self.reasoning_tokens, other.reasoning_tokens),
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -72,7 +72,7 @@ class TokenUsage:
         return data | {key: count for key, count in counts.items() if count is not None}
 
 
-def _add_counts(left: int | None, right: int | None) -> int | None:
+def add_counts(left: int | None, right: int | None) -> int | None:
     """Sum two optional counts, giving ``None`` only when both are ``None``."""
     if left is None and right is None:
         return None

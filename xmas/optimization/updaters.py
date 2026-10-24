@@ -121,7 +121,7 @@ class AgentPromptView(BasePredictor):
         """Run the system on ``xs`` with each prompt in this view's agent; ``BasePredictor``'s pair."""
         candidates = [prompts] * len(xs) if isinstance(prompts, str) else list(prompts)
         base = self.mas.prompts()
-        encoded = [encode_prompts({**base, **self.mas._spread({self.agent: prompt})}) for prompt in candidates]
+        encoded = [encode_prompts({**base, **self.mas.spread({self.agent: prompt})}) for prompt in candidates]
         return self.mas.predict(encoded, xs, system_prompts=system_prompts)
 
     # promptolution's BasePredictor calls _extract_preds on every prediction batch.

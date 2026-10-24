@@ -25,10 +25,10 @@ if TYPE_CHECKING:  # pragma: no cover
 ITEM_BUDGET_KEYS = ("cost_usd", "wall_s")
 """What an item budget may limit: an item's summed cost in USD and its summed latency in seconds."""
 
-_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
-_PATH = rf"{_NAME}(?:\.{_NAME})*"
-_FORM = re.compile(rf"\A\s*({_NAME})\s+in\s+({_PATH})\s*\Z")
-_SPEC_KEYS = {"item": "item", "in": "over", "at once": "at_once", "key": "key", "item budget": "item_budget"}
+NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+PATH = rf"{NAME}(?:\.{NAME})*"
+FORM = re.compile(rf"\A\s*({NAME})\s+in\s+({PATH})\s*\Z")
+SPEC_KEYS = {"item": "item", "in": "over", "at once": "at_once", "key": "key", "item budget": "item_budget"}
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,7 @@ class ForEach:
         item: Any = self.item
         over: Any = self.over
         if not (
-            isinstance(item, str) and isinstance(over, str) and re.fullmatch(_NAME, item) and re.fullmatch(_PATH, over)
+            isinstance(item, str) and isinstance(over, str) and re.fullmatch(NAME, item) and re.fullmatch(PATH, over)
         ):
             raise ValueError(
                 f"for each {item!r} in {over!r}: the item is a name and the list a value name with '.field' steps, "
@@ -67,7 +67,7 @@ class ForEach:
         if at_once is not None and (isinstance(at_once, bool) or not isinstance(at_once, int) or at_once < 1):
             raise ValueError(f"for each {self}: at once must be a positive integer, got {at_once!r}.")
         key: Any = self.key
-        if key is not None and not (isinstance(key, str) and re.fullmatch(_NAME, key)):
+        if key is not None and not (isinstance(key, str) and re.fullmatch(NAME, key)):
             raise ValueError(f"for each {self}: key names a field of the item, got {key!r}.")
         budget: Any = self.item_budget
         if budget is None:
@@ -110,17 +110,17 @@ class ForEach:
     def parse(cls, spec: str | Mapping[str, Any]) -> ForEach:
         """Read ``"page in plan.slides"``, or ``{item: page, in: plan.slides}`` with any of the options."""
         if isinstance(spec, str):
-            match = _FORM.match(spec)
+            match = FORM.match(spec)
             if match is None:
                 raise ValueError(f"for each {spec!r} must read '<item> in <list>', such as 'page in plan.slides'.")
             return cls(match[1], match[2])
         if not isinstance(spec, Mapping):
             raise ValueError(f"for each is a text such as 'page in plan.slides' or a mapping, not {spec!r}.")
-        unknown, missing = sorted(set(spec) - set(_SPEC_KEYS)), sorted({"item", "in"} - set(spec))
+        unknown, missing = sorted(set(spec) - set(SPEC_KEYS)), sorted({"item", "in"} - set(spec))
         if unknown or missing:
             problem = f"has unknown keys {unknown}" if unknown else f"is missing the keys {missing}"
-            raise ValueError(f"for each {dict(spec)!r} {problem}; it takes {list(_SPEC_KEYS)}.")
-        return cls(**{_SPEC_KEYS[key]: value for key, value in spec.items()})
+            raise ValueError(f"for each {dict(spec)!r} {problem}; it takes {list(SPEC_KEYS)}.")
+        return cls(**{SPEC_KEYS[key]: value for key, value in spec.items()})
 
 
 @dataclass(frozen=True)
