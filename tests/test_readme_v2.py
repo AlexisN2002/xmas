@@ -46,6 +46,7 @@ from xmas.predicates import Context, parse_predicate
 from xmas.tools import Tool, ToolSource, tool
 
 from .conftest import PNG, MockLLM, PaintingLLM, SeeingLLM, req
+from .test_stop import PollingLLM
 
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -487,7 +488,7 @@ def test_an_unrouted_error_fails_the_run_and_budget_and_stop_are_never_routable(
 
 
 def test_the_operator_table_matches_the_edge_kinds_and_the_spec_forms() -> None:
-    assert {kind.value for kind in EdgeKind} == {"plain", "when", "else", "while", "switch", "error"}
+    assert {kind.value for kind in EdgeKind} == {"plain", "when", "else", "while", "switch", "error", "first of"}
     assert Edge("a", "b", kind=EdgeKind.SWITCH, switch="verdict.action").case == "b"
     forms = {
         "a -> b: {when: verdict.fits}": Edge("a", "b", kind=EdgeKind.WHEN, when="verdict.fits"),
@@ -497,6 +498,7 @@ def test_the_operator_table_matches_the_edge_kinds_and_the_spec_forms() -> None:
         ),
         "a -> b: {switch: verdict.action}": Edge("a", "b", kind=EdgeKind.SWITCH, switch="verdict.action"),
         "a -> b: {on error: [timeout]}": Edge("a", "b", kind=EdgeKind.ERROR, errors=("timeout",)),
+        "a -> b: first of": Edge("a", "b", kind=EdgeKind.FIRST),
     }
     from xmas.edges import parse_edges
 
@@ -1110,6 +1112,139 @@ def test_media_claims_without_a_block(slides: Path) -> None:
     assert "writes" in inspect.signature(mcp.MCPTools).parameters
 
 
+# ---------------------------------------------------------------- People in the graph
+
+
+def test_people_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None:
+    from xmas import END, Human
+
+    llm = scripted()
+
+    editor = Human(
+        "editor",
+        "approve",
+        reads=["draft"],
+        writes="approval",
+        question="Publish this answer? {draft}",
+        labels={"yes": "Publish", "no": "Hold it"},
+    )
+    gated = MAS(
+        [Agent("writer", prompt="Write a short answer to: {query}", output="draft")],
+        steps=[Step("publish", uses="publish")],
+        humans=[editor],
+        edges=[
+            ("writer", "editor"),
+            Edge("editor", "publish", kind=EdgeKind.WHEN, when="approval.approved"),
+            Edge("editor", END, kind=EdgeKind.ELSE),
+        ],
+        tools=[publish],
+        llm=llm,
+    )
+
+    trace = gated.run_state({"query": "Why is the sky blue?"}, run_id="sky-1")
+    print(trace.status, [question.id for question in trace.pause.questions])  # type: ignore[union-attr]  # paused ['sky-1/editor/1']
+    print(trace.pause.questions[0].options)  # type: ignore[union-attr]  # ('Publish', 'Hold it')
+    done = gated.resume("sky-1", {"sky-1/editor/1": {"approved": True, "who": "tom"}})
+    print(done.status, done.output)  # ok Published: Sunlight scatters off air.
+
+    assert capsys.readouterr().out.splitlines() == [
+        "paused ['sky-1/editor/1']",
+        "('Publish', 'Hold it')",
+        f"ok Published: {DRAFT}",
+    ]
+    (record,) = done["editor"]
+    assert (record.kind, record.cost_usd, record.inputs) == ("human", 0.0, {"draft": DRAFT})
+    assert json.loads(record.raw_response)["who"] == "tom" and record.wait_s is not None
+
+
+def test_people_claims_without_a_block() -> None:
+    from xmas import Human, ReplayAsker
+    from xmas.human import ANSWER_FIELDS, COMMON_FIELDS, FORMS
+    from xmas.llms.api_llm import APILLM
+
+    assert FORMS == ("ask", "judge", "approve", "edit")
+    assert ANSWER_FIELDS == {
+        "ask": ("option",),
+        "judge": ("pick",),
+        "approve": ("approved", "option"),
+        "edit": ("changed",),
+    }
+    assert COMMON_FIELDS == ("who", "asked_at", "answered_at", "comment", "timed_out")
+    for form in FORMS:
+        assert f"| `{form}` |" in README
+    for name in ("XMAS_RUNS", "trace.pause", "ReplayAsker(traces)", "withdraw(question, reason)", "stream=True"):
+        assert name in README, name
+    assert inspect.signature(APILLM).parameters["stream"].default is False
+
+    # a timeout takes the default; an unattended run takes it too, or fails by name
+    def gate(**settings: Any) -> MAS:
+        approve = Human("approve", "approve", ["draft"], "approval", question="Ship {draft}?", **settings)
+        return MAS(
+            [Agent("writer", "Write {query}", "draft")], [("writer", "approve")], humans=[approve], llm=scripted()
+        )
+
+    timed = gate(timeout_s=0, default={"approved": False}).run_state({"query": QUERY})
+    assert timed.status == "ok" and json.loads(timed["approve"][0].raw_response)["timed_out"] is True
+    assert gate(default={"approved": True}).run(QUERY).status == "ok"
+    failed = gate().run(QUERY)
+    assert failed.status == "failed" and "human node 'approve' got no answer" in str(failed.error)
+
+    # an asker that replays recorded answers lets a system with people run unattended
+    asked = gate()
+    paused = asked.run_state({"query": QUERY}, run_id="p1")
+    done = asked.resume("p1", {paused.pause.questions[0].id: {"approved": True, "who": "tom"}})  # type: ignore[union-attr]
+    replayed = gate()
+    replayed.asker = ReplayAsker([done])
+    again = json.loads(replayed.run(QUERY).output)
+    assert (again["approved"], again["who"]) == (True, "tom")
+
+
+# ---------------------------------------------------------------- Stop
+
+
+def test_stop_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None:
+    import threading
+
+    llm = PollingLLM()
+
+    essay = MAS(
+        [Agent("writer", prompt="Write a long essay on: {query}", output="draft")],
+        outputs={"draft": "text"},
+        llm=llm,
+    )
+    threading.Timer(1.0, essay.stop, args=("essay-1",)).start()
+    trace = essay.run_state({"query": "Why is the sky blue?"}, run_id="essay-1")
+    print(trace.status, trace.error)  # stopped Stopped: stopped
+
+    assert capsys.readouterr().out == "stopped Stopped: stopped\n"
+    (record,) = trace.records
+    assert (record.error_kind, record.raw_response) == (ErrorKind.STOPPED, "half")
+    assert hasattr(xmas, "cancel_flag")
+
+
+# ---------------------------------------------------------------- first of
+
+
+def test_first_of_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None:
+    llm = PollingLLM(lambda prompt: 3.0 if prompt.startswith("A careful") else 0.0)
+
+    outline = Agent("outline", prompt="Outline an answer to: {query}", output="outline")
+    quick = Agent("quick", prompt="One line from: {outline}", inputs=["outline"], output="draft")
+    careful = Agent("careful", prompt="A careful answer from: {outline}", inputs=["outline"], output="draft")
+    racing = MAS(
+        [outline, quick, careful],
+        edges=[Edge("outline", "quick", kind=EdgeKind.FIRST), Edge("outline", "careful", kind=EdgeKind.FIRST)],
+        llm=llm,
+    )
+
+    trace = racing.run("Why is the sky blue?")
+    print(sorted(record.agent for record in trace.records if record.lost))  # ['careful']
+    print(trace.output)  # the quick draft
+
+    assert capsys.readouterr().out.splitlines() == ["['careful']", trace["quick"][0].raw_response]
+    assert trace["careful"][0].cost_usd is not None  # the loser paid for what it used
+
+
 # ---------------------------------------------------------------- Save and share
 
 
@@ -1250,8 +1385,6 @@ def test_nothing_the_readme_calls_planned_exists_yet() -> None:
         assert not hasattr(MAS, name), name
     scripts = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"].get("scripts", {})
     assert "xmas" not in scripts
-    assert not {"first of", "first_of"} & {kind.value for kind in EdgeKind}
-    assert not hasattr(xmas, "FirstOf")
     assert "langgraph" not in " ".join(inspect.signature(MAS).parameters).lower()
 
 
@@ -1271,6 +1404,6 @@ def test_every_component_the_readme_lists_exists() -> None:
 
     components = README.split("## 🏗 Components", 1)[1].split("\n## ", 1)[0]
     names = [line.split("`")[1] for line in components.splitlines() if line.startswith("- **`")]
-    assert len(names) == 15
+    assert len(names) == 17
     for name in names:
         assert hasattr(xmas, name) or hasattr(xmas.optimization, name), name

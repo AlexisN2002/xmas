@@ -15,8 +15,9 @@ so you always know who was naughty and who was nice. A single agent is the small
 system, not a special case.
 
 Version 2 puts the whole workflow in one graph: agents, code steps, conditions and loops,
-chains that run once per item of a list, answers with a fixed JSON shape, and pictures,
-documents and other files passed by reference. People are planned next.
+chains that run once per item of a list, answers with a fixed JSON shape, pictures,
+documents and other files passed by reference, people who approve or edit, branches that
+race, and a Stop that stops. The `.mas` bundle is planned next.
 xmas checks the wiring before the first call and draws the picture from the graph that runs.
 A system made only of agents and plain edges is a version 1 system, and works as before.
 
@@ -25,6 +26,7 @@ A system made only of agents and plain edges is a version 1 system, and works as
 - **Your first system in minutes:** a few `Agent` objects and their edges, and it runs.
 - **Code and conditions in the graph:** plain Python steps, JSON answers with a fixed shape, and `when`, `while`, `switch` and `on error` edges.
 - **Pictures and files as values:** a model that can see gets the pictures, and the check refuses one that cannot.
+- **People in the graph:** a person approves, picks, chooses or edits; the run pauses, and resumes after a restart too.
 - **Know what every run cost:** one record per visit with time, tokens and cost, budgets that end a run cleanly, and health signals.
 - **Save and share:** a version 1 system as one YAML file today; a version 2 system as a `.mas` bundle, planned.
 - **Optimization built in:** improve every agent's prompt, the wiring and the models against your task.
@@ -33,8 +35,9 @@ See [docs/design-principles.md](docs/design-principles.md) for the principles be
 design.
 
 > **Status: beta.** Inference, the optimization loop, CANTANTE, topology search, code steps,
-> JSON answers, conditions, loops, per-item chains, media values, budgets and health are in
-> place. The `.mas` bundle, people in the graph and the experiment layer are still to come.
+> JSON answers, conditions, loops, per-item chains, media values, budgets, health, people in
+> the graph, Stop and `first of` races are in place. The `.mas` bundle, `verify()`, learning
+> from human picks and the experiment layer are still to come.
 
 | What | Today |
 |---|---|
@@ -52,8 +55,9 @@ design.
 | `run_state`: start a run from several named values and read several outputs | built |
 | Images, audio, documents, tables and files as values, passed by reference | built |
 | Models that state what they accept and produce, checked when the system is built | built |
-| `first of` races | planned |
-| People in the graph, and Stop | planned |
+| `first of` races: the first good branch wins | built |
+| People in the graph: pauses, answers, resume after a restart | built |
+| Stop: a running system ends within moments and keeps its records | built |
 | The `.mas` bundle, its commands and `verify()` | planned |
 | Learning from human picks | planned |
 | The experiment layer: one config for a reproducible run, like promptolution's `ExperimentConfig` | planned |
@@ -320,7 +324,7 @@ colon:
 | `on error` | `Edge("a", "b", kind=EdgeKind.ERROR, errors=("timeout",))` | `a -> b: {on error: [timeout]}` | built |
 | box | `Box(name, system, reads=..., writes=...)` | `boxes:` | built |
 | `for each` | `MAS(..., each={"b": "page in plan.pages"})` | `for each: page in plan.pages` on each node | built |
-| `first of` | | | planned |
+| `first of` | `Edge("a", "b", kind=EdgeKind.FIRST)` | `a -> b: first of` | built |
 
 A `switch` edge's case is its target's name unless `case="..."` says otherwise. An
 `on error` edge takes kinds such as `timeout`, `outage`, `rate_limited`, `money`,
@@ -655,6 +659,135 @@ The rest of the rules:
 - A tool an agent calls reads no media either: the model would make up the reference.
   Run such a function as a step.
 
+## People in the graph
+
+A person can be a node too. A `Human` asks a question, and the run waits for the answer.
+Here an editor approves the draft before it is published, with the draft in the question:
+
+```python
+from xmas import END, Human
+
+editor = Human(
+    "editor",
+    "approve",
+    reads=["draft"],
+    writes="approval",
+    question="Publish this answer? {draft}",
+    labels={"yes": "Publish", "no": "Hold it"},
+)
+gated = MAS(
+    [Agent("writer", prompt="Write a short answer to: {query}", output="draft")],
+    steps=[Step("publish", uses="publish")],
+    humans=[editor],
+    edges=[
+        ("writer", "editor"),
+        Edge("editor", "publish", kind=EdgeKind.WHEN, when="approval.approved"),
+        Edge("editor", END, kind=EdgeKind.ELSE),
+    ],
+    tools=[publish],
+    llm=llm,
+)
+```
+
+Run it under a `run_id` of your choice. It returns paused, and the answer resumes it:
+
+```python
+trace = gated.run_state({"query": "Why is the sky blue?"}, run_id="sky-1")
+print(trace.status, [question.id for question in trace.pause.questions])  # paused ['sky-1/editor/1']
+print(trace.pause.questions[0].options)  # ('Publish', 'Hold it')
+done = gated.resume("sky-1", {"sky-1/editor/1": {"approved": True, "who": "tom"}})
+print(done.status, done.output)  # ok Published: Sunlight scatters off air.
+```
+
+The run pauses only when nothing else is left to do. Other branches run on and end
+first, and all open questions are asked together in `trace.pause`. `gated.answer(run_id,
+answers)` keeps answers while the run still goes. `gated.resume(run_id, answers)` goes on
+from the pause. Each answer is checked against its question, and a wrong one is refused
+with every problem listed.
+
+A person answers in one of four forms:
+
+| Form | Shows | Answers |
+|---|---|---|
+| `ask` | `options`: a list of labels, or the path of a list the node reads | `{option}` |
+| `judge` | `pair`: two values the node reads | `{pick}`: one of the two names, or `"tie"` |
+| `approve` | `labels`: the yes and no choices | `{approved, option}` |
+| `edit` | `edits`: the value to change | `{changed}`, and the new value under `writes={"answer": ..., "value": ...}` |
+
+Every answer also holds `who`, `asked_at`, `answered_at`, `comment` and `timed_out`. The
+question and the labels may name the node's reads, paths too, such as `{plan.title}`. The
+visit keeps a record of kind `human`: what was shown, the answer as `raw_response`, a cost
+of 0 and the wait in `wait_s`.
+
+A pause outlives the process when the run store is a file: `MAS(..., store="runs.db")`,
+or the variable `XMAS_RUNS`. A new process builds the same system and calls `resume`. A
+changed system is refused. The budget counts on from the pause, and the wait is not wall
+time. By default the store is in memory, so a run resumes in the same process only.
+
+`timeout_s` gives a question a deadline, and `default` is the answer then taken, with
+`timed_out` true. It routes like any other answer. A host passes `asker=`: an object
+whose `ask(question)` answers at once or returns `None`. It may also have
+`withdraw(question, reason)`, called when a paused run is stopped. `run`, `run_batch` and
+the optimizers never wait: a question the asker leaves open takes its default, or the run
+fails and names the node. `ReplayAsker(traces)` answers from recorded runs, so an
+optimizer can rerun a system with people in it.
+
+## Stop
+
+`mas.stop(run_id)` ends a running run from another thread. No call, step or item starts
+after it, and a model call in flight is cut. Here Stop is pressed one second into a long
+essay:
+
+```python
+import threading
+
+essay = MAS(
+    [Agent("writer", prompt="Write a long essay on: {query}", output="draft")],
+    outputs={"draft": "text"},
+    llm=llm,
+)
+threading.Timer(1.0, essay.stop, args=("essay-1",)).start()
+trace = essay.run_state({"query": "Why is the sky blue?"}, run_id="essay-1")
+print(trace.status, trace.error)  # stopped Stopped: stopped
+```
+
+The trace comes back within moments of the Stop and keeps every record so far. A visit
+cut after a call keeps a failed record with what its calls used. No `on error` edge
+catches a stop. A paused run is marked stopped, and its open questions are withdrawn.
+
+A Python step, a promptolution batch call or an MCP tool call is not cut. The run ends
+at the next boundary after it, and a step may poll `xmas.cancel_flag()` to end early.
+Streaming is opt-in per model: `APILLM(..., stream=True)` streams each answer, so a cut
+call keeps the text received so far as its `raw_response`. Without it, `APILLM` sends the
+same request as before.
+
+## Racing branches: `first of`
+
+A `first of` race starts several branches from one node, and the first good result
+wins. Here a quick and a careful writer race to write the draft from one outline:
+
+```python
+outline = Agent("outline", prompt="Outline an answer to: {query}", output="outline")
+quick = Agent("quick", prompt="One line from: {outline}", inputs=["outline"], output="draft")
+careful = Agent("careful", prompt="A careful answer from: {outline}", inputs=["outline"], output="draft")
+racing = MAS(
+    [outline, quick, careful],
+    edges=[Edge("outline", "quick", kind=EdgeKind.FIRST), Edge("outline", "careful", kind=EdgeKind.FIRST)],
+    llm=llm,
+)
+
+trace = racing.run("Why is the sky blue?")
+print(sorted(record.agent for record in trace.records if record.lost))  # ['careful']
+print(trace.output)  # the quick draft
+```
+
+All `first of` edges of one node form one race. The winner's writes stand. The other
+calls are cut, and each loser keeps a record with `lost` set and what it paid. A step
+that races cannot be cut: it runs to its end, and its writes are dropped. Contestants
+write the same values and go on to the same node, which runs once, or all end the run.
+If every contestant fails, the race fails with the last failure. Inside a `for each`
+chain, each item races on its own.
+
 ## 💾 Save and share
 
 A version 1 system, such as the quickstart's, saves as one YAML file. One file holds
@@ -666,7 +799,7 @@ team.to_yaml("team.yaml")
 team = MAS.from_yaml("team.yaml", llm=llm)
 ```
 
-A system that uses steps, JSON answers, conditions, boxes or chains is version 2. Its spec is
+A system that uses steps, JSON answers, conditions, boxes, chains or people is version 2. Its spec is
 plain data, and `MAS.from_dict` rebuilds it with the same models and functions:
 
 ```python
@@ -712,10 +845,10 @@ best.to_yaml("team-optimized.yaml")
 
 `MAS(..., frozen=("boss",))` keeps a node as it is. No optimizer changes its prompt,
 model, reads, writes or edges. A frozen node makes the system version 2, so keep its
-`to_dict()` instead of a YAML file. `EvolutionaryTopologyOptimizer` searches the wiring. It
-keeps steps, boxes, frozen nodes, conditional edges and every `for each` chain as they
-are, and drops any candidate the check refuses. Steps are never part of the prompts an
-optimizer sees, and agents that share a prompt are optimized as one prompt.
+`to_dict()` instead of a YAML file. `EvolutionaryTopologyOptimizer` searches the wiring.
+It keeps steps, boxes, human nodes, frozen nodes, conditional edges and every `for each`
+chain as they are, and drops any candidate the check refuses. Steps are never part of the
+prompts an optimizer sees, and agents that share a prompt are optimized as one prompt.
 
 ## 🔗 xmas and promptolution
 
@@ -818,21 +951,10 @@ under a small budget: a step must match exactly, and an agent must pass the exam
 check. A failure warns by default. Run it after a model switch, after an optimizer run
 and before a release.
 
-### Racing branches: `first of`
+### Learning from human picks
 
-`first of` races branches, and the first good result wins.
-
-### People in the graph
-
-A person becomes a node with one of four forms. `ask` shows a card with options,
-`judge` shows a pair to pick from, `approve` is a gate, and `edit` lets a person change
-a value. The run pauses with a checkpoint and resumes on the answer, after a restart
-too. An optional timeout takes a default edge. The trace records who answered, when,
-what they were shown and how long the run waited. A Stop ends a running system within
-seconds and keeps every record so far.
-
-A preference task will learn from those pairwise picks, with credit per node, so an
-optimizer can improve a system against what people chose.
+A preference task will learn from the picks people make in `judge` nodes, with credit
+per node, so an optimizer can improve a system against what people chose.
 
 ## 📚 Scientific Publications
 
@@ -849,14 +971,16 @@ xmas builds on:
 
 - **`Agent`** – One node: a prompt template, the values it reads and the value it writes.
 - **`Step`** – A node that runs a function or an MCP tool from the system's `tools=`, with no model call.
-- **`Edge`** – One edge with its operator, an `EdgeKind`: plain, `when`, `else`, `while`, `switch` or `on error`.
+- **`Edge`** – One edge with its operator, an `EdgeKind`: plain, `when`, `else`, `while`, `switch`, `on error` or `first of`.
 - **`Box`** – A whole system used as one node of another.
+- **`Human`** – A node that asks a person, in one of four forms: `ask`, `judge`, `approve` or `edit`.
 - **`MAS`** – The system and the predictor: agents, steps, edges, models and tools; runs a query and keeps its trace.
 - **`Trace`** – The per-agent record of one run: rendered prompts, outputs, tokens, cost, time, tool calls, status.
 - **`ForEach`** – The `for each` form of a chain: the item, the list it comes from, and options such as `at_once` and `key`.
 - **`Ref`** – A picture, a sound, a document, a table or a file as a value: where it is, its type, size and checksum.
 - **`Capabilities`** – What a model accepts and produces beyond text, such as `Capabilities(accepts=("image",))`.
-- **`Event`** – One start or end of a visit or an item, passed to `run_state`'s `on_event` as the run goes.
+- **`Event`** – One start or end of a visit or an item, a pause, a resume or a stop, passed to `on_event` as the run goes.
+- **`RunStore`** – Where paused runs, their questions and answers are kept: in memory, or in one SQLite file.
 - **`Budget`** – Limits on calls, cost and wall time for each run, and on model calls in flight.
 - **`Health`** – Signals read from a finished run: stuck loops, empty answers, retries, caps hit.
 - **`MASTask`** – A dataset plus a reward over the system's answers, e.g. `GSM8KTask`.
@@ -874,6 +998,7 @@ an endpoint or a key, and never says where stored media goes.
 | `XMAS_BASE_URL` | Base URL of an OpenAI-compatible endpoint |
 | `XMAS_API_KEY` | API key for that endpoint |
 | `XMAS_STORE` | Folder for stored pictures and other media; default `~/.cache/xmas/store` |
+| `XMAS_RUNS` | File where paused runs are kept, so they resume after a restart; default in memory |
 
 ## Development
 
