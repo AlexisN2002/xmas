@@ -13,8 +13,10 @@ Note:
 from xmas.agent import Agent
 from xmas.budget import Budget, CancelFlag, cancel_flag, contestant
 from xmas.chains import ForEach
+from xmas.config import Config, ModelEntry, ModelNameWarning
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, RaceLost, RunStatus, Stopped
+from xmas.examples import Check, Example
 from xmas.graph import END, START
 from xmas.health import Health, HealthSettings
 from xmas.human import Asker, Human, Pause, Question, ReplayAsker, answer_value
@@ -26,6 +28,7 @@ from xmas.store import Store as RunStore
 from xmas.tasks import GSM8KTask, MASTask
 from xmas.trace import AgentRecord, Event, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType
+from xmas.verify import VerifyFailed, VerifyReport, VerifyWarning
 
 __version__ = "0.0.0"
 
@@ -46,11 +49,14 @@ __all__ = [
     "BudgetExceeded",
     "CancelFlag",
     "Capabilities",
+    "Check",
+    "Config",
     "Document",
     "Edge",
     "EdgeKind",
     "ErrorKind",
     "Event",
+    "Example",
     "File",
     "ForEach",
     "GSM8KTask",
@@ -59,6 +65,8 @@ __all__ = [
     "Human",
     "Image",
     "MASTask",
+    "ModelEntry",
+    "ModelNameWarning",
     "Pause",
     "Question",
     "RaceLost",
@@ -74,6 +82,9 @@ __all__ = [
     "ToolCall",
     "Trace",
     "ValueType",
+    "VerifyFailed",
+    "VerifyReport",
+    "VerifyWarning",
     "__version__",
     "answer_value",
     "cancel_flag",
