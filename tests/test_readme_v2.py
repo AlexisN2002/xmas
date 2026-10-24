@@ -1381,8 +1381,6 @@ def test_per_agent_models_bind_by_name_and_an_unknown_name_is_refused() -> None:
 
 
 def test_nothing_the_readme_calls_planned_exists_yet() -> None:
-    for name in ("verify",):
-        assert not hasattr(MAS, name), name
     scripts = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"].get("scripts", {})
     assert "xmas" not in scripts
     assert "langgraph" not in " ".join(inspect.signature(MAS).parameters).lower()

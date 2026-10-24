@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import difflib
 import hashlib
-import importlib
 import json
 import os
 import re
@@ -41,6 +40,7 @@ import yaml
 
 from xmas.agent import Agent
 from xmas.budget import Budget
+from xmas.bundle import LOCK, Lock, code_hashes, compare, lock_of, read
 from xmas.media import Ref, store
 from xmas.nodes import Step
 from xmas.runtime import node_owner, node_types
@@ -632,11 +632,6 @@ def _write_cases(folder: Path, file: str, cases: Sequence[Mapping[str, Any]]) ->
     return path
 
 
-def bundle_module() -> Any:
-    """Return :mod:`xmas.bundle`, which reads bundles and their locks; imported when first needed."""
-    return importlib.import_module("xmas.bundle")
-
-
 def save_examples(
     mas: MAS, trace: Trace, *, nodes: Sequence[str] | None = None, file: str = "warmup", path: Path | None = None
 ) -> list[str]:
@@ -657,18 +652,17 @@ def save_examples(
     if folder.is_file():
         raise ValueError(f"{folder} is a zipped bundle: save_examples writes into a bundle folder")
     cases = cases_from_trace(mas, trace, nodes, folder / MEDIA)
-    bundle = bundle_module() if (folder / "xmas.lock").is_file() else None
-    clean = bundle is not None and _unchanged(bundle, mas, folder)
+    clean = (folder / LOCK).is_file() and _unchanged(mas, folder)
     _write_cases(folder, file, cases)
-    if bundle is not None and clean:
-        old = bundle.Lock.from_yaml((folder / bundle.LOCK).read_text(encoding="utf-8"))
-        files = {name: data for name, data in bundle.read(folder).items() if name != bundle.LOCK}
-        _write(folder / bundle.LOCK, bundle.lock_of(files, old.code).to_yaml().encode("utf-8"))
+    if clean:
+        old = Lock.from_yaml((folder / LOCK).read_text(encoding="utf-8"))
+        files = {name: data for name, data in read(folder).items() if name != LOCK}
+        _write(folder / LOCK, lock_of(files, old.code).to_yaml().encode("utf-8"))
     return [case["name"] for case in cases]
 
 
-def _unchanged(bundle: Any, mas: MAS, folder: Path) -> bool:
+def _unchanged(mas: MAS, folder: Path) -> bool:
     """Whether a bundle folder still matches its lock, code included."""
-    files = bundle.read(folder)
-    lock = bundle.Lock.from_yaml(files.pop(bundle.LOCK).decode("utf-8"))
-    return bool(bundle.compare(lock, files, bundle.code_hashes(mas)).clean)
+    files = read(folder)
+    lock = Lock.from_yaml(files.pop(LOCK).decode("utf-8"))
+    return compare(lock, files, code_hashes(mas)).clean

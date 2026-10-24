@@ -18,6 +18,8 @@ from promptolution.llms.base_llm import BaseLLM
 from promptolution.predictors.base_predictor import BasePredictor
 
 from xmas import bundle, runtime
+from xmas import examples as _examples
+from xmas import verify as _verify
 from xmas.agent import Agent
 from xmas.budget import Budget
 from xmas.chains import ChainShape, ForEach
@@ -955,6 +957,41 @@ class MAS(BasePredictor):
         self.bundle = bundle.write(path, bundle.files_of(self), bundle.code_hashes(self), zipped=zipped)
         return self.bundle
 
+    def verify(
+        self,
+        level: int = 1,
+        *,
+        budget: Budget | float | None = None,
+        strict: bool = False,
+        only: Iterable[str] = (),
+        examples: str | os.PathLike[str] | None = None,
+        config: Config | None = None,
+    ) -> _verify.VerifyReport:
+        """Verify the system up to ``level`` and return the report; see :func:`xmas.verify.verify`.
+
+        Level 0 compares the bundle with its lock, level 1 checks every part
+        without a model call, level 2 runs the warm-up examples under a small
+        budget. A report that is not ok warns once, or raises
+        :class:`~xmas.verify.VerifyFailed` when ``strict``.
+        """
+        where = None if examples is None else Path(examples)
+        return _verify.verify(self, level, budget=budget, strict=strict, only=only, examples=where, config=config)
+
+    def save_examples(
+        self,
+        trace: Trace,
+        *,
+        nodes: Sequence[str] | None = None,
+        file: str = "warmup",
+        path: str | os.PathLike[str] | None = None,
+    ) -> list[str]:
+        """Record one warm-up case per node from a run's trace into the bundle; see :func:`xmas.examples.save_examples`.
+
+        Returns:
+            The names of the cases written to ``examples/<file>.yaml``.
+        """
+        return _examples.save_examples(self, trace, nodes=nodes, file=file, path=None if path is None else Path(path))
+
     @classmethod
     def load(
         cls,
@@ -966,6 +1003,7 @@ class MAS(BasePredictor):
         config: Config | None = None,
         overlay: Mapping[str, str] | None = None,
         resolve: bool = True,
+        verify: int | None = None,
     ) -> MAS:
         """Load a ``.mas`` bundle, a folder or a zip, and build the system it holds.
 
@@ -986,6 +1024,7 @@ class MAS(BasePredictor):
             config: Where tool servers and the catalogue come from; :meth:`Config.load` when ``None``.
             overlay: Model names by agent, replacing the bundle's.
             resolve: Whether model names are checked against the catalogue.
+            verify: A level to :meth:`verify` the loaded system at before it is returned.
 
         Raises:
             ValueError: If the bundle is malformed or names what cannot be found,
@@ -1026,6 +1065,8 @@ class MAS(BasePredictor):
         mas.bundle = Path(path)
         if resolve:
             mas._resolve(configured())
+        if verify is not None:
+            mas.verify(verify, config=settings)
         return mas
 
     def _resolve(self, config: Config) -> None:

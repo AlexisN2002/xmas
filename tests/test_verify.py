@@ -1,15 +1,12 @@
 """Verify: checksums against the lock, the dry check, warm-up examples under a budget, and cases from traces.
 
 Every model is scripted, and every call costs 0.01 USD unless its model reports
-no cost. The bundle reader is :class:`FakeBundle`, which keeps the bundle
-module's names (``read``, ``files_of``, ``compare``, ``lock_of``, ...) over a
-folder of plain files.
+no cost. Bundles are saved with ``MAS.save`` into temporary folders.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import re
 import warnings
@@ -19,7 +16,6 @@ from typing import Any, cast
 import pytest
 import yaml
 
-import xmas.examples
 import xmas.verify
 from tests.conftest import (
     DECK,
@@ -37,6 +33,7 @@ from tests.conftest import (
     render_pages,
 )
 from xmas import MAS, Agent, Box, ErrorKind, Human
+from xmas.bundle import Lock
 from xmas.config import Config
 from xmas.convert import document_text
 from xmas.examples import Check, parse_examples, run_checks, save_examples
@@ -46,111 +43,6 @@ from xmas.verify import VerifyFailed, VerifyReport, VerifyWarning, verify
 
 NAMES = Config(catalogue=("writer-model", "judge-model", "vision-model"))
 """A configured catalogue holding every model name the test systems bind."""
-
-
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-@dataclasses.dataclass(frozen=True)
-class FakeLock:
-    """A lock: the bundle digest, each file's sha256, each callable's source hash."""
-
-    bundle: str
-    files: dict[str, str]
-    code: dict[str, str | None]
-
-    def to_yaml(self) -> str:
-        """Write the lock."""
-        return yaml.safe_dump({"version": 1, "bundle": self.bundle, "files": self.files, "code": self.code})
-
-    @classmethod
-    def from_yaml(cls, text: str) -> FakeLock:
-        """Read a lock."""
-        data = yaml.safe_load(text)
-        return cls(data["bundle"], data["files"], data["code"])
-
-
-@dataclasses.dataclass(frozen=True)
-class FakeDiff:
-    """What differs from a lock."""
-
-    changed: tuple[str, ...]
-    added: tuple[str, ...]
-    missing: tuple[str, ...]
-    code_changed: tuple[str, ...]
-
-    @property
-    def clean(self) -> bool:
-        """Whether nothing differs."""
-        return not (self.changed or self.added or self.missing or self.code_changed)
-
-
-class FakeBundle:
-    """The bundle module's names over a folder: ``xmas.yaml``, a plain prompt file per prompt, a lock of sha256s."""
-
-    LOCK = "xmas.lock"
-    WIRING = "xmas.yaml"
-    CALLABLES = "callables.yaml"
-    Lock = FakeLock
-
-    def __init__(self) -> None:
-        """Hash one callable's source as ``a``."""
-        self.code: dict[str, str | None] = {"render_page": "a"}
-
-    def read(self, path: Path) -> dict[str, bytes]:
-        """Return every file of a bundle folder by its path in the bundle."""
-        return {item.relative_to(path).as_posix(): item.read_bytes() for item in path.rglob("*") if item.is_file()}
-
-    def files_of(self, mas: MAS) -> dict[str, bytes]:
-        """Return the files a system owns: its spec without prompts, and one file per prompt."""
-        spec = mas.to_dict()
-        prompts = spec.pop("prompts", {})
-        return {"xmas.yaml": yaml.safe_dump(spec).encode()} | {
-            f"prompts/{name}.md": f"{text}\n".encode() for name, text in prompts.items()
-        }
-
-    def parse_prompt(self, raw: str, where: str) -> tuple[str, None]:
-        """Read a prompt file: its text without the final newline, no form."""
-        return raw.removesuffix("\n"), None
-
-    def code_hashes(self, mas: MAS) -> dict[str, str | None]:
-        """Return the callables' source hashes."""
-        return dict(self.code)
-
-    def lock_of(self, files: dict[str, bytes], code: dict[str, str | None]) -> FakeLock:
-        """Lock the files and the code."""
-        shas = {path: _sha(data) for path, data in sorted(files.items())}
-        return FakeLock(_sha("".join(f"{path} {sha}\n" for path, sha in shas.items()).encode()), shas, dict(code))
-
-    def compare(self, lock: FakeLock, files: dict[str, bytes], code: dict[str, str | None]) -> FakeDiff:
-        """Return what differs from the lock."""
-        now = {path: _sha(data) for path, data in files.items()}
-        return FakeDiff(
-            tuple(sorted(path for path in now if path in lock.files and now[path] != lock.files[path])),
-            tuple(sorted(set(now) - set(lock.files))),
-            tuple(sorted(set(lock.files) - set(now))),
-            tuple(sorted(name for name, sha in code.items() if lock.code.get(name) != sha)),
-        )
-
-    def save(self, mas: MAS, folder: Path) -> Path:
-        """Write the owned files and the lock over every file in the folder, and mark the system as saved there."""
-        for path, data in self.files_of(mas).items():
-            (folder / path).parent.mkdir(parents=True, exist_ok=True)
-            (folder / path).write_bytes(data)
-        lock = self.lock_of(self.read(folder), self.code_hashes(mas))
-        (folder / self.LOCK).write_text(lock.to_yaml(), encoding="utf-8")
-        mas.__dict__["bundle"] = folder
-        return folder
-
-
-@pytest.fixture
-def bundle(monkeypatch: pytest.MonkeyPatch) -> FakeBundle:
-    """The bundle module verify and save_examples read and write bundles through."""
-    fake = FakeBundle()
-    for module in (xmas.examples, xmas.verify):
-        monkeypatch.setattr(module, "bundle_module", lambda: fake)
-    return fake
 
 
 def examples_file(folder: Path, *cases: dict[str, Any], **top: Any) -> Path:
@@ -255,13 +147,13 @@ BAD_FILES = [
 """Examples files that do not read, with the problem each names."""
 
 
-def test_level_0_unchanged_since_saved(tmp_path: Path, bundle: FakeBundle) -> None:
+def test_level_0_unchanged_since_saved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     d = deck()
-    folder = bundle.save(d, tmp_path / "deck.mas")
+    folder = d.save(tmp_path / "deck.mas")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         report = verify(d, 0)
-    lock = FakeLock.from_yaml((folder / "xmas.lock").read_text(encoding="utf-8"))
+    lock = Lock.from_yaml((folder / "xmas.lock").read_text(encoding="utf-8"))
     assert report.ok and report.lines() == [
         f"level 0: unchanged since saved (bundle {lock.bundle[:16]}, {len(lock.files)} files)",
         "ok: level 0",
@@ -271,7 +163,7 @@ def test_level_0_unchanged_since_saved(tmp_path: Path, bundle: FakeBundle) -> No
     (folder / "prompts" / "noter.md").write_text("Write notes, by hand: {plan}\n", encoding="utf-8")
     (folder / "prompts" / "captioner.md").unlink()
     examples_file(folder)
-    bundle.code = {"render_page": "b"}
+    monkeypatch.setattr(xmas.verify, "code_hashes", lambda mas: {**lock.code, "render_page": "b"})
     with pytest.warns(VerifyWarning, match="level 0 differs"):
         report = verify(d, 0)
     assert report.lines() == [
@@ -282,9 +174,10 @@ def test_level_0_unchanged_since_saved(tmp_path: Path, bundle: FakeBundle) -> No
         "level 0: in memory, not saved: prompts/captioner.md, prompts/noter.md",
         "not ok: level 0 differs",
     ]
+    monkeypatch.undo()
 
     edited = deck()
-    bundle.save(edited, tmp_path / "edited.mas")
+    edited.save(tmp_path / "edited.mas")
     edited.agents["noter"].prompt = "Write short notes for this plan: {plan}"
     with pytest.warns(VerifyWarning):
         report = verify(edited, 0)
@@ -390,7 +283,7 @@ def test_level_2_node_cases(tmp_path: Path) -> None:
         'equals {"words": 12, "overflow": true}: got {"words": 13, "overflow": true}',
     )
     assert all(r.latency_s > 0 for r in report.examples) and report.cost_usd == pytest.approx(0.02)
-    assert report.lines()[2].startswith("level 2: checker-sees-the-overflow  pass     0.0100 USD  ")
+    assert report.lines()[2].startswith("level 2: checker-sees-the-overflow  pass  0.0100 USD  ")
     assert report.lines()[4] == "  - verdict.fits equals true: got false"
     assert report.lines()[-1] == "not ok: level 0 differs; 2 examples passed, 2 fail, 0.0200 USD"
 
@@ -554,11 +447,11 @@ def test_every_check_kind(spec: dict[str, Any], failure: str | None) -> None:
     assert found == [] if failure is None else len(found) == 1 and found[0].startswith(failure), found
 
 
-def test_warning_strict_and_only(tmp_path: Path, bundle: FakeBundle) -> None:
+def test_warning_strict_and_only(tmp_path: Path) -> None:
     d = deck()
-    folder = tmp_path / "deck.mas"
+    folder = d.save(tmp_path / "deck.mas")
     examples_file(folder, CHECKER, {**CHECKER, "name": "checker-wrong", "must": [{"equals": {"fits": True}}]}, RENDER)
-    bundle.save(d, folder)
+    d.save(folder)  # the lock now holds the examples too
     with pytest.warns(VerifyWarning) as caught:
         report = verify(d, 2, config=NAMES)
     assert len(caught) == 1 and str(caught[0].message) == str(report)
@@ -582,9 +475,9 @@ def test_warning_strict_and_only(tmp_path: Path, bundle: FakeBundle) -> None:
     assert unknown.problems == ("only names no example or node: 'nobody'",)
 
 
-def test_save_examples_from_a_trace(tmp_path: Path, bundle: FakeBundle, png: Path) -> None:
+def test_save_examples_from_a_trace(tmp_path: Path, png: Path) -> None:
     d = deck()
-    folder = bundle.save(d, tmp_path / "deck.mas")
+    folder = d.save(tmp_path / "deck.mas")
     trace = d.run_state({"plan": PLAN, "house": "plain"})
     names = save_examples(d, trace)
     assert sorted(names) == ["assemble", "captioner", "checker", "drafter", "figure_checker", "noter", "render"]

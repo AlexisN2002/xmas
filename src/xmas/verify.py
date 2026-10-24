@@ -25,14 +25,15 @@ import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from xmas.budget import Budget
+from xmas.bundle import CALLABLES, LOCK, WIRING, Lock, LockDiff, code_hashes, compare, files_of, parse_prompt, read
 from xmas.check import check_system
 from xmas.config import Catalogue, Config, read_catalogue, resolve_names
-from xmas.examples import FOLDER, UNSET, Check, Example, ExampleFile, bundle_module, parse_examples, run_checks, written
+from xmas.examples import FOLDER, UNSET, Check, Example, ExampleFile, parse_examples, run_checks, written
 from xmas.human import Human
 from xmas.media import Ref
 from xmas.runtime import node_owner, node_types, render_prompt, run_node
@@ -54,20 +55,6 @@ STATUSES = ("pass", "fail", "skipped", "error")
 
 _OWNED = ("prompts/", "boxes/")
 _PLACEHOLDER_TYPES = {"image": "image/png", "audio": "audio/wav", "document": "application/pdf", "table": "text/csv"}
-
-
-class LockDiff(Protocol):
-    """What :func:`xmas.bundle.compare` finds between a lock and the files."""
-
-    changed: tuple[str, ...]
-    added: tuple[str, ...]
-    missing: tuple[str, ...]
-    code_changed: tuple[str, ...]
-
-    @property
-    def clean(self) -> bool:
-        """Whether nothing differs."""
-        ...  # pragma: no cover
 
 
 class VerifyWarning(UserWarning):
@@ -171,10 +158,11 @@ class VerifyReport:
             lines += [f"  - {problem}" for problem in self.problems]
         if self.level >= 2:
             width = max((len(result.name) for result in self.examples), default=0)
+            status = max((len(result.status) for result in self.examples), default=0)
             for result in self.examples:
                 cost = "cost unknown" if result.cost_usd is None else f"{result.cost_usd:.4f} USD"
                 took = "<0.1 s" if result.latency_s < 0.1 else f"{result.latency_s:.1f} s"
-                lines.append(f"level 2: {result.name:<{width}}  {result.status:<7}  {cost}  {took}")
+                lines.append(f"level 2: {result.name:<{width}}  {result.status:<{status}}  {cost}  {took}")
                 lines += [f"  - {failure}" for failure in result.failures]
                 lines += [f"  note: {note}" for note in result.notes]
             lines += [f"level 2: {note}" for note in self.notes]
@@ -289,7 +277,7 @@ def verify(
         raise ValueError(f"verify levels are 0, 1 and 2, got {level!r}")
     raw = getattr(mas, "bundle", None)
     bundle = None if raw is None else Path(raw)
-    files = {} if bundle is None else dict(bundle_module().read(bundle))
+    files = {} if bundle is None else dict(read(bundle))
     parsed: list[ExampleFile] = []
     problems: list[str] = []
     misses: dict[str, tuple[str, ...]] = {}
@@ -327,30 +315,27 @@ def verify(
 
 def _level0(mas: MAS, files: Mapping[str, bytes]) -> dict[str, Any]:
     """Compare the bundle's files with its lock, and the system in memory with the files."""
-    bundle = bundle_module() if files else None
-    if bundle is None or bundle.LOCK not in files:
+    if LOCK not in files:
         return {}
-    saved = bundle.Lock.from_yaml(files[bundle.LOCK].decode("utf-8"))
-    disk = {path: data for path, data in files.items() if path != bundle.LOCK}
-    owned = bundle.files_of(mas)
-    on_disk = {path for path in disk if path in (bundle.WIRING, bundle.CALLABLES) or path.startswith(_OWNED)}
-    unsaved = [path for path in sorted({*owned, *on_disk}) if not _same(bundle, path, owned.get(path), disk.get(path))]
+    saved = Lock.from_yaml(files[LOCK].decode("utf-8"))
+    disk = {path: data for path, data in files.items() if path != LOCK}
+    owned = files_of(mas)
+    on_disk = {path for path in disk if path in (WIRING, CALLABLES) or path.startswith(_OWNED)}
+    unsaved = [path for path in sorted({*owned, *on_disk}) if not _same(path, owned.get(path), disk.get(path))]
     return {
-        "lock": bundle.compare(saved, disk, bundle.code_hashes(mas)),
+        "lock": compare(saved, disk, code_hashes(mas)),
         "unsaved": tuple(unsaved),
         "digest": saved.bundle[:16],
         "files": len(saved.files),
     }
 
 
-def _same(bundle: Any, path: str, ours: bytes | None, theirs: bytes | None) -> bool:
+def _same(path: str, ours: bytes | None, theirs: bytes | None) -> bool:
     """Whether two versions of a bundle file say the same: YAML as loaded, prompts as text and form."""
     if ours is None or theirs is None:
         return False
     if path.endswith(".md"):
-        return bool(
-            bundle.parse_prompt(ours.decode("utf-8"), path) == bundle.parse_prompt(theirs.decode("utf-8"), path)
-        )
+        return parse_prompt(ours.decode("utf-8"), path) == parse_prompt(theirs.decode("utf-8"), path)
     return bool(yaml.safe_load(ours) == yaml.safe_load(theirs))
 
 
