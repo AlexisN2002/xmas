@@ -1,0 +1,599 @@
+"""Stop: a run ends within a moment, its calls in flight cut; streaming opt-in; the flags of a ``first of`` race."""
+
+from __future__ import annotations
+
+import base64
+import dataclasses
+import gc
+import json
+import pickle
+import re
+import select
+import socket
+import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from typing import Any
+
+import httpx2
+import pytest
+from openai.types.chat import ChatCompletion
+
+from xmas import MAS, Agent, Budget, TokenUsage
+from xmas.budget import RUNNING, SLICE_S, RunMeter, cancel_flag, contestant
+from xmas.edges import Edge, EdgeKind
+from xmas.errors import BudgetExceeded, ErrorKind, RaceLost, RunStatus, Stopped, classify
+from xmas.llms.api_llm import APILLM, assemble
+from xmas.llms.meta import CallMeta, TokenPrice
+from xmas.nodes import Box
+from xmas.tools import ToolCallRequest
+
+from .conftest import META, MockLLM, add, answer
+
+CUT_USD, META_USD = 0.001, 0.01
+CUT = CallMeta(latency_s=0.1, tokens=TokenUsage(3, 1), cost_usd=CUT_USD)
+"""What the polling model's cut call used; a finished call uses ``META``, of ``META_USD``."""
+
+
+class PollingLLM(MockLLM):
+    """A model thinking ``seconds(prompt)`` per prompt, polling its call's cancel flag as a streaming wrapper does."""
+
+    def __init__(self, seconds: Callable[[str], float] = lambda prompt: 5.0) -> None:
+        """Answer "done" after the prompt's time, unless the flag is set first."""
+        super().__init__(meta=True)
+        self.seconds = seconds
+
+    def generate_with_meta(self, prompt: str, system_prompt: str = "") -> tuple[str, CallMeta]:
+        """Wait out the prompt's time; a set flag cuts the call with :data:`CUT` and the text so far."""
+        self.calls.append(prompt)
+        flag = cancel_flag()
+        assert flag is not None, "a metered call sees its flag"
+        ends = time.monotonic() + self.seconds(prompt)
+        while time.monotonic() < ends:
+            if flag.wait(0.01):
+                flag.check(CUT, "half")
+        return "done", META
+
+    def started(self, count: int) -> None:
+        """Wait until ``count`` calls started."""
+        ends = time.monotonic() + 5
+        while len(self.calls) < count and time.monotonic() < ends:
+            time.sleep(0.005)
+        assert len(self.calls) == count
+
+
+def stop_system(model: PollingLLM) -> MAS:
+    """A planner, then 8 items four at once beside a side agent with an error edge and a box; the planner is quick."""
+    inner = MAS([Agent("inner", "Inner {pages}", "short", ["pages"])], inputs={"pages": "list of text"}, llm=model)
+    return MAS(
+        [
+            Agent("planner", "Plan {pages}", "plan", ["pages"]),
+            Agent("drafter", "Draft {page}", "draft", ["page"]),
+            Agent("noter", "Note {pages}", "note", ["pages"]),
+            Agent("fallback", "Fallback {pages}", "apology", ["pages"]),
+        ],
+        [("planner", "noter"), ("planner", "boxed"), Edge("noter", "fallback", EdgeKind.ERROR, errors=("any",))],
+        boxes=[Box("boxed", inner, reads={"pages": "pages"}, writes={"short": "short"})],
+        each={"drafter": {"item": "page", "in": "pages", "at once": 4}},
+        inputs={"pages": "list of text"},
+        outputs={"draft": "list of text", "note": "text", "apology": "text", "short": "text"},
+        llm=model,
+        budget=Budget(max_cost_usd=1.0),
+    )
+
+
+PAGES = {"pages": list("abcdefgh")}
+LISTED = json.dumps(PAGES["pages"])
+
+
+def test_stop_ends_a_run_within_a_second() -> None:
+    model = PollingLLM(lambda prompt: 0.0 if prompt.startswith("Plan") else 5.0)
+    mas = stop_system(model)
+    pressed: list[float] = []
+
+    def press() -> None:
+        model.started(7)  # the planner, four items, the side agent and the box's agent
+        (meter,) = [meter for meter in list(RUNNING.values()) if meter.owner is mas]
+        pressed.append(time.monotonic())
+        meter.stop("Tom pressed Stop")
+
+    presser = threading.Thread(target=press)
+    presser.start()
+    trace = mas.run_state(PAGES)
+    returned = time.monotonic()
+    presser.join()
+
+    assert returned - pressed[0] < 0.5
+    assert (trace.status, trace.error_kind) == (RunStatus.STOPPED, ErrorKind.STOPPED)
+    assert trace.error == "Stopped: Tom pressed Stop"
+    # the queued items never started, the box's inner run stopped too, and no error edge routed the stop
+    assert sorted(model.calls) == [
+        "Draft a",
+        "Draft b",
+        "Draft c",
+        "Draft d",
+        "Inner " + LISTED,
+        "Note " + LISTED,
+        "Plan " + LISTED,
+    ]
+    # the six cut calls count what they used on the run's meter
+    assert trace.health is not None
+    assert trace.health.budget["cost_usd"]["spent"] == pytest.approx(META_USD + 6 * CUT_USD)
+
+
+@pytest.mark.skipif(not hasattr(MAS, "stop"), reason="MAS.stop is not in this build")
+def test_mas_stop_keeps_cut_records_and_one_event() -> None:
+    model = PollingLLM(lambda prompt: 0.0 if prompt.startswith("Plan") else 5.0)
+    mas: Any = stop_system(model)
+    events: list[Any] = []
+    done: dict[str, Any] = {}
+    runner = threading.Thread(
+        target=lambda: done.update(trace=mas.run_state(PAGES, run_id="turn-7", on_event=events.append))
+    )
+    runner.start()
+    model.started(7)
+    with pytest.raises(ValueError, match="in use"):
+        mas.run_state(PAGES, run_id="turn-7")
+    pressed = time.monotonic()
+    assert mas.stop("turn-7", "Tom pressed Stop") is True
+    runner.join(5)
+    assert time.monotonic() - pressed < 0.5
+    trace = done["trace"]
+    assert (trace.status, trace.run_id) == (RunStatus.STOPPED, "turn-7")
+    assert [(event.node, event.reason) for event in events if event.kind == "stop"] == [("", "Tom pressed Stop")]
+    cut = {(record.agent, record.item): record for record in trace.records if record.error_kind is ErrorKind.STOPPED}
+    assert sorted(cut) == [("boxed", None), *[("drafter", item) for item in range(4)], ("noter", None)]
+    noter, boxed = cut["noter", None], cut["boxed", None]
+    assert (noter.raw_response, noter.cost_usd, noter.tokens) == ("half", CUT.cost_usd, CUT.tokens)
+    assert noter.error == "Stopped: Tom pressed Stop"
+    assert boxed.inner is not None
+    assert [(record.agent, record.raw_response) for record in boxed.inner.records] == [("inner", "half")]
+    ended = sorted(event.node for event in events if event.kind == "end" and event.status == "stopped")
+    assert ended == ["boxed", "drafter", "drafter", "drafter", "drafter", "inner", "noter"]
+    assert mas.stop("turn-7") is False  # ended: no longer running
+    assert mas.stop("no-such-run") is False
+
+
+# ------------------------------------------------------------ a local endpoint
+
+
+def sse(chunk: dict[str, Any]) -> bytes:
+    """One server-sent event carrying ``chunk``."""
+    return f"data: {json.dumps(chunk)}\n\n".encode()
+
+
+def word_chunk(index: int) -> dict[str, Any]:
+    """The streamed chunk carrying word ``index``."""
+    delta = {"index": 0, "delta": {"content": f"w{index} "}, "finish_reason": None}
+    return {"id": "s", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": [delta]}
+
+
+class SlowServer:
+    """A local endpoint that answers slowly: one word every 0.1 s when streamed, else nothing for 10 s.
+
+    It notes each request body and the moment the client went away.
+    """
+
+    def __init__(self) -> None:
+        """Listen on a free local port."""
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}/v1"
+        self.bodies: list[dict[str, Any]] = []
+        self.gone: list[float] = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._answer, args=(conn,), daemon=True).start()
+
+    def _answer(self, conn: socket.socket) -> None:
+        with conn:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(65536)
+            head, _, body = data.partition(b"\r\n\r\n")
+            found = re.search(rb"(?i)content-length:\s*(\d+)", head)
+            assert found is not None
+            while len(body) < int(found.group(1)):
+                body += conn.recv(65536)
+            request = json.loads(body)
+            self.bodies.append(request)
+            if request.get("stream"):
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+            for index in range(100):
+                if request.get("stream"):
+                    try:
+                        conn.sendall(sse(word_chunk(index)))
+                    except OSError:
+                        break
+                readable, _, _ = select.select([conn], [], [], 0.1)
+                if readable and not conn.recv(1):
+                    break
+            else:
+                return
+            self.gone.append(time.monotonic())
+
+    def gone_by(self, count: int) -> list[float]:
+        """The moments the client went away, once ``count`` are noted."""
+        ends = time.monotonic() + 2
+        while len(self.gone) < count and time.monotonic() < ends:
+            time.sleep(0.005)
+        return self.gone
+
+
+@pytest.fixture
+def server() -> Iterator[SlowServer]:
+    endpoint = SlowServer()
+    yield endpoint
+    endpoint.sock.close()
+
+
+def cut_after(meter: RunMeter, seconds: float, action: Callable[[], object]) -> list[float]:
+    """Run ``action`` after ``seconds`` on a timer; return the list its moment lands in."""
+    moments: list[float] = []
+
+    def act() -> None:
+        moments.append(time.monotonic())
+        action()
+
+    threading.Timer(seconds, act).start()
+    return moments
+
+
+PRICE = TokenPrice(input_per_m=1.0, output_per_m=2.0)
+
+
+def test_apillm_cancels_in_flight(server: SlowServer) -> None:
+    for stream, price in ((True, PRICE), (True, None), (False, PRICE)):
+        llm = APILLM(model="m", base_url=server.url, api_key="k", stream=stream, price=price, max_retries=0)
+        meter = RunMeter()
+        pressed = cut_after(meter, 0.5, meter.stop)
+        with pytest.raises(Stopped) as raised:
+            meter.metered(lambda llm=llm: llm.generate_with_meta("hi"))  # type: ignore[misc]
+        returned = time.monotonic()
+        gone = server.gone_by(len(server.bodies))
+        assert returned - pressed[0] < 0.3
+        assert gone[-1] - pressed[0] < 0.3, "the connection closed"
+        cut = raised.value
+        assert (str(cut), cut.reason) == ("stopped", "stopped")
+        assert cut.meta is not None
+        assert cut.meta.finish_reason is None
+        assert meter.calls == 1
+        if not stream:  # only a stream keeps what arrived; the cut call's use is unknown
+            assert (cut.text, cut.meta.tokens, cut.meta.cost_usd, cut.meta.served_model) == ("", None, None, None)
+            assert meter.uncosted_calls == 1
+            continue
+        words = cut.text.split()
+        assert 2 <= len(words) <= 8 and words == [f"w{index}" for index in range(len(words))]
+        assert cut.meta.tokens == TokenUsage(5 + 1, len(words))  # "You are a helpful assistant." and "hi"
+        assert cut.meta.served_model == "m"
+        if price is None:
+            assert (cut.meta.cost_usd, meter.uncosted_calls) == (None, 1)
+        else:
+            assert cut.meta.cost_usd == pytest.approx((6 * 1.0 + len(words) * 2.0) / 1e6)
+            assert meter.cost_usd == cut.meta.cost_usd
+    assert len(server.bodies) == 3, "a cut call is not sent again"
+
+    # a tool turn is cut alike, and outside a metered call nothing polls
+    llm = APILLM(model="m", base_url=server.url, api_key="k", stream=True, max_retries=0)
+    meter = RunMeter()
+    cut_after(meter, 0.3, meter.stop)
+    with pytest.raises(Stopped) as raised:
+        meter.metered(lambda: llm.get_tool_response_meta([{"role": "user", "content": "hi"}], [add])[::2])
+    assert raised.value.text.startswith("w0 ")
+    assert server.bodies[-1]["tools"] == [add.to_openai()]
+    assert cancel_flag() is None
+
+    # a stop in the wait before a retry ends the call with the paid attempt; a watched call still times out
+    usage = {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1, "cost": 0.002}
+    llm, sent = wired([answer(None, usage=usage).model_dump(mode="json")] * 2, retry_base_delay_s=5.0)
+    meter = RunMeter()
+    pressed = cut_after(meter, 0.2, meter.stop)
+    with pytest.raises(Stopped) as raised:
+        meter.metered(lambda: llm.generate_with_meta("hi"))
+    assert time.monotonic() - pressed[0] < 0.3
+    assert raised.value.meta is not None
+    assert (len(sent), raised.value.meta.cost_usd, meter.cost_usd) == (1, 0.002, 0.002)
+    slow = APILLM(model="m", base_url=server.url, api_key="k", max_retries=0, gather_timeout_s=-4.8)
+    with pytest.raises(TimeoutError, match=r"^model call timed out after 0\.2"):
+        RunMeter().metered(lambda: slow.generate_with_meta("hi"))
+
+
+# ------------------------------------------------------------ streaming
+
+
+def wired(replies: list[bytes | dict[str, Any]], **kwargs: Any) -> tuple[APILLM, list[bytes]]:
+    """An APILLM whose transport keeps each request body and answers the next reply: SSE bytes or a JSON body."""
+    sent: list[bytes] = []
+
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request.content)
+        body = replies.pop(0)
+        if isinstance(body, bytes):
+            return httpx2.Response(200, content=body, headers={"content-type": "text/event-stream"})
+        return httpx2.Response(200, json=body)
+
+    client = {"http_client": httpx2.AsyncClient(transport=httpx2.MockTransport(reply))}
+    return APILLM(model="m", base_url="https://gateway.example/v1", api_key="k", client_kwargs=client, **kwargs), sent
+
+
+def streamed(*deltas: dict[str, Any], finish: str = "stop", usage: dict[str, Any] | None = None, **top: Any) -> bytes:
+    """A stream of ``deltas`` as a provider sends it: the role first, the finish reason, then usage and ``top``."""
+    base = {"id": "x", "object": "chat.completion.chunk", "created": 0, "model": top.pop("model", "m")}
+    chunks = [{**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}]
+    chunks += [{**base, "choices": [{"index": 0, "delta": delta}]} for delta in deltas]
+    chunks.append({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+    chunks.append({**base, "choices": [], **({"usage": usage} if usage else {}), **top})
+    return b"".join(sse(chunk) for chunk in chunks) + b"data: [DONE]\n\n"
+
+
+DEFAULT_BYTES = (
+    b'{"model":"m","messages":[{"role":"system","content":"You are a helpful assistant."},'
+    b'{"role":"user","content":"hi"}],"max_tokens":4096}'
+)
+"""The default request for "hi", byte for byte."""
+
+STREAMED_BYTES = (
+    b'{"model":"m","stream":true,"messages":[{"role":"system","content":"You are a helpful assistant."},'
+    b'{"role":"user","content":"hi"}],"max_tokens":4096,"stream_options":{"include_usage":true}}'
+)
+"""The same request streamed: ``stream`` placed by the client, ``stream_options`` last, nothing else."""
+
+USAGE = {
+    "prompt_tokens": 100,
+    "completion_tokens": 40,
+    "total_tokens": 140,
+    "prompt_tokens_details": {"cached_tokens": 60},
+    "completion_tokens_details": {"reasoning_tokens": 25},
+    "cost": 0.0123,
+}
+
+CALLS = [
+    {"id": "c1", "type": "function", "function": {"name": "add", "arguments": '{"a": 40}'}},
+    {"id": "c2", "type": "function", "function": {"name": "add", "arguments": '{"a": 1, "b": 1}'}},
+]
+
+
+def test_streaming_is_opt_in_and_equivalent() -> None:
+    # off by default: today's bytes; on: the same body plus stream and stream_options
+    plain, sent = wired([answer("ok").model_dump(mode="json")])
+    assert plain.stream is False
+    assert plain.generate_with_meta("hi")[0] == "ok"
+    explicit, sent_too = wired([answer("ok").model_dump(mode="json")], stream=False)
+    assert explicit.generate_with_meta("hi")[0] == "ok"
+    assert sent == sent_too == [DEFAULT_BYTES]
+    on, sent = wired([streamed({"content": "ok"})], stream=True)
+    assert on.generate_with_meta("hi")[0] == "ok"
+    assert sent == [STREAMED_BYTES]
+    assert json.loads(STREAMED_BYTES) == {**json.loads(DEFAULT_BYTES), **on.call_params()} | {
+        "messages": json.loads(DEFAULT_BYTES)["messages"]
+    }
+    assert on.call_params() == {"max_tokens": 4096, "stream": True, "stream_options": {"include_usage": True}}
+    assert "stream" not in plain.call_params()
+
+    # a streamed answer gives the plain answer's text and meta: usage, cost, finish reason, served model
+    whole = answer("half an ans", finish="length", usage=USAGE, model="vendor/m-0613").model_dump(mode="json")
+    pieces = streamed(
+        {"content": "half "},
+        {"content": "an "},
+        {"content": "ans"},
+        finish="length",
+        usage=USAGE,
+        model="vendor/m-0613",
+    )
+    plain, _ = wired([whole])
+    on, _ = wired([pieces], stream=True)
+    (text, meta), (streamed_text, streamed_meta) = plain.generate_with_meta("hi"), on.generate_with_meta("hi")
+    assert streamed_text == text == "half an ans"
+    assert dataclasses.replace(streamed_meta, latency_s=0) == dataclasses.replace(meta, latency_s=0)
+    assert (meta.cost_usd, meta.error_kind, meta.served_model) == (0.0123, ErrorKind.LENGTH_CUT, "vendor/m-0613")
+
+    # tool turns: the call deltas joined by index, the request the tool turn's plus the stream keys
+    messages = [{"role": "user", "content": "hi"}]
+    plain, plain_sent = wired([answer("", calls=CALLS, usage=USAGE).model_dump(mode="json")])
+    deltas = (
+        {"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {"name": "add", "arguments": ""}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": '{"a": '}}]},
+        {"tool_calls": [{"index": 1, "id": "c2", "type": "function", "function": {"name": "add"}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": "40}"}}]},
+        {"tool_calls": [{"index": 1, "function": {"arguments": '{"a": 1, "b": 1}'}}]},
+    )
+    on, on_sent = wired([streamed(*deltas, finish="tool_calls", usage=USAGE)], stream=True)
+    turn, streamed_turn = plain.get_tool_response_meta(messages, [add]), on.get_tool_response_meta(messages, [add])
+    requests = [ToolCallRequest("c1", "add", '{"a": 40}'), ToolCallRequest("c2", "add", '{"a": 1, "b": 1}')]
+    assert turn[:2] == streamed_turn[:2] == ("", requests)
+    assert dataclasses.replace(streamed_turn[2], latency_s=0) == dataclasses.replace(turn[2], latency_s=0)
+    sent_body, streamed_body = json.loads(plain_sent[0]), json.loads(on_sent[0])
+    assert streamed_body == {**sent_body, "stream": True, "stream_options": {"include_usage": True}}
+
+    # a stream of usage alone has no choice and is asked again; promptolution's batch path streams too
+    usage_only = sse({"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": []})
+    on, sent = wired([usage_only + b"data: [DONE]\n\n", streamed({"content": "ok"})], stream=True, retry_base_delay_s=0)
+    assert on.generate_with_meta("hi")[0] == "ok"
+    assert len(sent) == 2
+    on, sent = wired([streamed({"content": "ok"})], stream=True)
+    assert on.get_response(["hi"]) == ["ok"]
+    assert sent == [STREAMED_BYTES]
+
+    # images as OpenRouter streams them, and a top-level cost
+    url = "data:image/png;base64," + base64.b64encode(b"\x89PNG").decode()
+    on, _ = wired([streamed({"images": [{"type": "image_url", "image_url": {"url": url}}]}, cost=0.5)], stream=True)
+    text, images, meta = on.generate_image_with_meta("draw")
+    assert (text, images, meta.cost_usd) == ("", [(b"\x89PNG", "image/png")], 0.5)
+    assert assemble([]).choices == []
+    assert isinstance(assemble([]), ChatCompletion)
+
+
+# ------------------------------------------------------------ runs that are not running
+
+
+def test_stop_paused_and_unknown_runs() -> None:
+    assert "no-such-run" not in RUNNING
+    meter = RunMeter(run_id="turn-1")
+    assert RUNNING["turn-1"] is meter
+    with pytest.raises(ValueError, match="'turn-1' is in use"):
+        RunMeter(run_id="turn-1")
+    meter.close()
+    meter.close()
+    assert "turn-1" not in RUNNING
+    again = RunMeter(run_id="turn-1")  # an ended run's id may be taken again
+    del again
+    gc.collect()
+    assert "turn-1" not in RUNNING  # a dropped meter leaves the registry too
+    assert len({RunMeter().run_id for _ in range(3)}) == 3
+
+
+# ------------------------------------------------------------ first of
+
+
+def test_first_of_races(server: SlowServer) -> None:
+    meter = RunMeter()
+    race = meter.race("outline:0:1")
+    assert meter.race("outline:0:1") is race and not race.is_set()
+    outcome: dict[str, tuple[str, float]] = {}
+    started = time.monotonic()
+
+    def contest(name: str, seconds: float) -> None:
+        model = PollingLLM(lambda prompt: seconds)
+        with contestant(race):
+            try:
+                meter.metered(lambda: model.generate_with_meta(name))
+            except RaceLost as error:
+                assert (error.text, error.meta, error.kind) == ("half", CUT, ErrorKind.STOPPED)
+                outcome[name] = ("lost", time.monotonic() - started)
+                return
+        outcome[name] = ("won" if meter.win("outline:0:1", name) else "dropped", time.monotonic() - started)
+
+    racers = [threading.Thread(target=contest, args=args) for args in (("fast", 0.3), ("mid", 1.0), ("slow", 3.0))]
+    for racer in racers:
+        racer.start()
+    for racer in racers:
+        racer.join()
+    assert {name: result for name, (result, _) in outcome.items()} == {"fast": "won", "mid": "lost", "slow": "lost"}
+    assert max(at for _, at in outcome.values()) < 0.3 + 0.2, "the wall is the fastest contestant's"
+    assert meter.calls == 3
+    assert meter.cost_usd == pytest.approx(META_USD + 2 * CUT_USD)  # the losers paid for what they used
+    assert meter.win("outline:0:1", "slow") is False  # a contestant that finishes later is dropped
+    with contestant(race), pytest.raises(RaceLost):
+        meter.before_call()  # a lost contestant starts no more calls
+    assert meter.flag().reason is None  # outside the race the run goes on
+    meter.before_call()
+
+    # a real call of a losing contestant is cut, and keeps what it streamed
+    llm = APILLM(model="m", base_url=server.url, api_key="k", stream=True, max_retries=0)
+    second = meter.race("outline:0:2")
+    cut_after(meter, 0.3, lambda: meter.win("outline:0:2", "quick"))
+    with contestant(second), pytest.raises(RaceLost) as raised:
+        meter.metered(lambda: llm.generate_with_meta("hi"))
+    assert raised.value.text.startswith("w0 ")
+    assert server.gone_by(1)
+
+    # stopping the run sets every race; a contestant then stops rather than loses
+    third = meter.race("outline:0:3")
+    meter.stop()
+    assert third.is_set() and meter.race("outline:0:4").is_set()
+    with contestant(third), pytest.raises(Stopped) as stopped:
+        meter.before_call()
+    assert type(stopped.value) is Stopped
+    assert meter.win("outline:0:3", "fast") is True  # the engine reads the stop at its next boundary
+
+
+# ------------------------------------------------------------ budgets, gates and the flag
+
+
+@contextmanager
+def holding(meter: RunMeter, place: Callable[[], Any]) -> Iterator[threading.Event]:
+    """Hold ``place`` on another thread until the block ends; yield once it is held."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with place():
+            held.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(5)
+    try:
+        yield held
+    finally:
+        release.set()
+        holder.join()
+
+
+def test_stop_with_budgets_and_gates() -> None:
+    # a stop beats a budget refusal; steps and calls alike are refused, with the reason
+    meter = RunMeter(Budget(max_calls=0))
+    with pytest.raises(BudgetExceeded):
+        meter.before_call()
+    meter.stop("halt")
+    meter.stop("again")  # a second stop changes nothing
+    assert (meter.stopped, meter.halted.is_set()) == ("halt", True)
+    for check in (meter.before_call, meter.check_boundary):
+        with pytest.raises(Stopped, match=r"^halt$"):
+            check()
+
+    # waiters for a call slot or a chain's place leave within a slice of the stop
+    for place in ("slot", "gate"):
+        meter = RunMeter(Budget(max_parallel_calls=1))
+        enter = meter.slot if place == "slot" else lambda meter=meter: meter.gate("each:1", 1)
+        with holding(meter, enter):
+            pressed = cut_after(meter, 0.2, meter.stop)
+            with pytest.raises(Stopped), enter():
+                pass  # pragma: no cover (never entered)
+            assert time.monotonic() - pressed[0] < SLICE_S + 0.05
+    meter = RunMeter(Budget(max_parallel_calls=1))
+    with meter.slot(), meter.gate("each:2", 2), meter.gate("each:2", 9):
+        pass  # free places are taken at once
+    assert meter.gate("each:3", None).__enter__() is None
+
+    # the flag: none outside a call; inside, it reports and waits; Stopped and RaceLost survive a pickle
+    meter = RunMeter()
+    assert cancel_flag() is None
+    seen: list[tuple[str | None, bool]] = []
+
+    def call() -> tuple[str, CallMeta]:
+        flag = cancel_flag()
+        assert flag is not None
+        seen.append((flag.reason, flag.wait(0.01)))
+        flag.check()  # not set: nothing raised
+        return "ok", META
+
+    assert meter.metered(call) == ("ok", META)
+    assert seen == [(None, False)]
+    for error in (Stopped("halt", CUT, "half"), RaceLost("lost", CUT, "half")):
+        restored = pickle.loads(pickle.dumps(error))
+        assert (type(restored), restored.reason, restored.meta, restored.text) == (
+            type(error),
+            "halt" if type(error) is Stopped else "lost",
+            CUT,
+            "half",
+        )
+        assert classify(error) is ErrorKind.STOPPED
+    assert str(Stopped()) == "stopped"
+
+    # totals and seed: the counts carry over, the wall counts active time only
+    first = RunMeter(Budget(max_wall_s=10.0))
+    first.start()
+    first.before_call()
+    first.after_call(META)
+    first.after_call(None)
+    totals = first.totals()
+    assert {key: totals[key] for key in ("calls", "cost_usd", "uncosted_calls")} == {
+        "calls": 1,
+        "cost_usd": META.cost_usd,
+        "uncosted_calls": 1,
+    }
+    resumed = RunMeter(Budget(max_wall_s=10.0))
+    resumed.seed({**totals, "active_s": 9.99})
+    resumed.start()  # the seeded clock is kept
+    assert 9.99 <= resumed.elapsed_s < 10.5
+    assert resumed.totals()["calls"] == 1
+    time.sleep(0.02)
+    with pytest.raises(BudgetExceeded, match=r"^wall_s"):
+        resumed.check_boundary()
