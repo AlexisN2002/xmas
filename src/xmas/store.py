@@ -248,21 +248,7 @@ class Store(BaseCheckpointSaver[str]):
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Return the checkpoint ``config`` names, else its thread's latest."""
-        ids = config["configurable"]
-        key = (str(ids["thread_id"]), ids.get("checkpoint_ns", ""))
-        if checkpoint_id := get_checkpoint_id(config):
-            rows = self._execute(
-                f"SELECT {_CHECKPOINT_COLUMNS} FROM checkpoints"
-                " WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
-                (*key, checkpoint_id),
-            )
-        else:
-            rows = self._execute(
-                f"SELECT {_CHECKPOINT_COLUMNS} FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ?"
-                " ORDER BY checkpoint_id DESC LIMIT 1",
-                key,
-            )
-        return self._tuple(rows[0]) if rows else None
+        return next(self.list({"configurable": {"checkpoint_ns": "", **config["configurable"]}}, limit=1), None)
 
     def list(
         self,
@@ -356,9 +342,7 @@ class Store(BaseCheckpointSaver[str]):
 
     def delete_thread(self, thread_id: str) -> None:
         """Delete a thread's checkpoints and writes."""
-        with self._lock, self._conn:
-            for table in ("checkpoints", "writes"):
-                self._conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (str(thread_id),))
+        self._delete("thread_id = ?", (str(thread_id),))
 
     def get_next_version(self, current: str | int | None, channel: None) -> str:  # noqa: ARG002
         """Return the next channel version, in ``SqliteSaver``'s format: a padded count, a dot, a random tail."""
@@ -387,13 +371,15 @@ class Store(BaseCheckpointSaver[str]):
 
     def run(self, run_id: str) -> RunRow | None:
         """Return a run's row, or ``None`` for an unknown id."""
-        rows = self._execute("SELECT * FROM xmas_runs WHERE run_id = ?", (run_id,))
-        return _run_row(rows[0]) if rows else None
+        return next(iter(self._runs("run_id = ?", run_id)), None)
 
     def runs(self, status: str | None = None) -> tuple[RunRow, ...]:
         """Return every run's row, or those with ``status``, oldest first."""
-        where, params = (" WHERE status = ?", (status,)) if status is not None else ("", ())
-        return tuple(_run_row(r) for r in self._execute(f"SELECT * FROM xmas_runs{where} ORDER BY created_at", params))
+        return self._runs("status = ?", status) if status is not None else self._runs("1")
+
+    def _runs(self, where: str, *params: Any) -> tuple[RunRow, ...]:
+        rows = self._execute(f"SELECT * FROM xmas_runs WHERE {where} ORDER BY created_at", params)
+        return tuple(_run_row(row) for row in rows)
 
     def save_question(
         self,
@@ -441,13 +427,15 @@ class Store(BaseCheckpointSaver[str]):
 
     def question(self, question_id: str) -> QuestionRow | None:
         """Return a question's row, or ``None`` for an unknown id."""
-        rows = self._execute("SELECT * FROM xmas_questions WHERE question_id = ?", (question_id,))
-        return _question_row(rows[0]) if rows else None
+        return next(iter(self._questions("question_id = ?", question_id)), None)
 
     def questions(self, run_id: str) -> tuple[QuestionRow, ...]:
         """Return a run's questions in the order asked."""
-        rows = self._execute("SELECT * FROM xmas_questions WHERE run_id = ? ORDER BY asked_at, rowid", (run_id,))
-        return tuple(_question_row(r) for r in rows)
+        return self._questions("run_id = ?", run_id)
+
+    def _questions(self, where: str, *params: Any) -> tuple[QuestionRow, ...]:
+        rows = self._execute(f"SELECT * FROM xmas_questions WHERE {where} ORDER BY asked_at, rowid", params)
+        return tuple(_question_row(row) for row in rows)
 
     def due(self, now: datetime | None = None) -> tuple[RunRow, ...]:
         """Return the paused runs with an open question whose deadline has passed at ``now``, oldest first.
@@ -476,14 +464,15 @@ class Store(BaseCheckpointSaver[str]):
     def delete(self, run_id: str) -> None:
         """Delete a run's row, its questions, and its threads: ``run_id`` and every ``run_id/...``."""
         prefix = run_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
+        self._delete("thread_id = ? OR thread_id LIKE ? ESCAPE '\\'", (run_id, prefix), run_id)
+
+    def _delete(self, threads: str, params: Sequence[Any], run_id: str | None = None) -> None:
+        """Delete the checkpoints and writes of the threads ``threads`` matches, and the rows of ``run_id``."""
         with self._lock, self._conn:
-            self._conn.execute("DELETE FROM xmas_runs WHERE run_id = ?", (run_id,))
-            self._conn.execute("DELETE FROM xmas_questions WHERE run_id = ?", (run_id,))
+            for table in ("xmas_runs", "xmas_questions") if run_id is not None else ():
+                self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             for table in ("checkpoints", "writes"):
-                self._conn.execute(
-                    f"DELETE FROM {table} WHERE thread_id = ? OR thread_id LIKE ? ESCAPE '\\'",
-                    (run_id, prefix),
-                )
+                self._conn.execute(f"DELETE FROM {table} WHERE {threads}", params)
 
 
 def _json(value: Mapping[str, Any] | None) -> str | None:
