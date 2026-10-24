@@ -27,8 +27,9 @@ from xmas.errors import BudgetExceeded, ErrorKind, RaceLost, RunStatus, Stopped,
 from xmas.human import Human, Question
 from xmas.llms.api_llm import APILLM, assemble
 from xmas.llms.meta import CallMeta, TokenPrice
-from xmas.nodes import Box
-from xmas.tools import ToolCallRequest
+from xmas.nodes import Box, Step
+from xmas.tools import ToolCallRequest, tool
+from xmas.trace import Event
 
 from .conftest import META, MockLLM, add, answer
 
@@ -541,6 +542,121 @@ def test_first_of_races(server: SlowServer) -> None:
         meter.before_call()
     assert type(stopped.value) is Stopped
     assert meter.win("outline:0:3", "fast") is True  # the engine reads the stop at its next boundary
+
+
+SECONDS = {"Outline": 0.0, "Side": 0.0, "Draft": 0.0, "Quick": 0.05, "Careful": 3.0, "Polish": 0.0}
+"""How long the racing system's model thinks per prompt, by its first word."""
+
+
+def racing(model: MockLLM, *, careful: Step | None = None) -> MAS:
+    """``quick`` and ``careful`` race from ``outline`` to write the notes; ``polish`` joins them with a side branch."""
+    agents = [
+        Agent("outline", "Outline {query}", "outline"),
+        Agent("quick", "Quick {outline}", "notes", ["outline"]),
+        Agent("side", "Side {query}", "aside"),
+        Agent("polish", "Polish {notes} {aside}", "final", ["notes", "aside"]),
+    ]
+    if careful is None:
+        agents.append(Agent("careful", "Careful {outline}", "notes", ["outline"]))
+    edges: list[tuple[str, str] | Edge] = [
+        Edge("outline", "quick", EdgeKind.FIRST),
+        Edge("outline", "careful", EdgeKind.FIRST),
+        ("quick", "polish"),
+        ("careful", "polish"),
+        ("side", "polish"),
+    ]
+    steps = [] if careful is None else [careful]
+    return MAS(agents, edges, steps=steps, tools=[slow], outputs={"final": "text"}, llm=model)
+
+
+@tool
+def slow(outline: str) -> str:
+    """Write notes slowly, without a model."""
+    time.sleep(0.3)
+    return f"slow notes on {outline}"
+
+
+def test_the_first_of_a_race_writes() -> None:
+    model = PollingLLM(lambda prompt: SECONDS[prompt.split()[0]])
+    events: list[Event] = []
+    mas = racing(model)
+    assert mas._checked().joins["polish"].kind == "join"  # the race is one group of the join
+    started = time.monotonic()
+    trace = mas.run_state({"query": "q"}, on_event=events.append)
+    assert time.monotonic() - started < 1.0, "the wall is the fastest contestant's"
+    assert trace.status == "ok" and trace.outputs == {"final": "done"}
+    by = {record.agent: record for record in trace.records}
+    assert [record.agent for record in trace.records].count("polish") == 1
+    assert (by["quick"].lost, by["quick"].outputs) == (False, {"notes": "done"})
+    careful = by["careful"]
+    assert (careful.lost, careful.outputs, careful.error, careful.raw_response) == (True, {}, None, "half")
+    assert (careful.cost_usd, careful.route) == (CUT_USD, ())
+    assert ("careful", "lost") in [(event.node, event.status) for event in events if event.kind == "end"]
+
+    # without the side branch the node after the race is a merge, and runs once too
+    merged = MAS(
+        [
+            *(mas.agents[name] for name in ("outline", "quick", "careful")),
+            Agent("polish", "Polish {notes}", "final", ["notes"]),
+        ],
+        [edge for edge in mas.edges if edge.source != "side"],
+        outputs={"final": "text"},
+        llm=PollingLLM(lambda prompt: SECONDS[prompt.split()[0]]),
+    )
+    assert merged._checked().joins["polish"].kind == "merge"
+    trace = merged.run_state({"query": "q"})
+    assert trace.outputs == {"final": "done"} and [r.agent for r in trace.records].count("polish") == 1
+
+    # a step contestant cannot be cut: it is waited for, and its writes are dropped
+    stepped = racing(
+        PollingLLM(lambda prompt: SECONDS[prompt.split()[0]]), careful=Step("careful", "slow", writes={"slow": "notes"})
+    )
+    trace = stepped.run_state({"query": "q"})
+    by = {record.agent: record for record in trace.records}
+    assert trace.outputs == {"final": "done"} and by["careful"].lost and by["careful"].cost_usd == 0.0
+    assert [record.agent for record in trace.records].count("polish") == 1
+
+
+def test_a_race_fails_when_every_contestant_fails() -> None:
+    def answer(prompt: str) -> str:
+        if prompt.startswith(("Quick", "Careful")):
+            raise ValueError(f"no notes from {prompt.split()[0]}")
+        return "done"
+
+    trace = racing(MockLLM(answer)).run_state({"query": "q"})
+    assert trace.status == "failed" and "no notes from" in str(trace.error)
+    assert sorted(record.agent for record in trace.records if record.error) == ["careful", "quick"]
+    assert "polish" not in {record.agent for record in trace.records}
+
+    def one(prompt: str) -> str:
+        if prompt.startswith("Quick"):
+            raise ValueError("no quick notes")
+        return "done"
+
+    trace = racing(MockLLM(one)).run_state({"query": "q"})  # the other contestant wins
+    assert trace.status == "ok" and trace.outputs == {"final": "done"}
+
+
+def test_a_race_inside_a_chain_item() -> None:
+    model = PollingLLM(lambda prompt: SECONDS[prompt.split()[0]])
+    mas = MAS(
+        [
+            Agent("drafter", "Draft {page}", "draft", ["page"]),
+            Agent("quick", "Quick {draft}", "notes", ["draft"]),
+            Agent("careful", "Careful {draft}", "notes", ["draft"]),
+        ],
+        [Edge("drafter", "quick", EdgeKind.FIRST), Edge("drafter", "careful", EdgeKind.FIRST)],
+        each={"drafter": {"item": "page", "in": "pages"}, "quick": "page in pages", "careful": "page in pages"},
+        inputs={"pages": "list of text"},
+        outputs={"notes": "list of text"},
+        llm=model,
+    )
+    started = time.monotonic()
+    trace = mas.run_state({"pages": ["a", "b"]})
+    assert time.monotonic() - started < 1.0
+    assert trace.status == "ok" and trace.outputs == {"notes": ["done", "done"]}
+    lost = sorted((record.agent, record.item) for record in trace.records if record.lost)
+    assert lost == [("careful", 0), ("careful", 1)]
 
 
 # ------------------------------------------------------------ budgets, gates and the flag

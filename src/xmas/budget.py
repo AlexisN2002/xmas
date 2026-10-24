@@ -217,6 +217,7 @@ class RunMeter(_Metering):
         self.halted = threading.Event()
         self._races: dict[str, threading.Event] = {}
         self._winners: dict[str, str] = {}
+        self._failed: dict[str, int] = {}
         with _running_lock:
             if self.run_id in RUNNING:
                 raise ValueError(f"Run id {self.run_id!r} is in use by a running run.")
@@ -261,6 +262,12 @@ class RunMeter(_Metering):
             self._winners[key] = node
             self._races.setdefault(key, threading.Event()).set()
             return True
+
+    def fail(self, key: str) -> int:
+        """Count a contestant of the race ``key`` that failed; return how many have failed so far."""
+        with self._lock:
+            self._failed[key] = self._failed.get(key, 0) + 1
+            return self._failed[key]
 
     def flag(self) -> CancelFlag:
         """Return the cancel flag of a call starting now: the run's stop, and the race of the running contestant."""

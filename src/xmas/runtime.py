@@ -49,6 +49,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
@@ -61,10 +62,10 @@ from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from promptolution.utils.token_counter import get_token_counter
 
 from xmas.agent import Agent
-from xmas.budget import RUNNING, RunMeter, VisitMeter
+from xmas.budget import RUNNING, RunMeter, VisitMeter, contestant
 from xmas.check import SENT, step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
-from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, XmasError, classify
+from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, RaceLost, XmasError, classify
 from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
 from xmas.human import Asker, Human, Pause, Question, answer_value, question_id
@@ -306,6 +307,7 @@ def _wrap(
     *,
     writes_error: bool = False,
     starts: bool = True,
+    race: tuple[str, int] | None = None,
 ) -> Callable[[MASState], dict[str, Any]]:
     """Turn a node's body into the node LangGraph runs.
 
@@ -327,6 +329,13 @@ def _wrap(
     A box whose inner run paused keeps no record yet: the node writes the
     paused thread under ``asks`` for the box's wait node, which finishes the
     visit (``starts=False``: the visit has started already).
+
+    A contestant of a ``first of`` race (``race``: its source and how many
+    race) runs on the race's flag, keyed by source, item and visit. The first
+    to finish wins and writes; a later one, or one whose call the win cut,
+    writes nothing and keeps a ``lost`` record of what it paid. A contestant
+    that fails goes on no further, and the race fails with the last one when
+    every contestant failed.
     """
     retry = mas.retry.get(name, {})
 
@@ -345,23 +354,36 @@ def _wrap(
         visit = VisitMeter(meter)
         update: dict[str, Any] = {}
         used: Counter[str] = Counter()
+        contest = None if race is None else f"{race[0]}:{index}:{here['visit']}"
+
+        def lost(record: AgentRecord) -> dict[str, Any]:
+            """Keep a race loser's record, paid but writing nothing, and send it nowhere."""
+            took = time.perf_counter() - started
+            record = dataclasses.replace(record, latency_s=took, lost=True, route=(), retries=used.total(), **here)
+            meter.keep(record, mas)
+            meter.emit("end", name, status="lost", cost_usd=record.cost_usd, **here)
+            return {"records": [record], "routes": {name: []}}
+
         try:
-            while True:
-                try:
-                    record, update["values"] = body(state, visit)
-                    break
-                except GraphBubbleUp:
-                    raise
-                except Exception as error:
-                    again = _kind_of(error).value
-                    if used[again] >= retry.get(again, 0):
+            with nullcontext() if contest is None else contestant(meter.race(contest)):
+                while True:
+                    try:
+                        record, update["values"] = body(state, visit)
+                        break
+                    except GraphBubbleUp:
                         raise
-                    used[again] += 1
+                    except Exception as error:
+                        again = _kind_of(error).value
+                        if used[again] >= retry.get(again, 0):
+                            raise
+                        used[again] += 1
             if used and record.kind == "agent":  # its cost is that of every attempt
                 paid = visit.meta
                 record = dataclasses.replace(
                     record, **paid.record_fields() if paid else {"cost_usd": None, "tokens": None}
                 )
+            if contest is not None and not meter.win(contest, name):
+                return lost(dataclasses.replace(record, outputs={}))
             if decision is not None:
                 route, capped = decision.route(_context(mas, name, state, update["values"], meter))
                 record = dataclasses.replace(record, route=tuple(route), capped=capped)
@@ -371,6 +393,9 @@ def _wrap(
         except GraphBubbleUp:  # LangGraph's own signals, such as an interrupt, pass untouched
             raise
         except Exception as error:
+            if contest is not None and isinstance(error, RaceLost):
+                record = _failed_record(mas, name, error, ErrorKind.STOPPED, 0.0, None, visit)
+                return lost(dataclasses.replace(record, error=None, error_kind=None, raw_response=error.text))
             kind = _kind_of(error)
             stopped = kind is ErrorKind.STOPPED
             cut = stopped and bool(visit.metas or visit.inner)
@@ -385,6 +410,8 @@ def _wrap(
             meter.keep(record, mas)
             status = "stopped" if stopped else "failed" if target is None else "routed"
             meter.emit("end", name, status=status, cost_usd=record.cost_usd, **here)
+            if race is not None and contest is not None and not stopped and meter.fail(contest) < race[1]:
+                return {"records": [record], "routes": {name: []}}  # the other contestants race on
             if target is None:
                 raise
             routed: dict[str, Any] = {"records": [record], "routes": {name: [target]}}
@@ -886,7 +913,7 @@ class _Decision:
             elif edge.kind in (EdgeKind.WHEN, EdgeKind.WHILE):
                 choices.append((edge, predicates[edge]))
         return cls(
-            plain=tuple(edge.target for edge in edges if edge.kind is EdgeKind.PLAIN),
+            plain=tuple(edge.target for edge in edges if edge.kind in (EdgeKind.PLAIN, EdgeKind.FIRST)),
             choices=tuple(choices),
             otherwise=next((edge.target for edge in edges if edge.kind is EdgeKind.ELSE), None),
             errors=tuple(edge for edge in edges if edge.kind is EdgeKind.ERROR),
@@ -1330,20 +1357,23 @@ def compile_mas(mas: MAS) -> Any:
             bodies[box.name] = _box_body(box, types)
 
     out = _out_edges(mas) if mas.version == 2 else {}
-    decisions = {
+    races = mas.info.races if mas.info is not None else {}
+    racing = {name: (source, len(names)) for source, names in races.items() for name in names}
+    decisions = {  # a contestant decides too: only the winner goes on
         source: _Decision.of(edges, mas._checked().predicates)
         for source, edges in out.items()
-        if any(e.kind is not EdgeKind.PLAIN for e in edges)
+        if source in racing or any(e.kind not in (EdgeKind.PLAIN, EdgeKind.FIRST) for e in edges)
     }
     deferred = join_nodes(mas.graph) if mas.version != 2 else set()
     writes_error = mas.version == 2 and _reads(mas, "error")
     for name, body in bodies.items():
-        node = _wrap(mas, name, body, decisions.get(name), writes_error=writes_error)
+        node = _wrap(mas, name, body, decisions.get(name), writes_error=writes_error, race=racing.get(name))
         # mypy rejects a TypedDict schema here; langgraph documents it as the usage.
         builder.add_node(name, node, defer=name in deferred, input_schema=schema)  # type: ignore[arg-type]
     for name in holding:
         body = _box_body(mas.boxes[name], types, resumes=True)
-        finish = _wrap(mas, name, body, decisions.get(name), writes_error=writes_error, starts=False)
+        decision, race = decisions.get(name), racing.get(name)
+        finish = _wrap(mas, name, body, decision, writes_error=writes_error, starts=False, race=race)
         builder.add_node(f"{name}.wait", _box_wait(name, finish), defer=True, input_schema=schema)  # type: ignore[arg-type]
     for name, human in humans.items():
         ask, wait = _human_nodes(mas, human, decisions.get(name), types)
