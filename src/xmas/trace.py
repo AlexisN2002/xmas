@@ -22,6 +22,7 @@ from xmas.values import plain
 
 if TYPE_CHECKING:  # pragma: no cover
     from xmas.health import Health
+    from xmas.human import Pause
 
 
 @dataclass(frozen=True)
@@ -138,8 +139,9 @@ class AgentRecord:
         finish_reason: Why the model stopped, as the provider said.
         error_kind: The kind of a cut or refused answer that still produced text.
         served_model: The model the provider says served the call.
-        kind: What kind of node ran: ``"agent"``, ``"step"`` for a step, or
-            ``"box"`` for a box.
+        kind: What kind of node ran: ``"agent"``, ``"step"`` for a step,
+            ``"box"`` for a box, or ``"human"`` for a human node, whose
+            ``raw_response`` is its answer's JSON.
         rejected: Answers refused by the agent's answer form before the one it
             kept in ``raw_response``, in order.
         error: Why the visit failed, when it failed and the run went on.
@@ -153,6 +155,10 @@ class AgentRecord:
         item_key: The item's key field, for a chain with ``key``.
         visit: Which visit of its node this is in its run (or its item), from 1.
         retries: How often a ``retry`` rule ran the visit again.
+        wait_s: Seconds a human node's question waited for its answer. Left
+            out of ``==``, like ``latency_s``.
+        lost: Whether the visit lost a ``first of`` race: it ran, paid, and
+            its writes were dropped.
     """
 
     agent: str
@@ -181,12 +187,15 @@ class AgentRecord:
     item_key: str | None = None
     visit: int | None = None
     retries: int = 0
+    wait_s: float | None = field(default=None, compare=False)
+    lost: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form: the first ten fields, then each later field that is set.
 
         ``kind`` is set when it is not ``"agent"``, ``rejected`` when it is not
-        empty, ``capped`` when it is true and ``retries`` when it is not 0.
+        empty, ``capped`` and ``lost`` when they are true and ``retries`` when
+        it is not 0.
         """
         data: dict[str, Any] = {
             "agent": self.agent,
@@ -217,6 +226,8 @@ class AgentRecord:
             "item_key": self.item_key,
             "visit": self.visit,
             "retries": self.retries or None,
+            "wait_s": self.wait_s,
+            "lost": self.lost or None,
         }
         data.update((key, value) for key, value in later.items() if value is not None)
         return data
@@ -242,6 +253,8 @@ class Trace:
             that declares none.
         run_id: The run's id, new for every run, so left out of ``==``.
         graph_id: The ``describe()`` id of the system that ran.
+        pause: The questions a paused run waits on; ``None`` for a run that
+            ended. Left out of ``==``, since its questions hold the times asked.
     """
 
     query: str
@@ -253,6 +266,7 @@ class Trace:
     outputs: dict[str, Any] = field(default_factory=dict)
     run_id: str | None = field(default=None, compare=False)
     graph_id: str | None = None
+    pause: Pause | None = field(default=None, compare=False)
 
     def __getitem__(self, agent: str) -> tuple[AgentRecord, ...]:
         """Return every record for one agent, in execution order.
@@ -296,7 +310,9 @@ class Trace:
 
     @property
     def status(self) -> RunStatus:
-        """How the run ended: ``ok`` without an error, else derived from ``error_kind``."""
+        """How the run ended: ``paused`` while it waits on a person, ``ok`` without an error, else by ``error_kind``."""
+        if self.pause is not None:
+            return RunStatus("paused")
         return RunStatus.OK if self.error is None else status_for(self.error_kind)
 
     @property
@@ -311,11 +327,11 @@ class Trace:
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form, suitable for JSON or YAML.
 
-        ``query``, ``output``, ``records`` and ``error`` come first. ``"status"`` follows only for a failed run,
-        so it is never ``"ok"``, ``"error_kind"`` only when it is known, and
+        ``query``, ``output``, ``records`` and ``error`` come first. ``"status"`` follows only for a failed or
+        paused run, so it is never ``"ok"``, ``"error_kind"`` only when it is known, and
         ``"health"`` only when it reports something, then ``"outputs"``,
-        ``"run_id"`` and ``"graph_id"`` when set; a media output is its
-        ref's dict. A reader that finds no
+        ``"run_id"``, ``"graph_id"`` and ``"pause"`` when set; a media output
+        is its ref's dict. A reader that finds no
         ``"status"`` reads ``"ok"`` when ``error`` is null and ``"failed"``
         otherwise.
         """
@@ -325,23 +341,30 @@ class Trace:
             "records": [record.to_dict() for record in self.records],
             "error": self.error,
         }
-        if self.error is not None:
+        if self.error is not None or self.pause is not None:
             data["status"] = self.status.value
         if self.error_kind is not None:
             data["error_kind"] = self.error_kind.value
         health = None if self.health is None else self.health.to_dict()
         if health:
             data["health"] = health
-        later = {"outputs": plain(self.outputs) or None, "run_id": self.run_id, "graph_id": self.graph_id}
+        later = {
+            "outputs": plain(self.outputs) or None,
+            "run_id": self.run_id,
+            "graph_id": self.graph_id,
+            "pause": None if self.pause is None else self.pause.to_dict(),
+        }
         data.update((key, value) for key, value in later.items() if value is not None)
         return data
 
 
-EVENT_KINDS = ("start", "end", "item_start", "item_end")
-"""What an :class:`Event` reports: a visit's start and end, and an item's."""
+EVENT_KINDS = ("start", "end", "item_start", "item_end", "pause", "resume", "stop")
+"""What an :class:`Event` reports: a visit's start and end, an item's, a human
+node's question left open and answered, and a run stopped."""
 
-EVENT_STATUSES = ("ok", "routed", "failed")
-"""How an ending visit or item went: it succeeded, its error was routed, or it failed."""
+EVENT_STATUSES = ("ok", "routed", "failed", "stopped", "lost")
+"""How an ending visit or item went: it succeeded, its error was routed, it
+failed, it was cut by a stop, or it lost a ``first of`` race."""
 
 
 @dataclass(frozen=True)
@@ -358,6 +381,9 @@ class Event:
         visit: Which visit of the node this is, from 1.
         status: How it went, one of :data:`EVENT_STATUSES`; ends only.
         cost_usd: What the visit or item cost, when known; ends only.
+        question: The question's id, for ``pause`` and ``resume``.
+        wait_s: Seconds the question waited, for ``resume``.
+        reason: Why the run stopped, for ``stop``.
     """
 
     kind: str
@@ -369,6 +395,9 @@ class Event:
     visit: int | None = None
     status: str | None = None
     cost_usd: float | None = None
+    question: str | None = None
+    wait_s: float | None = None
+    reason: str | None = None
 
     def __post_init__(self) -> None:
         """Refuse an unknown kind or status, and a status on a start."""
