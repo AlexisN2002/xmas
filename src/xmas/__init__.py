@@ -19,6 +19,7 @@ from xmas.graph import END, START
 from xmas.health import Health, HealthSettings
 from xmas.llms import APILLM, ScoredSequence
 from xmas.mas import MAS
+from xmas.media import Audio, Capabilities, Document, File, Image, Ref, Table
 from xmas.nodes import Box, Step
 from xmas.tasks import GSM8KTask, MASTask
 from xmas.trace import AgentRecord, Event, TokenUsage, ToolCall, Trace
@@ -35,22 +36,29 @@ __all__ = [
     "TEXT",
     "Agent",
     "AgentRecord",
+    "Audio",
     "BadFormat",
     "Box",
     "Budget",
     "BudgetExceeded",
+    "Capabilities",
+    "Document",
     "Edge",
     "EdgeKind",
     "ErrorKind",
     "Event",
+    "File",
     "ForEach",
     "GSM8KTask",
     "Health",
     "HealthSettings",
+    "Image",
     "MASTask",
+    "Ref",
     "RunStatus",
     "ScoredSequence",
     "Step",
+    "Table",
     "TokenUsage",
     "ToolCall",
     "Trace",
