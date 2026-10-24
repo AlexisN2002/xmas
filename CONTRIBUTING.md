@@ -80,7 +80,7 @@ until promptolution widens its supported range.
 
 ## Versioning
 
-`__version__` lives in `src/xmas/__init__.py` and the build reads it from there. Keep it a
+`__version__` lives in `xmas/__init__.py` and the build reads it from there. Keep it a
 plain string literal on its own line. Do not duplicate the version into `pyproject.toml`.
 
 ## Docs
