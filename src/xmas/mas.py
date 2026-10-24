@@ -245,7 +245,7 @@ class MAS(BasePredictor):
         self.frozen = frozenset(frozen)
         self.health = health
         self.each = {name: f if isinstance(f, ForEach) else ForEach.parse(f) for name, f in (each or {}).items()}
-        self.outputs = {name: t if isinstance(t, ValueType) else parse_type(t) for name, t in (outputs or {}).items()}
+        self.outputs = _typed(outputs or {})
         self.retry = {name: dict(rules) for name, rules in (retry or {}).items()}
         self.prompt_names = dict(prompt_names or {})
         self.models = {
@@ -289,10 +289,16 @@ class MAS(BasePredictor):
         self.last_traces: tuple[Trace, ...] = ()
         self.bundle = None
         self.unresolved = {}
-        if self.version == 2:
-            self._build_v2(inputs, state)
-        else:
+        if self.version == 1:
             self._build_v1()
+            return
+        self.inputs = _typed(inputs if inputs is not None else _QUERY_ONLY)
+        for value, entry in (state or {}).items():
+            if entry != {"merge": MERGE_LAST}:
+                raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
+        self.merges = dict.fromkeys(state or {}, MERGE_LAST)
+        self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
+        self.graph = self.info.graph
 
     def _infer_version(
         self,
@@ -331,20 +337,6 @@ class MAS(BasePredictor):
         for agent in self.agents.values():
             if agent.tools:
                 self.resolve_tools(agent)
-
-    def _build_v2(
-        self, inputs: Mapping[str, str | ValueType] | None, state: Mapping[str, Mapping[str, str]] | None
-    ) -> None:
-        """Read the inputs and merges, and run :func:`~xmas.check.check_system`, which builds the graph."""
-        given = inputs if inputs is not None else _QUERY_ONLY
-        self.inputs = {name: kind if isinstance(kind, ValueType) else parse_type(kind) for name, kind in given.items()}
-        self.merges = {}
-        for value, entry in (state or {}).items():
-            if entry != {"merge": MERGE_LAST}:
-                raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
-            self.merges[value] = MERGE_LAST
-        self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
-        self.graph = self.info.graph
 
     def _chain_system(
         self, shape: ChainShape, inputs: Mapping[str, ValueType], written: Mapping[str, ValueType]
@@ -1130,17 +1122,6 @@ class MAS(BasePredictor):
 
     def _describe_node(self, name: str, node: Agent | Step | Box | Human) -> dict[str, Any]:
         """Return one node of :meth:`describe`."""
-        entry = self._describe_body(name, node)
-        if name in self.each:
-            entry["for each"] = str(self.each[name])
-        if isinstance(node, Agent) and node.renamed:
-            entry["placeholders"] = dict(node.reads)
-        if name in self.retry:
-            entry["retry"] = dict(self.retry[name])
-        return entry
-
-    def _describe_body(self, name: str, node: Agent | Step | Box | Human) -> dict[str, Any]:
-        """Return the kind, model or callable or system, typed reads and writes, and frozen of one node."""
         info = self.info
         chain = next((c for c in info.chains.values() if name in c.nodes), None) if info is not None else None
         types = chain.system._checked().types if chain is not None else info.types if info is not None else {}
@@ -1160,8 +1141,7 @@ class MAS(BasePredictor):
             }
             if node.schema is not None:
                 entry["schema"] = _copy.deepcopy(node.schema)
-            return entry
-        if isinstance(node, Human):
+        elif isinstance(node, Human):
             entry = {"name": name, "kind": "human", "form": node.form, "reads": typed(node.reads.values())}
             entry["writes"] = typed(node.written)
             if node.timeout_s is not None:
@@ -1175,6 +1155,12 @@ class MAS(BasePredictor):
             entry["writes"] = typed(writes.values())
         if name in self.frozen:
             entry["frozen"] = True
+        if name in self.each:
+            entry["for each"] = str(self.each[name])
+        if isinstance(node, Agent) and node.renamed:
+            entry["placeholders"] = dict(node.reads)
+        if name in self.retry:
+            entry["retry"] = dict(self.retry[name])
         return entry
 
     def _describe_edge(self, pair: tuple[str, str], edge: Edge | None, loop: bool) -> dict[str, Any]:
@@ -1385,6 +1371,11 @@ def _health_settings(spec: Mapping[str, Any]) -> HealthSettings:
     """Read a spec's ``health`` section."""
     data: dict[str, Any] = {name: tuple(value) if name == "leak" else value for name, value in spec.items()}
     return HealthSettings(**data)
+
+
+def _typed(types: Mapping[str, str | ValueType]) -> dict[str, ValueType]:
+    """Read ``{name: type}``, each type a word or a :class:`~xmas.values.ValueType`."""
+    return {name: vtype if isinstance(vtype, ValueType) else parse_type(vtype) for name, vtype in types.items()}
 
 
 def _type_words(types: Mapping[str, ValueType]) -> dict[str, str]:
