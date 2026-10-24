@@ -179,7 +179,7 @@ class APILLM(promptolution.APILLM):
         if self.call_log is not None:
             self.call_log.record(record)
 
-    def log(
+    def log_call(
         self, operation: str, started: float, started_at: str, *, error: BaseException | None = None, **fields: Any
     ) -> None:
         """Record one call that started at ``started``; ``error`` marks it failed."""
@@ -202,7 +202,7 @@ class APILLM(promptolution.APILLM):
         """Record an answered ``generate`` call with the provider's token counts, else ``estimate``; return them."""
         tokens = estimate if meta.tokens is None else meta.tokens
         fields.setdefault("params", self.call_params())
-        self.log(
+        self.log_call(
             "generate",
             started,
             started_at,
@@ -224,7 +224,7 @@ class APILLM(promptolution.APILLM):
 
     async def _ainvoke_once(self, prompt: str, system_prompt: str) -> ChatCompletion:
         """Make promptolution's request, noting the provider's completion id for the caller."""
-        completion = await self.once(self.request(prompt_messages(prompt, system_prompt)))
+        completion = await self.send_once(self.build_request(prompt_messages(prompt, system_prompt)))
         completion_id.get()[0] = completion.id
         return completion
 
@@ -256,20 +256,20 @@ class APILLM(promptolution.APILLM):
         try:
             tagged = super().get_response(prompts, system_prompts)
         except Exception as error:
-            self.log(
+            self.log_call(
                 "generate",
                 started,
                 started_at,
                 error=error,
                 n_prompts=n_prompts,
                 params=params,
-                **self.provenance(prompts, system_prompts, None, None),
+                **self.call_provenance(prompts, system_prompts, None, None),
             )
             raise
         after = self.get_token_count()
         response_ids = [getattr(response, "completion_id", None) for response in tagged]
         responses = [str(response) for response in tagged]  # plain strings, not the tagged subclass
-        self.log(
+        self.log_call(
             "generate",
             started,
             started_at,
@@ -277,11 +277,11 @@ class APILLM(promptolution.APILLM):
             output_tokens=after["output_tokens"] - before["output_tokens"],
             n_prompts=n_prompts,
             params=params,
-            **self.provenance(prompts, system_prompts, responses, response_ids),
+            **self.call_provenance(prompts, system_prompts, responses, response_ids),
         )
         return responses
 
-    def provenance(
+    def call_provenance(
         self,
         prompts: str | list[str],
         system_prompts: str | list[str] | None,
@@ -339,15 +339,15 @@ class APILLM(promptolution.APILLM):
             EmptyResponse: If no attempt's response had a choice, or the model
                 was cut or refused before it wrote any text or call.
         """
-        request = self.request(messages)
+        request = self.build_request(messages)
         if tools:
             request["tools"] = [spec.to_openai() for spec in tools]
         started_at = timestamp()
         started = time.perf_counter()
         try:
-            completion, meta = self.ask(request, "tool turn", tool_turn=True)
+            completion, meta = self.ask_until_answered(request, "tool turn", tool_turn=True)
         except Exception as error:
-            self.log("generate", started, started_at, error=error, params=self.call_params())
+            self.log_call("generate", started, started_at, error=error, params=self.call_params())
             raise
         message = completion.choices[0].message
         text = message.content or ""
@@ -374,7 +374,7 @@ class APILLM(promptolution.APILLM):
                 refused; otherwise after the last attempt.
             TimeoutError: If the call outlives ``gather_timeout_s + 5``.
         """
-        _, text, meta = self.generate(prompt, system_prompt)
+        _, text, meta = self.send_generation(prompt, system_prompt)
         return text, meta
 
     def generate_parts_with_meta(
@@ -392,7 +392,7 @@ class APILLM(promptolution.APILLM):
             EmptyResponse: As :meth:`generate_with_meta`.
             TimeoutError: As :meth:`generate_with_meta`.
         """
-        _, text, meta = self.generate(parts, system_prompt)
+        _, text, meta = self.send_generation(parts, system_prompt)
         return text, meta
 
     def generate_image_with_meta(
@@ -415,25 +415,25 @@ class APILLM(promptolution.APILLM):
             ValueError: If a part cannot be sent (see :func:`~xmas.llms.parts.to_content`).
             TimeoutError: As :meth:`generate_with_meta`.
         """
-        completion, text, meta = self.generate(prompt, system_prompt, modalities=list(IMAGE_MODALITIES))
+        completion, text, meta = self.send_generation(prompt, system_prompt, modalities=list(IMAGE_MODALITIES))
         try:
             images = [decode_image(url) for url in image_urls(completion.choices[0].message)]
         except XmasError as error:  # the call was paid: the meta goes with the error to the meter
             raise EmptyResponse(str(error), kind=ErrorKind.BAD_FORMAT, meta=meta) from None
         return text, images, meta
 
-    def request(self, messages: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+    def build_request(self, messages: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
         """Return promptolution's request for ``messages``, with ``extra`` keys before ``call_kwargs``."""
         request: dict[str, Any] = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
         request.update(extra)
         request.update(self._call_kwargs)
         return request
 
-    def generate(
+    def send_generation(
         self, prompt: str | Sequence[Part], system_prompt: str, **extra: Any
     ) -> tuple[ChatCompletion, str, CallMeta]:
         """Send one generation with ``extra`` request keys, record it, and move the token counters by its text."""
-        request = self.request(prompt_messages(prompt, system_prompt), **extra)
+        request = self.build_request(prompt_messages(prompt, system_prompt), **extra)
         shown = prompt if isinstance(prompt, str) else record_text(prompt)
         counted = prompt if isinstance(prompt, str) else "".join(part for part in prompt if isinstance(part, str))
         logged = {"params": self.call_params()}
@@ -442,19 +442,19 @@ class APILLM(promptolution.APILLM):
         started_at = timestamp()
         started = time.perf_counter()
         try:
-            completion, meta = self.ask(request, "model call", images="modalities" in extra)
+            completion, meta = self.ask_until_answered(request, "model call", images="modalities" in extra)
         except Exception as error:
-            fields = self.provenance(shown, system_prompt, None, None)
-            self.log("generate", started, started_at, error=error, **logged, **fields)
+            fields = self.call_provenance(shown, system_prompt, None, None)
+            self.log_call("generate", started, started_at, error=error, **logged, **fields)
             raise
         text = completion.choices[0].message.content or ""
         self.update_token_count([counted, system_prompt], [text])
         estimate = TokenUsage(approximate_tokens(counted) + approximate_tokens(system_prompt), approximate_tokens(text))
-        fields = self.provenance(shown, system_prompt, [text], [completion.id])
+        fields = self.call_provenance(shown, system_prompt, [text], [completion.id])
         self.log_answer(started, started_at, meta, estimate, **logged, **fields)
         return completion, text, meta
 
-    def ask(
+    def ask_until_answered(
         self, request: dict[str, Any], what: str, *, tool_turn: bool = False, images: bool = False
     ) -> tuple[ChatCompletion, CallMeta]:
         """Send ``request`` until the response has an answer, summing the paid attempts into one meta.
@@ -464,7 +464,7 @@ class APILLM(promptolution.APILLM):
         finished cleanly. An empty answer
         that was cut or refused raises at once, since the same request would
         only repeat it. Inside a metered call the waits end once the call's
-        :func:`~xmas.budget.cancel_flag` is set (:meth:`wait`).
+        :func:`~xmas.budget.cancel_flag` is set (:meth:`wait_for_attempt`).
         """
         paid: CallMeta | None = None
         flag = cancel_flag()
@@ -472,10 +472,10 @@ class APILLM(promptolution.APILLM):
             progress = Progress()
             token = current_progress.set(progress)
             try:
-                future = asyncio.run_coroutine_threadsafe(self.send(request), self._loop)
+                future = asyncio.run_coroutine_threadsafe(self.send_with_retries(request), self._loop)
             finally:
                 current_progress.reset(token)
-            completion = self.wait(future, what, flag, progress, paid)
+            completion = self.wait_for_attempt(future, what, flag, progress, paid)
             meta = meta_from_completion(completion, time.perf_counter() - progress.started, self.price)
             paid = meta if paid is None else paid.combine(meta)
             if completion.choices:
@@ -501,7 +501,7 @@ class APILLM(promptolution.APILLM):
                     flag.check(paid)
         raise EmptyResponse(f"Empty content from model after {self.max_retries + 1} attempts", meta=paid)
 
-    def wait(
+    def wait_for_attempt(
         self,
         future: Future[ChatCompletion],
         what: str,
@@ -539,24 +539,24 @@ class APILLM(promptolution.APILLM):
         cut = cut_meta(time.perf_counter() - progress.started, tokens, progress.model, self.price)
         flag.check(cut if paid is None else paid.combine(cut), received)
 
-    async def send(self, request: dict[str, Any]) -> ChatCompletion:
+    async def send_with_retries(self, request: dict[str, Any]) -> ChatCompletion:
         """Make ``request``, retrying with promptolution's backoff unless the error is permanent."""
         attempt = 0
         while True:
             try:
-                return await self.once(request)
+                return await self.send_once(request)
             except Exception as exc:
                 if is_permanent(exc) or attempt >= self.max_retries:
                     raise
                 await asyncio.sleep(self.retry_base_delay_s * (2**attempt))
                 attempt += 1
 
-    async def once(self, request: dict[str, Any]) -> ChatCompletion:
+    async def send_once(self, request: dict[str, Any]) -> ChatCompletion:
         """Make ``request`` once, in a slot of promptolution's semaphore, within its per-call timeout."""
         async with self._sem:
-            return await asyncio.wait_for(self.completion(request), timeout=self.call_timeout_s)
+            return await asyncio.wait_for(self.fetch_completion(request), timeout=self.call_timeout_s)
 
-    async def completion(self, kwargs: dict[str, Any]) -> ChatCompletion:
+    async def fetch_completion(self, kwargs: dict[str, Any]) -> ChatCompletion:
         """Send ``kwargs``; when streaming, with :data:`STREAM` added, the chunks assembled (:func:`assemble`)."""
         if not self.stream:
             completion: ChatCompletion = await self.client.chat.completions.create(**kwargs)
@@ -609,11 +609,11 @@ class APILLM(promptolution.APILLM):
             )
             scored = parse_score(response)
         except Exception as error:
-            self.log("score", started, started_at, error=error)
+            self.log_call("score", started, started_at, error=error)
             raise
         # A probe is billed for the prompt and the continuation both, decodes
         # nothing, and measures the continuation alone.
-        self.log(
+        self.log_call(
             "score",
             started,
             started_at,

@@ -219,6 +219,38 @@ RICH = TokenUsage(input_tokens=100, output_tokens=40, cached_tokens=60, reasonin
 """The counts in ``USAGE``, as xmas reads them."""
 
 
+class OneShotLLM(APILLM):
+    """A subclass with helpers of its own under plain names, as a gateway's metered model has."""
+
+    def ask(self, prompt: str, system_prompt: str = "", timeout_s: float | None = None) -> str:
+        """Its own ask, not APILLM's."""
+        return "own ask"
+
+    def request(self) -> str:
+        """Its own request, not APILLM's."""
+        return "own request"
+
+    def generate(self) -> str:
+        """Its own generate, not APILLM's."""
+        return "own generate"
+
+    def wait(self) -> str:
+        """Its own wait, not APILLM's."""
+        return "own wait"
+
+    def log(self) -> str:
+        """Its own log, not APILLM's."""
+        return "own log"
+
+
+def test_a_subclass_may_name_its_own_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # APILLM's own steps go by names a subclass is unlikely to pick, so a plain ``ask`` does not replace one
+    llm, sent = recording_llm(monkeypatch, [answer("hi"), answer("again")], cls=OneShotLLM)
+    assert llm.generate_with_meta("hello")[0] == "hi"
+    assert llm.get_tool_response_meta([{"role": "user", "content": "hello"}], [])[0] == "again"
+    assert len(sent) == 2
+
+
 def test_full_response_keeps_usage_cost_and_finish(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # the provider's cost, cache reads, reasoning and served model reach the meta and the record keywords
