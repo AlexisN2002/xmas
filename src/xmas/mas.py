@@ -49,6 +49,36 @@ if TYPE_CHECKING:  # pragma: no cover
 _QUERY_ONLY = {"query": TEXT}
 
 
+@dataclasses.dataclass(frozen=True)
+class ModelEntry(Capabilities):
+    """A ``models:`` entry whose name stands for another catalogue id, such as ``editor: {model: kimi-k3}``.
+
+    Attributes:
+        model: The catalogue id the bound name stands for.
+    """
+
+    model: str | None = None
+
+    def to_spec(self) -> dict[str, Any]:
+        """Return the ``models:`` entry: the id, then the stated capabilities."""
+        return {"model": self.model, **super().to_spec()}
+
+
+def model_entry(entry: Any, where: str) -> Capabilities:
+    """Read a ``models:`` entry: a :class:`ModelEntry` when it names a ``model`` id, else :class:`Capabilities`.
+
+    Raises:
+        ValueError: As :meth:`Capabilities.parse`, or for a ``model`` that is not a catalogue id.
+    """
+    if not isinstance(entry, Mapping) or "model" not in entry:
+        return Capabilities.parse(entry, where)
+    model = entry["model"]
+    if not isinstance(model, str) or not model or "://" in model:
+        raise ValueError(f"{where} model is a catalogue id such as 'kimi-k3', not {model!r}")
+    stated = Capabilities.parse({key: value for key, value in entry.items() if key != "model"}, where)
+    return ModelEntry(stated.accepts, stated.produces, model)
+
+
 class MAS(BasePredictor):
     """A graph of agents that maps an input to an output.
 
@@ -89,7 +119,9 @@ class MAS(BasePredictor):
             runs again on each kind of :data:`~xmas.check.RETRYABLE`.
         prompt_names: ``{agent: prompt name}`` for agents that share one prompt.
         models: ``{model name: Capabilities}``: what each bound model takes and
-            gives besides text, as declared; empty when none is (and in version 1).
+            gives besides text, as declared, a :class:`ModelEntry` where the
+            name stands for another catalogue id; empty when none is (and in
+            version 1).
         version: 1 or 2.
         info: What the version 2 check learned (types, writers, joins); ``None``
             in version 1.
@@ -233,7 +265,7 @@ class MAS(BasePredictor):
         self.retry = {name: dict(rules) for name, rules in (retry or {}).items()}
         self.prompt_names = dict(prompt_names or {})
         self.models = {
-            name: entry if isinstance(entry, Capabilities) else Capabilities.parse(entry, f"models entry {name!r}")
+            name: entry if isinstance(entry, Capabilities) else model_entry(entry, f"models entry {name!r}")
             for name, entry in (models or {}).items()
         }
         self.version = self._infer_version(version, agents, [*steps, *boxes, *humans], inputs, state)
@@ -708,7 +740,7 @@ class MAS(BasePredictor):
         return prompts
 
     def _callable_specs(self) -> dict[str, dict[str, Any]]:
-        """Return the ``callables`` section: every callable a node uses, steps' first."""
+        """Return the ``callables`` section: every callable a node uses, steps' first; a server by its name."""
         index = self._callables()
         used = [step.uses for step in self.steps.values()] + [t for agent in self.agents.values() for t in agent.tools]
         specs: dict[str, dict[str, Any]] = {}
@@ -722,9 +754,11 @@ class MAS(BasePredictor):
                 }
             else:
                 entry = {"kind": "mcp"}
-                url = getattr(source, "url", None)
-                if isinstance(url, str):
-                    entry["server"] = url
+                server = getattr(source, "name", None)
+                if isinstance(server, str):
+                    entry["server"] = server
+            if item.params:
+                entry["params"] = dict(item.params)
             reads = _type_words(item.reads)
             if reads:
                 entry["reads"] = reads
