@@ -199,8 +199,8 @@ Models
 appear by name only and keys never appear: endpoints and keys come from
 configuration, never from the spec.
 
-Refused, with a message saying so: `to_yaml` on a version 2 system (its file
-format is the `.mas` bundle; `to_dict()` gives its spec), and `run(query)` on a
+Refused, with a message saying so: `to_yaml` on a version 2 system (`save(path)`
+writes it as a `.mas` bundle; `to_dict()` gives its spec), and `run(query)` on a
 system whose inputs are not exactly `{query: text}` (`run_state(values)` runs it).
 
 ::: xmas.nodes.Step
@@ -415,9 +415,9 @@ problems:
   the same for `produces image but cannot answer with images` and
   `generate_image_with_meta`. A subclass of `APILLM` that overrides a hook of
   promptolution's path has `full_response` false and is refused here.
-- `models names 'x', which no agent binds`; `models entry 'x' has key
-  'temperature'; it takes accepts and produces (model parameters come with the
-  .mas bundle)`; `models entry 'x' accepts
+- `models names 'x', which no agent binds`; `models entry 'x' has key 'colour';
+  it takes model, accepts, produces and the parameters max_tokens, timeout_s,
+  temperature, top_p, seed, reasoning_effort`; `models entry 'x' accepts
   'video'; a model may accept image, audio`.
 - `step 'draw' passes image 'png' to remote tool 'paint'; remote tools read no
   media`.
@@ -581,6 +581,96 @@ further; the race fails with the last failure when every contestant failed.
         - contestant
         - RUNNING
         - SLICE_S
+
+## Bundles, verify, configuration, the command line
+
+**`MAS.save(path, *, zipped=False)`** writes a system as a `.mas` bundle, a
+folder or one zip file: `xmas.yaml` (the spec without its prompts),
+`callables.yaml`, `prompts/<name>.md` (the text, after an optional header that
+holds only the answer's `schema`), `boxes/<box>.mas/`, and `xmas.lock` (the
+sha256 of every other file and of each python callable's source), written last.
+Into an existing folder it writes only the files whose parsed content changed
+and never touches `examples/` or `optimize.yaml`. **`MAS.load(path, *, llm=None,
+llms=None, tools=(), config=None, overlay=None, resolve=True, verify=None)`**
+reads one back: a callable in `tools` wins, a python callable is imported by its
+`import` path and bound to its `params`, a remote one reaches the server its
+`server` names under `[tools.<name>]`, and every bound model name not given gets
+`build_llms`. With `resolve`, the names are checked against the catalogue: a
+miss warns with a `ModelNameWarning`, lands in `mas.unresolved`, and every run
+entry point refuses until it is fixed. A load refuses absolute paths, `..`,
+symlinks and bundles over `MAX_BYTES`.
+
+**`MAS.verify(level=1, *, budget=None, strict=False, only=(), examples=None,
+config=None)`** returns a `VerifyReport`: level 0 compares the bundle with its
+lock, level 1 checks the system, renders every prompt, reads every examples file
+and resolves every model name with no model call, level 2 runs the examples
+under `BUDGET_USD` in all and `PER_EXAMPLE_USD` each unless a budget is given. A
+report that is not ok warns once, or raises `VerifyFailed` when `strict`.
+**`MAS.save_examples(trace, *, nodes=None, file="warmup", path=None)`** records
+one node case per node from a trace into `examples/<file>.yaml`.
+
+::: xmas.bundle
+    options:
+      members:
+        - files_of
+        - read
+        - write
+        - spec_of
+        - dump_prompt
+        - parse_prompt
+        - read_optimize
+        - Lock
+        - lock_of
+        - code_hashes
+        - LockDiff
+        - compare
+
+::: xmas.examples
+    options:
+      members:
+        - Check
+        - Example
+        - ExampleFile
+        - parse_examples
+        - run_checks
+        - cases_from_trace
+        - save_examples
+        - CHECK_KINDS
+
+::: xmas.verify
+    options:
+      members:
+        - verify
+        - VerifyReport
+        - ExampleResult
+        - VerifyWarning
+        - VerifyFailed
+        - BUDGET_USD
+        - PER_EXAMPLE_USD
+
+::: xmas.config
+    options:
+      members:
+        - Config
+        - ToolServer
+        - config_path
+        - Catalogue
+        - read_catalogue
+        - closest
+        - misses
+        - resolve_names
+        - Resolution
+        - ModelNameWarning
+        - ModelEntry
+        - PARAMS
+        - build_llms
+        - Unconfigured
+        - tool_sources
+
+::: xmas.cli
+    options:
+      members:
+        - main
 
 ## Prompts
 

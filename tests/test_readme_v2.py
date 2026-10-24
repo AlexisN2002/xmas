@@ -13,6 +13,9 @@ import inspect
 import itertools
 import json
 import re
+import shlex
+import shutil
+import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -23,6 +26,10 @@ import yaml
 from promptolution.llms.base_llm import BaseLLM
 
 import xmas
+import xmas.config
+import xmas.mas
+import xmas.tasks
+import xmas.verify
 from xmas import (
     MAS,
     Agent,
@@ -40,9 +47,16 @@ from xmas import (
     Step,
     TokenUsage,
 )
+from xmas.bundle import parse_prompt, read
+from xmas.cli import main
+from xmas.config import PARAMS, Catalogue, Config, ModelEntry, build_llms, closest
 from xmas.convert import document_text, table_rows
+from xmas.examples import CHECK_KINDS, parse_examples
+from xmas.llms import APILLM
 from xmas.predicates import Context, parse_predicate
+from xmas.spec import validate_spec_v2
 from xmas.tools import Tool, ToolSource, tool
+from xmas.verify import BUDGET_USD, PER_EXAMPLE_USD, VerifyFailed, VerifyWarning
 
 from .conftest import PNG, MockLLM, PaintingLLM, SeeingLLM, req
 from .test_stop import PollingLLM
@@ -1297,6 +1311,150 @@ def test_version_2_save_block_runs_as_written(capsys: pytest.CaptureFixture[str]
         mas.to_yaml(tmp_path / "team.yaml")
 
 
+def block(fence: str, start: str) -> str:
+    """Return the README code block that opens with ``fence`` and whose text starts with ``start``."""
+    return start + README.split(f"```{fence}\n{start}", 1)[1].split("```", 1)[0]
+
+
+@pytest.fixture
+def endpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> MockLLM:
+    """The README's model behind a configured endpoint: built by load, named in the endpoint's catalogue."""
+    monkeypatch.chdir(tmp_path)
+    for name in ("XMAS_BASE_URL", "XMAS_API_KEY", "XMAS_MODELS", "XMAS_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-config"))
+    llm = scripted()
+    llm.full_response = True  # each call reports its cost
+    llm.model_id = "llama-3.1-8b"  # type: ignore[attr-defined]  # the default model's name, as APILLM's
+
+    def listed(config: Config, **_: Any) -> Catalogue:
+        return Catalogue(("llama-3.1-8b", "text-model"), "endpoint")
+
+    monkeypatch.setattr(xmas.config, "read_catalogue", listed)
+    monkeypatch.setattr(xmas.verify, "read_catalogue", listed)
+    monkeypatch.setattr(xmas.mas, "build_llms", lambda names, models, config: dict.fromkeys(names, llm))
+    return llm
+
+
+def test_the_bundle_block_runs_as_written(endpoint: MockLLM, capsys: pytest.CaptureFixture[str]) -> None:
+    mas = looping_system(endpoint)
+
+    mas.save("team.mas")  # save("team.mas", zipped=True) writes one zip file
+    team = MAS.load("team.mas")
+    print(team.describe()["id"] == mas.describe()["id"])  # True
+
+    assert capsys.readouterr().out == "True\n"
+    files = read("team.mas")
+    assert sorted(files) == ["callables.yaml", "prompts/judge.md", "prompts/writer.md", "xmas.lock", "xmas.yaml"]
+    listed = [line.split()[0] for line in block("text", "team.mas/").splitlines()[1:]]
+    assert listed == ["xmas.yaml", "callables.yaml", "prompts/", "boxes/", "examples/", "optimize.yaml", "xmas.lock"]
+    assert yaml.safe_load(block("yaml", "version: 2\nagents:")) == yaml.safe_load(files["xmas.yaml"])
+    shown = block("markdown", "---\nschema:")
+    assert parse_prompt(shown, "judge.md") == parse_prompt(files["prompts/judge.md"].decode(), "judge.md")
+    located = yaml.safe_load(block("yaml", "count_words:\n  kind: python"))
+    saved = yaml.safe_load(files["callables.yaml"])
+    assert located["count_words"] == {**saved["count_words"], "import": "mytools.text:count_words"}
+    validate_spec_v2({**mas.to_dict(), "callables": {**saved, "web_search": located["web_search"]}})
+    assert not any(b"://" in data or b"key" in data for data in files.values())
+
+    entry = ModelEntry.parse(yaml.safe_load(block("yaml", "models:\n  editor:"))["models"]["editor"], "editor")
+    editor = build_llms(["editor"], {"editor": entry}, Config(base_url="http://localhost:8000/v1"))["editor"]
+    assert isinstance(editor, APILLM) and (editor.model_id, editor.call_timeout_s) == ("llama-3.1-70b", 120)
+    assert editor.call_params() == {"max_tokens": 2000, "temperature": 0.2}
+    assert "`" + "`, `".join(PARAMS).replace(", `reasoning_effort", " and\n`reasoning_effort") + "`" in README
+    zipped = mas.save("team-zip.mas", zipped=True)
+    assert zipped.is_file() and MAS.load(zipped).describe()["id"] == mas.describe()["id"]
+    (Path("team.mas") / "callables.yaml").write_text("# hand notes\n" + files["callables.yaml"].decode(), "utf-8")
+    team.agents["writer"].prompt = "Write a very short answer to: {query}\nThe judge's last verdict: {verdict}"
+    team.save("team.mas")  # only the changed prompt file and the lock are rewritten; the comment stays
+    assert read("team.mas")["callables.yaml"].startswith(b"# hand notes\n")
+    with pytest.raises(ValueError, match=r"save\(path\) writes it"):
+        mas.to_yaml("team.yaml")
+
+
+def test_the_verify_block_runs_as_written(endpoint: MockLLM, capsys: pytest.CaptureFixture[str]) -> None:
+    looping_system(endpoint).save("team.mas")
+    team = MAS.load("team.mas")
+
+    trace = team.run("Why is the sky blue?")
+    team.save_examples(trace, nodes=["count", "judge"])
+    print(team.verify(2))
+
+    def steady(text: str) -> str:
+        return re.sub(r"(<0\.1|\d+\.\d) s", "_ s", re.sub(r"bundle [0-9a-f]{16}", "bundle _", text))
+
+    assert steady(capsys.readouterr().out) == steady(block("text", "level 0:"))
+    hand = Path("hand.yaml")
+    hand.write_text(block("yaml", "version: 1\nbudget:"), encoding="utf-8")
+    problems: list[str] = []
+    parse_examples({"examples/hand.yaml": hand.read_bytes()}, None, problems=problems)
+    assert problems == []
+    report = team.verify(2, examples=hand)
+    assert report.ok and [(r.name, r.status) for r in report.examples] == [("judge", "pass"), ("short-answer", "pass")]
+    kinds = README.split("A check is one of ", 1)[1].split(". Its `path`", 1)[0]
+    assert {word.split(":")[0] for word in re.findall(r"`([^`]+)`", kinds)} - {"within"} == set(CHECK_KINDS)
+    assert (BUDGET_USD, PER_EXAMPLE_USD) == (0.05, 0.02)
+    assert [r.name for r in team.verify(2, only=["judge"]).examples] == ["judge"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        MAS.load("team.mas", verify=1)
+    (Path("team.mas") / "prompts" / "writer.md").write_text("Write: {query} {verdict}\n", encoding="utf-8")
+    with pytest.warns(VerifyWarning, match="level 0: changed: prompts/writer.md"):
+        team.verify(0)
+    with pytest.raises(VerifyFailed, match="not ok: level 0 differs"):
+        team.verify(0, strict=True)
+
+
+def test_the_command_line_block_runs_as_written(
+    endpoint: MockLLM, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    commands = [shlex.split(line.split("  #", 1)[0]) for line in block("bash", "xmas init").splitlines()]
+    assert [command[:2] for command in commands] == [
+        ["xmas", "init"],
+        ["xmas", "check"],
+        ["xmas", "show"],
+        ["xmas", "run"],
+        ["xmas", "diff"],
+        ["xmas", "verify"],
+    ]
+    endpoint.responder = lambda prompt: "Rayleigh scattering."
+    monkeypatch.setenv("XMAS_BASE_URL", "http://localhost:8000/v1")
+    for command in commands:
+        assert main(command[1:]) == 0, command
+        if command[1] == "init":
+            shutil.copytree("team.mas", "copy.mas")
+    out = capsys.readouterr().out
+    assert "ok: 1 node, 0 edges, 0 chains" in out and "Rayleigh scattering." in out and "same files" in out
+    assert out.rstrip().endswith("ok: 1 example passed, 0.0100 USD")
+
+
+def test_the_configuration_block_loads(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(block("toml", "[endpoint]"), encoding="utf-8")
+    path.chmod(0o600)
+    keys = {"GATEWAY_KEY": "sk-readme", "WEB_TOOLS_KEY": "w"}
+    config = Config.load(path, environ=keys)
+    assert (config.base_url, config.api_key, config.catalogue) == (
+        "http://localhost:8000/v1",
+        "sk-readme",
+        ("llama-3.1-8b",),
+    )
+    assert (config.stream_of("llama-3.1-8b"), config.stream_of("other"), config.tools["web"].key) == (True, False, "w")
+    assert (config.media_store, config.run_store) == (
+        Path("~/.cache/xmas/store").expanduser(),
+        Path("~/.cache/xmas/runs.sqlite").expanduser(),
+    )
+    assert Config.load(path, environ={**keys, "XMAS_BASE_URL": "http://env/v1"}).base_url == "http://env/v1"
+    assert Config.load(path, environ=keys, base_url="http://given/v1").base_url == "http://given/v1"
+    table = README.split("| Variable | Meaning |", 1)[1].split("\n\n", 1)[0]
+    named = set(re.findall(r"^\| `(XMAS_[A-Z_]+)`", table, flags=re.MULTILINE))
+    assert named == {
+        f"XMAS_{name}" for name in ("BASE_URL", "API_KEY", "MODELS", "CONFIG", "TOOLS_KEY", "STORE", "RUNS")
+    }
+    assert closest("llama-3-1-8b", ["llama-3.1-70b", "llama-3.1-8b"])[0] == "llama-3.1-8b"
+    assert "sk-readme" not in repr(config)
+
+
 # ------------------------------------------------------------ Optimization built in
 
 
@@ -1384,6 +1542,7 @@ def test_per_agent_models_bind_by_name_and_an_unknown_name_is_refused() -> None:
 
 
 def test_nothing_the_readme_calls_planned_exists_yet() -> None:
+    assert not any("preference" in name.lower() for name in [*dir(xmas), *dir(xmas.tasks)])
     assert "langgraph" not in " ".join(inspect.signature(MAS).parameters).lower()
 
 
@@ -1403,6 +1562,6 @@ def test_every_component_the_readme_lists_exists() -> None:
 
     components = README.split("## 🏗 Components", 1)[1].split("\n## ", 1)[0]
     names = [line.split("`")[1] for line in components.splitlines() if line.startswith("- **`")]
-    assert len(names) == 17
+    assert len(names) == 19
     for name in names:
         assert hasattr(xmas, name) or hasattr(xmas.optimization, name), name

@@ -17,7 +17,8 @@ system, not a special case.
 Version 2 puts the whole workflow in one graph: agents, code steps, conditions and loops,
 chains that run once per item of a list, answers with a fixed JSON shape, pictures,
 documents and other files passed by reference, people who approve or edit, branches that
-race, and a Stop that stops. The `.mas` bundle is planned next.
+race, and a Stop that stops. A system saves as a `.mas` bundle, a folder of plain files, and
+checks itself with a few warm-up examples.
 xmas checks the wiring before the first call and draws the picture from the graph that runs.
 A system made only of agents and plain edges is a version 1 system, and works as before.
 
@@ -28,7 +29,7 @@ A system made only of agents and plain edges is a version 1 system, and works as
 - **Pictures and files as values:** a model that can see gets the pictures, and the check refuses one that cannot.
 - **People in the graph:** a person approves, picks, chooses or edits; the run pauses, and resumes after a restart too.
 - **Know what every run cost:** one record per visit with time, tokens and cost, budgets that end a run cleanly, and health signals.
-- **Save and share:** a version 1 system as one YAML file today; a version 2 system as a `.mas` bundle, planned.
+- **Save and share:** a system as a `.mas` bundle with one file per prompt, checked by `verify()` and the `xmas` command.
 - **Optimization built in:** improve every agent's prompt, the wiring and the models against your task.
 
 See [docs/design-principles.md](docs/design-principles.md) for the principles behind the
@@ -36,8 +37,8 @@ design.
 
 > **Status: beta.** Inference, the optimization loop, CANTANTE, topology search, code steps,
 > JSON answers, conditions, loops, per-item chains, media values, budgets, health, people in
-> the graph, Stop and `first of` races are in place. The `.mas` bundle, `verify()`, learning
-> from human picks and the experiment layer are still to come.
+> the graph, Stop, `first of` races, the `.mas` bundle, `verify()` and the `xmas` command are
+> in place. Learning from human picks and the experiment layer are still to come.
 
 | What | Today |
 |---|---|
@@ -58,7 +59,10 @@ design.
 | `first of` races: the first good branch wins | built |
 | People in the graph: pauses, answers, resume after a restart | built |
 | Stop: a running system ends within moments and keeps its records | built |
-| The `.mas` bundle, its commands and `verify()` | planned |
+| The `.mas` bundle: save, load, a lock of checksums | built |
+| `verify()`: checksums, a dry check, warm-up examples | built |
+| Configuration: endpoint, key, catalogue and tool servers, outside the bundle | built |
+| The `xmas` command: `init`, `check`, `show`, `run`, `diff`, `verify` | built |
 | Learning from human picks | planned |
 | The experiment layer: one config for a reproducible run, like promptolution's `ExperimentConfig` | planned |
 
@@ -80,7 +84,8 @@ cp .env.example .env   # then set XMAS_BASE_URL and XMAS_API_KEY
 ```
 
 xmas reads the two variables from the environment and never opens `.env` itself.
-Export them, or start Python with `uv run --env-file .env python`.
+Export them, or start Python with `uv run --env-file .env python`. A configuration file
+works too (see Configuration). Installing xmas also installs the `xmas` command.
 
 Tools served over MCP need `uv sync --extra mcp`.
 
@@ -632,8 +637,7 @@ The system does not check (1 problem):
 
 What a model takes comes from the first of three places: the system's `models` entry for
 the model's name, the model's own `accepts` and `produces`, or else text only. In a spec,
-the `models` section names each model and says what it accepts and produces, and
-nothing else:
+the `models` section names each model and says what it accepts and produces:
 
 ```yaml
 models:
@@ -642,7 +646,8 @@ models:
 ```
 
 `MAS(..., models={"vision-model": {"accepts": ["image"]}})` says the same in Python.
-Any other key, such as `temperature`, is refused, and so is a name no agent binds.
+An entry may also set model parameters (see Save and share). Any other key is refused,
+and so is a name no agent binds.
 The rest of the rules:
 
 - A model sees an image or audio as a content part. `APILLM` sends parts; another
@@ -793,8 +798,102 @@ chain, each item races on its own.
 
 ## 💾 Save and share
 
-A version 1 system, such as the quickstart's, saves as one YAML file. One file holds
-the whole system: prompts, wiring and models, never keys or endpoints.
+A system saves as a bundle: a folder named `name.mas/`, or the same files zipped into one
+file named `name.mas`. Here the system of "Conditions and loops" goes into `team.mas` and
+comes back:
+
+```python
+mas.save("team.mas")  # save("team.mas", zipped=True) writes one zip file
+team = MAS.load("team.mas")
+print(team.describe()["id"] == mas.describe()["id"])  # True
+```
+
+`MAS.load` builds each model the bundle names on the endpoint of your configuration (see
+Configuration). It imports each function from where `callables.yaml` says it lives. Pass
+`llm=`, `llms=` or `tools=[...]` to supply your own instead. The folder holds one file
+per part:
+
+```text
+team.mas/
+  xmas.yaml        # the wiring: inputs, outputs, nodes, edges, models by name
+  callables.yaml   # where each function and tool lives, with typed reads and writes
+  prompts/         # one plain-text file per prompt: writer.md, judge.md
+  boxes/           # each box's system, as a bundle of its own
+  examples/        # warm-up cases for verify(), optional
+  optimize.yaml    # what an optimizer may tune, optional
+  xmas.lock        # checksums of every file and of each function's source
+```
+
+`xmas.yaml` is the system's spec without its prompts. No prompt text sits in the wiring:
+
+```yaml
+version: 2
+agents:
+  - {name: writer, reads: [query, verdict], writes: {draft: text}}
+  - {name: judge, reads: [query, draft, count_words], writes: {verdict: json}}
+steps:
+  - {name: count, uses: count_words}
+  - {name: publish, uses: publish}
+  - {name: sorry, uses: apologize}
+edges:
+  - writer -> count -> judge
+  - judge -> writer: {when: not verdict.fits, max_visits: 3}
+  - judge -> publish: {switch: verdict.action}
+  - judge -> sorry: else
+  - count -> sorry: {on error: [timeout, outage]}
+default_model: llama-3.1-8b
+```
+
+A prompt file is the text exactly as the model sees it. A short header may hold the
+answer's schema, and nothing else; xmas strips it before the model sees the text.
+`prompts/judge.md`:
+
+```markdown
+---
+schema:
+  fits: {type: bool, means: the draft answers the question in under 50 words}
+  action: {type: text, one of: [publish, shorten]}
+---
+Question: {query}
+Draft, {count_words} words: {draft}
+Judge the draft.
+```
+
+`callables.yaml` locates code and never inlines it. A remote tool names its server, here
+`web`, and the server's address sits in your configuration under `[tools.web]`:
+
+```yaml
+count_words:
+  kind: python
+  import: mytools.text:count_words
+  reads: {draft: text}
+  writes: {count_words: json}
+web_search:
+  kind: mcp
+  server: web
+  writes: {web_search: text}
+```
+
+A python entry may add `params:`, constant arguments bound when the bundle loads. A model
+name may stand for another catalogue id and carry parameters, under `models` in
+`xmas.yaml`:
+
+```yaml
+models:
+  editor: {model: llama-3.1-70b, max_tokens: 2000, timeout_s: 120, temperature: 0.2}
+```
+
+The parameters are `max_tokens`, `timeout_s`, `temperature`, `top_p`, `seed` and
+`reasoning_effort`. They apply to the models `MAS.load` builds.
+
+`xmas.lock` records the checksum of every other file and of each function's source, for
+`verify()` to compare. Saving again rewrites only the files whose content changed. A new
+prompt from an optimizer changes one prompt file and the lock, and your comments in the
+other files stay. A bundle never holds an endpoint, a key, a tool server's address, a
+budget or a run. Loading a bundle imports the code that `callables.yaml` names, so load
+only bundles you trust. A function passed in `tools=[...]` is used by its name instead.
+
+A version 1 system, such as the quickstart's, also saves as one YAML file:
 
 ```python
 team = MAS([intern, boss], edges=[("intern", "boss")], llm=llm)  # the quickstart's system
@@ -802,8 +901,8 @@ team.to_yaml("team.yaml")
 team = MAS.from_yaml("team.yaml", llm=llm)
 ```
 
-A system that uses steps, JSON answers, conditions, boxes, chains or people is version 2. Its spec is
-plain data, and `MAS.from_dict` rebuilds it with the same models and functions:
+Any system's spec is plain data. `to_dict()` gives it, and `MAS.from_dict` rebuilds the
+system with the same models and functions:
 
 ```python
 spec = mas.to_dict()  # version, agents, steps, edges, callables, prompts
@@ -821,14 +920,89 @@ The spec's `edges` read like this in YAML, and `from_dict` accepts them in this 
 - count -> sorry: {on error: [timeout, outage]}
 ```
 
-A whole spec written to a YAML file, by hand or with `yaml.safe_dump(spec)`, loads with
-`MAS.from_yaml(path, llm=llm, tools=[...])`.
+A whole spec in a YAML file loads with `MAS.from_yaml(path, llm=llm, tools=[...])`.
+`to_yaml` refuses a version 2 system and points to `save`. Every version 1 file loads,
+runs and saves as before.
 
-`callables` records where each function lives and what it reads and writes. Models
-appear by name only, with what each accepts and produces under `models`. Each agent's prompt sits under `prompts` for now; in the planned
-bundle, each prompt gets a file of its own. `to_yaml` refuses a version 2 system, since
-its file format is the `.mas` bundle (see below), and points to `to_dict()` until then.
-Every version 1 file loads, runs and saves as before.
+## Verify
+
+`verify()` checks a system on three levels, each including the ones before it:
+
+- **0, checksums:** every file and each function's source is unchanged since it was
+  saved, and the system in memory matches the files.
+- **1, dry:** the wiring check, every prompt rendered, every answer form compiled, every
+  examples file read, and every model name looked up in the endpoint's catalogue. No
+  model is called. This is the default level.
+- **2, warm-up:** the examples run under a small budget. A step must write exactly what
+  was recorded, and an agent's answer must pass its checks.
+
+`save_examples` records one case per node from a run. Here the loaded team runs once and
+keeps cases for the count and the judge, then runs them:
+
+```python
+trace = team.run("Why is the sky blue?")
+team.save_examples(trace, nodes=["count", "judge"])
+print(team.verify(2))
+```
+
+```text
+level 0: unchanged since saved (bundle 9c7e2c30958e1c1d, 5 files)
+level 1: no problems; model names checked against the endpoint catalogue
+level 2: count  pass  0.0000 USD  <0.1 s
+level 2: judge  pass  0.0100 USD  0.9 s
+ok: 2 examples passed, 0.0100 USD
+```
+
+The cases land in `examples/warmup.yaml`, and the lock is refreshed. You can also write
+cases by hand. A node case gives the values the node reads; a run case gives the system's
+inputs and checks per output or node under `expect`:
+
+```yaml
+version: 1
+budget: {cost_usd: 0.05, per example: {cost_usd: 0.03, wall_s: 120}}
+examples:
+- name: judge
+  node: judge
+  inputs: {query: "Why is the sky blue?", draft: Sunlight scatters off air., count_words: 4}
+  recorded: {fits: true, action: publish}
+  must: [{form: valid}, {path: verdict.fits, equals: true}]
+- name: short-answer
+  inputs: {query: "Why is the sky blue?"}
+  expect: {judge: [{path: verdict.action, equals: publish}]}
+```
+
+A check is one of `form: valid`, `equals`, `contains`, `not contains`, `matches`, `line`,
+`len`, `not empty`, `exists`, or `near` with `within`. Its `path` picks a value and a
+field, such as `verdict.fits` or `pages[0]`. A picture input is a reference to a file
+under `examples/media/`.
+
+Without a budget, level 2 spends at most 0.05 USD in all and 0.02 USD per example. The
+file's `budget` or `verify(2, budget=0.10)` sets another. A model whose cost is unknown
+and that has no price fails its example, since no cap could bind. A report that is not
+ok gives one `VerifyWarning`; `verify(strict=True)` raises `VerifyFailed` with the report
+instead. `MAS.load(path, verify=1)` verifies while it loads, and `verify(2, only=["judge"])`
+runs only that node's cases. Run it after a model switch, after an optimizer run and
+before a release.
+
+## The command line
+
+The `xmas` command works on bundles from the shell:
+
+```bash
+xmas init team.mas         # a one-agent bundle to edit; --agents a,b for a chain
+xmas check team.mas        # load and check, no model call
+xmas show team.mas         # nodes and edges as text; --json for describe()
+xmas run team.mas --query "Why is the sky blue?" --budget 0.10
+xmas diff team.mas copy.mas  # file by file; with one bundle, against its lock
+xmas verify team.mas --level 2
+```
+
+`run` takes other inputs as `--input name=value`: JSON for a json value, a path for a
+picture. It prints the output, then one line with the status, the model calls, the cost
+and the time. It refuses a model name the catalogue does not hold. `show`, `diff` and
+`verify` take `--json`, and `verify --strict` fails when the report is not ok. The exit
+status is 0 when all is well, 1 for a problem, and 2 for a usage error or a missing
+bundle. A bundle's functions import from the current folder.
 
 ## 🧠 Optimization built in
 
@@ -864,99 +1038,11 @@ optimizers send the same requests to it as to a single prompt.
 
 ## Where this is going
 
-> **Planned, not in the code yet.** Nothing in this section runs today. The code below
-> shows how it will read.
-
-### One bundle per system: `name.mas/`
-
-A version 2 system will save as a bundle, a folder in which each part has its own file.
-No prompt text sits in the wiring:
-
-```text
-team.mas/
-  xmas.yaml        # the wiring: inputs, outputs, nodes, edges, budget, health
-  callables.yaml   # where each tool and step lives, with typed reads and writes
-  prompts/         # one plain-text file per agent
-  optimize.yaml    # the task, what to tune, what stays frozen
-```
-
-The folder also carries a few warm-up examples and a lock file of checksums. Runs are
-never part of it. The running example's `xmas.yaml` would read:
-
-```yaml
-version: 2
-inputs: {query: text}
-agents:
-  - {name: writer, model: text-model, reads: [query, verdict], writes: {draft: text}}
-  - {name: judge, model: text-model, reads: [query, draft, count_words], writes: {verdict: json}}
-steps:
-  - {name: count, uses: count_words}
-  - {name: publish, uses: publish}
-  - {name: sorry, uses: apologize}
-edges:
-  - writer -> count -> judge
-  - judge -> writer: {when: not verdict.fits, max_visits: 3}
-  - judge -> publish: {switch: verdict.action}
-  - judge -> sorry: else
-  - count -> sorry: {on error: [timeout, outage]}
-```
-
-A prompt file is plain text. It may start with a short header that holds only the
-answer's schema. xmas strips the header before the model sees the text. `prompts/judge.md`:
-
-```markdown
----
-verdict:
-  fits: {type: bool, means: the draft answers the question in under 50 words}
-  action: {type: text, one of: [publish, shorten]}
----
-Question: {query}
-Draft, {count_words} words: {draft}
-Judge the draft.
-```
-
-`callables.yaml` locates code and never inlines it:
-
-```yaml
-count_words:
-  kind: python
-  import: mytools.text:count_words
-  reads: {draft: text}
-  writes: {count_words: json}
-```
-
-The folder names models and tools. Addresses and keys live in your configuration
-(`XMAS_BASE_URL`, `XMAS_API_KEY`), never in the folder. A model name the configured
-endpoint does not know gives a warning with the closest names from its catalogue. An
-MCP tool names its server; the server's address sits in your configuration too.
-
-From Python and from the shell, it will read like this:
-
-```python
-mas = MAS.load("team.mas")
-mas.verify()
-mas.save("team.mas")  # rewrites only the files whose content changed
-```
-
-```bash
-xmas init team.mas      # a new folder
-xmas check team.mas     # the wiring check, no model call
-xmas show team.mas      # the graph as a picture
-xmas run team.mas "Why is the sky blue?"
-xmas diff a.mas b.mas   # file by file
-xmas verify team.mas
-```
-
-`verify()` works on three levels. First, checksums: every file, and the code it points
-to, is unchanged since it was saved. Second, a dry check of the wiring, the prompts and
-the model names at the endpoint, with no model call. Third, the warm-up examples run
-under a small budget: a step must match exactly, and an agent must pass the example's
-check. A failure warns by default. Run it after a model switch, after an optimizer run
-and before a release.
+> **Planned, not in the code yet.** Nothing in this section runs today.
 
 ### Learning from human picks
 
-A preference task will learn from the picks people make in `judge` nodes, with credit
+A preference task learns from the picks people make in `judge` nodes, with credit
 per node, so an optimizer can improve a system against what people chose.
 
 ## 📚 Scientific Publications
@@ -985,6 +1071,8 @@ xmas builds on:
 - **`Event`** – One start or end of a visit or an item, a pause, a resume or a stop, passed to `on_event` as the run goes.
 - **`RunStore`** – Where paused runs, their questions and answers are kept: in memory, or in one SQLite file.
 - **`Budget`** – Limits on calls, cost and wall time for each run, and on model calls in flight.
+- **`Config`** – Where models and tools are served: endpoint, key, catalogue, prices and tool servers.
+- **`VerifyReport`** – What `verify()` found on each level, with each example's result, cost and time.
 - **`Health`** – Signals read from a finished run: stuck loops, empty answers, retries, caps hit.
 - **`MASTask`** – A dataset plus a reward over the system's answers, e.g. `GSM8KTask`.
 - **`APILLM`** – Any OpenAI-compatible endpoint, with scoring, tool turns and a per-call log.
@@ -992,16 +1080,56 @@ xmas builds on:
 
 ## Configuration
 
-xmas is configured entirely through the environment. There is no config file, and no
-credential is ever read from or written to the repository. A saved system never holds
-an endpoint or a key, and never says where stored media goes.
+A bundle names its models and tool servers. Where they are served lives in your
+configuration: the environment, then a TOML file, `$XMAS_CONFIG` or else
+`~/.config/xmas/config.toml` (under `$XDG_CONFIG_HOME` when it is set). A missing file is
+no error. What you pass in code wins over both, such as
+`MAS.load(path, config=Config.load(base_url=...))`. A file with every table:
+
+```toml
+[endpoint]
+base_url = "http://localhost:8000/v1"
+api_key_env = "GATEWAY_KEY"        # or api_key = "..."
+catalogue = ["llama-3.1-8b"]       # optional; else GET {base_url}/models
+stream = false
+
+[models."llama-3.1-8b"]
+price = {input_per_m = 0.6, output_per_m = 2.5}
+stream = true
+
+[tools.web]
+url = "https://tools.example.com/mcp"
+key_env = "WEB_TOOLS_KEY"          # or key = "..."
+
+[store]
+media = "~/.cache/xmas/store"
+runs = "~/.cache/xmas/runs.sqlite"
+```
+
+Prices and streaming hold per model id, for the models `MAS.load` builds. A tool server
+is named by `server:` in `callables.yaml` and found under `[tools.<name>]`. The
+environment variables:
 
 | Variable | Meaning |
 |---|---|
 | `XMAS_BASE_URL` | Base URL of an OpenAI-compatible endpoint |
 | `XMAS_API_KEY` | API key for that endpoint |
+| `XMAS_MODELS` | Model ids, comma separated, that stand for the catalogue, so names check offline |
+| `XMAS_CONFIG` | The configuration file, instead of `~/.config/xmas/config.toml` |
+| `XMAS_TOOLS_KEY` | Key for a tool server whose entry has none |
 | `XMAS_STORE` | Folder for stored pictures and other media; default `~/.cache/xmas/store` |
 | `XMAS_RUNS` | File where paused runs are kept, so they resume after a restart; default in memory |
+
+The catalogue is the list of model ids the endpoint serves. It is `catalogue` or
+`XMAS_MODELS` when set, else the endpoint's answer to `GET /models`, kept for five
+minutes per endpoint and key. Offline, a kept answer of any age stands in. A model name
+the catalogue does not hold gives a `ModelNameWarning` with the closest ids, such as
+`llama-3.1-8b` for `llama-3-1-8b`. xmas never swaps in another name: the system refuses
+to run until the name is fixed, and `verify(1)` checks again. Without an endpoint or a
+catalogue, names go unchecked.
+
+No key appears in a bundle, a record, a `repr` or the kept catalogue. A configuration
+file that holds a key and that others can read gives a warning.
 
 ## Development
 
