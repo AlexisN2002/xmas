@@ -403,9 +403,9 @@ print(spent["intern"][0].outputs)  # the intern's draft is kept
 
 `Budget` also takes `max_cost_usd` and `max_wall_s`. A limit of 0 spends nothing. Calls
 already in flight may overshoot by one call per branch. `max_parallel_calls` caps how
-many model calls are in flight at once, across branches, boxes and chain items. A cost limit refuses the next
-call when the last one reported no cost and its model has no price, because an unknown
-cost cannot be checked.
+many model calls are in flight at once, across branches, boxes and chain items. A cost
+limit refuses the next call when the last one reported no cost and its model has no
+price, because an unknown cost cannot be checked.
 
 ## Drawing a system
 
@@ -615,7 +615,8 @@ best.to_yaml("team-optimized.yaml")
 model, reads, writes or edges. A frozen node makes the system version 2, so keep its
 `to_dict()` instead of a YAML file. `EvolutionaryTopologyOptimizer` searches the wiring. It
 keeps steps, boxes, frozen nodes, conditional edges and every `for each` chain as they
-are, and drops any candidate the check refuses. Steps are never part of the prompts an optimizer sees.
+are, and drops any candidate the check refuses. Steps are never part of the prompts an
+optimizer sees, and agents that share a prompt are optimized as one prompt.
 
 ## 🔗 xmas and promptolution
 

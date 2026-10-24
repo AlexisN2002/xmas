@@ -339,7 +339,8 @@ node, and `run`, `{cost_usd, elapsed_s, calls, records}` at read time.
 `Agent(..., inputs={"slide": "page"})` fills a placeholder from a value of
 another name, and records key their inputs by placeholder.
 `MAS(..., prompt_names={"checker": "judge", "figure_checker": "judge"})` lets agents share one
-prompt; an optimizer's `copy(prompts=...)` changes it for all of them.
+prompt; `copy(prompts=...)` changes it for all of them, and an optimizer works on it as
+one prompt, through the first agent that shares it, unless one of them is frozen.
 
 `describe()` gains `for each`, `placeholders` and `retry` on nodes, and
 `outputs` and `groups` (one per chain) at the top, each only when set.
