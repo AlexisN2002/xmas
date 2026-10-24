@@ -93,10 +93,9 @@ class ForEach:
     @property
     def options(self) -> dict[str, Any]:
         """The chain-wide options that are set, as a spec writes them."""
-        given: dict[str, Any] = {"at once": self.at_once, "key": self.key, "item budget": self.item_budget}
-        return {
-            name: value if name != "item budget" else dict(value) for name, value in given.items() if value is not None
-        }
+        budget = None if self.item_budget is None else dict(self.item_budget)
+        given: dict[str, Any] = {"at once": self.at_once, "key": self.key, "item budget": budget}
+        return {name: value for name, value in given.items() if value is not None}
 
     def __str__(self) -> str:
         """Return the form as a spec writes it, ``"page in plan.slides"``."""
@@ -208,9 +207,8 @@ def find_chains(
             )
             continue
         (head,) = entries
-        found = []
         exits = tuple(e for e in edges if e.source in inside and e.target not in inside)
-        found += [
+        found = [
             f"chain {head!r}: the {e.kind.value} edge {e.label} leaves it; route it inside the chain"
             for e in exits
             if e.kind not in (EdgeKind.PLAIN, EdgeKind.ELSE)
