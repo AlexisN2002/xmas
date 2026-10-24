@@ -363,7 +363,7 @@ def check_the_logged_records_and_events(store: Store, trace: Trace) -> None:
         "served_model", "cost_usd",
     ]  # fmt: skip
     assert sorted(r[4] for r in logged) == sorted(r.agent for r in trace.records)
-    first = next(r for r in logged if r[4] == "drafter")
+    first = next(r for r in logged if r[4] == "drafter" and r[6] == 0)  # the items run at once, in either order
     assert (first[5], first[6], first[7], first[8], first[11]) == ("agent", 0, "a", 1, 0.01)
     assert json.loads(first[20]) == {"slide": '{"id": "a"}', "rules": "plain", "verdict": ""}
     events = store.events(cast("str", trace.run_id))

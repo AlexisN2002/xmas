@@ -577,7 +577,7 @@ def test_store_keeps_deadlines_totals_and_threads(tmp_path: Path) -> None:
     run(mas, plan("a", "b"), "s1")
     store = mas.runs()
     (row,) = store.runs("paused")
-    assert row.paused == ("s1/fix/a/1", "s1/fix/b/1")
+    assert sorted(row.paused) == ["s1/fix/a/1", "s1/fix/b/1"]  # in the order the items paused, which threads decide
     assert row.totals is not None
     assert row.totals["calls"] == 2
     question = cast("Any", store.question("s1/fix/b/1"))
