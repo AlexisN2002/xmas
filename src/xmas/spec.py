@@ -7,7 +7,10 @@ compiled graph and no callable is ever part of it.
 
 A ``version: 2`` spec adds steps, boxes, typed values, answer forms, the edge
 forms of :mod:`xmas.edges`, ``frozen`` nodes and ``health`` settings, and keeps
-its prompts in a top-level ``prompts`` section.
+its prompts in a top-level ``prompts`` section. It may declare ``outputs``; a
+node may run ``for each`` item of a list and ``retry`` on some error kinds; an
+agent may read values under placeholders of other names and share a prompt
+with other agents under a ``prompt`` name.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from typing import Any
 V2_KEYS: dict[str, Any] = {
     "version": int,
     "inputs": dict,
+    "outputs": dict,
     "agents": list,
     "steps": list,
     "boxes": list,
@@ -34,18 +38,40 @@ _ENTRIES: dict[str, tuple[str, frozenset[str], dict[str, Any]]] = {
     "agents": (
         "Agent",
         frozenset({"writes"}),
-        {"name": str, "model": str, "reads": list, "writes": dict, "tools": list, "schema": dict},
+        {
+            "name": str,
+            "model": str,
+            "prompt": str,
+            "for each": (str, dict),
+            "reads": (list, dict),
+            "writes": dict,
+            "tools": list,
+            "schema": dict,
+            "retry": dict,
+        },
     ),
-    "steps": ("Step", frozenset({"uses"}), {"name": str, "uses": str, "reads": dict, "writes": dict}),
+    "steps": (
+        "Step",
+        frozenset({"uses"}),
+        {"name": str, "uses": str, "for each": (str, dict), "reads": dict, "writes": dict, "retry": dict},
+    ),
     "boxes": (
         "Box",
         frozenset({"reads", "writes", "system"}),
-        {"name": str, "reads": dict, "writes": dict, "system": dict},
+        {"name": str, "for each": (str, dict), "reads": dict, "writes": dict, "system": dict},
     ),
 }
 _CALLABLE = {"kind": str, "import": str, "server": str, "reads": dict, "writes": dict}
 _HEALTH = {"length_factor": (int, float), "min_samples": int, "leak": list}
-_WORDS = {int: "an integer", (int, float): "a number", str: "a string", list: "a list", dict: "a mapping"}
+_WORDS = {
+    int: "an integer",
+    (int, float): "a number",
+    str: "a string",
+    list: "a list",
+    dict: "a mapping",
+    (str, dict): "a string or a mapping",
+    (list, dict): "a list or a mapping",
+}
 
 
 def validate_spec(data: dict[str, Any]) -> dict[str, Any]:
@@ -120,10 +146,7 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
         for index, entry in enumerate(data.get(section, [])):
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 raise ValueError(f"{label} {index} must be a mapping with a string 'name'.")
-            where = f"{label} {entry['name']!r}"
-            if section == "agents" and "prompt" in entry:
-                raise ValueError(f"{where}: a version 2 prompt sits in the top-level 'prompts' section.")
-            _check_fields(entry, where, fields, required)
+            _check_fields(entry, f"{label} {entry['name']!r}", fields, required)
     for name, entry in data.get("callables", {}).items():
         _check_fields(entry, f"Callable {name!r}", _CALLABLE, frozenset({"kind"}))
         if entry["kind"] not in ("python", "mcp"):
@@ -132,15 +155,17 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
 
     prompts = data.get("prompts", {})
     if not all(isinstance(text, str) for text in prompts.values()):
-        raise ValueError("Spec 'prompts' must map agent names to prompt text.")
+        raise ValueError("Spec 'prompts' must map agent and prompt names to prompt text.")
     for agent in data.get("agents", []):
         if len(agent["writes"]) != 1:
             raise ValueError(
                 f"Agent {agent['name']!r} needs exactly one write such as {{draft: text}}, got {agent['writes']!r}."
             )
-        if agent["name"] not in prompts:
+        if "prompt" in agent and agent["prompt"] not in prompts:
+            raise ValueError(f"Agent {agent['name']!r}: prompt {agent['prompt']!r} names no entry of 'prompts'.")
+        if agent["name"] not in prompts and "prompt" not in agent:
             raise ValueError(f"Agent {agent['name']!r} has no prompt in the 'prompts' section.")
-    stray = sorted(set(prompts) - {agent["name"] for agent in data.get("agents", [])})
+    stray = sorted(set(prompts) - {agent.get("prompt", agent["name"]) for agent in data.get("agents", [])})
     if stray:
-        raise ValueError(f"Spec 'prompts' names unknown agents: {stray}.")
+        raise ValueError(f"Spec 'prompts' has entries no agent uses: {stray}.")
     return data
