@@ -146,6 +146,11 @@ class AgentRecord:
         capped: Whether a ``while`` edge that held was skipped because its
             target had run ``max_visits`` times.
         inner: The inner system's trace, for a box.
+        item: The index of the item a ``for each`` chain ran this visit for;
+            ``None`` outside a chain.
+        item_key: The item's key field, for a chain with ``key``.
+        visit: Which visit of its node this is in its run (or its item), from 1.
+        retries: How often a ``retry`` rule ran the visit again.
     """
 
     agent: str
@@ -170,12 +175,16 @@ class AgentRecord:
     route: tuple[str, ...] | None = None
     capped: bool = False
     inner: Trace | None = None
+    item: int | None = None
+    item_key: str | None = None
+    visit: int | None = None
+    retries: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form: the first ten fields, then each later field that is set.
 
         ``kind`` is set when it is not ``"agent"``, ``rejected`` when it is not
-        empty and ``capped`` when it is true.
+        empty, ``capped`` when it is true and ``retries`` when it is not 0.
         """
         data: dict[str, Any] = {
             "agent": self.agent,
@@ -202,6 +211,10 @@ class AgentRecord:
             "route": None if self.route is None else list(self.route),
             "capped": self.capped or None,
             "inner": None if self.inner is None else self.inner.to_dict(),
+            "item": self.item,
+            "item_key": self.item_key,
+            "visit": self.visit,
+            "retries": self.retries or None,
         }
         data.update((key, value) for key, value in later.items() if value is not None)
         return data
@@ -222,6 +235,11 @@ class Trace:
         health: What looked wrong in the run (:func:`xmas.health.summarize`),
             or ``None`` for a trace the engine did not finish. Left out of
             ``==``, since its budget entry holds the wall time.
+        outputs: The final value of each declared output, ``None`` for one
+            whose writer did not run; empty for a failed run and for a system
+            that declares none.
+        run_id: The run's id, new for every run, so left out of ``==``.
+        graph_id: The ``describe()`` id of the system that ran.
     """
 
     query: str
@@ -230,6 +248,9 @@ class Trace:
     error: str | None = None
     error_kind: ErrorKind | None = None
     health: Health | None = field(default=None, compare=False)
+    outputs: dict[str, Any] = field(default_factory=dict)
+    run_id: str | None = field(default=None, compare=False)
+    graph_id: str | None = None
 
     def __getitem__(self, agent: str) -> tuple[AgentRecord, ...]:
         """Return every record for one agent, in execution order.
@@ -290,7 +311,8 @@ class Trace:
 
         ``query``, ``output``, ``records`` and ``error`` come first. ``"status"`` follows only for a failed run,
         so it is never ``"ok"``, ``"error_kind"`` only when it is known, and
-        ``"health"`` only when it reports something. A reader that finds no
+        ``"health"`` only when it reports something, then ``"outputs"``,
+        ``"run_id"`` and ``"graph_id"`` when set. A reader that finds no
         ``"status"`` reads ``"ok"`` when ``error`` is null and ``"failed"``
         otherwise.
         """
@@ -307,4 +329,55 @@ class Trace:
         health = None if self.health is None else self.health.to_dict()
         if health:
             data["health"] = health
+        later = {"outputs": self.outputs or None, "run_id": self.run_id, "graph_id": self.graph_id}
+        data.update((key, value) for key, value in later.items() if value is not None)
         return data
+
+
+EVENT_KINDS = ("start", "end", "item_start", "item_end")
+"""What an :class:`Event` reports: a visit's start and end, and an item's."""
+
+EVENT_STATUSES = ("ok", "routed", "failed")
+"""How an ending visit or item went: it succeeded, its error was routed, or it failed."""
+
+
+@dataclass(frozen=True)
+class Event:
+    """One moment of a run, as ``run_state(on_event=...)`` reports it to a live view.
+
+    Attributes:
+        kind: One of :data:`EVENT_KINDS`.
+        node: The node that starts or ends, or the chain's head for an item.
+        run_id: The run's id, as on its trace.
+        at_s: Seconds since the run started.
+        item: The item's index, inside a chain.
+        item_key: The item's key, for a chain with ``key``.
+        visit: Which visit of the node this is, from 1.
+        status: How it went, one of :data:`EVENT_STATUSES`; ends only.
+        cost_usd: What the visit or item cost, when known; ends only.
+    """
+
+    kind: str
+    node: str
+    run_id: str
+    at_s: float
+    item: int | None = None
+    item_key: str | None = None
+    visit: int | None = None
+    status: str | None = None
+    cost_usd: float | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse an unknown kind or status, and a status on a start."""
+        if self.kind not in EVENT_KINDS:
+            raise ValueError(f"An event's kind is one of {list(EVENT_KINDS)}, not {self.kind!r}.")
+        if self.status is None:
+            return
+        if self.kind not in ("end", "item_end"):
+            raise ValueError(f"A {self.kind} event has no status, got {self.status!r}.")
+        if self.status not in EVENT_STATUSES:
+            raise ValueError(f"An event's status is one of {list(EVENT_STATUSES)}, not {self.status!r}.")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the plain-data form, the fields that are set only."""
+        return {key: value for key, value in asdict(self).items() if value is not None}
