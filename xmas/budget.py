@@ -3,8 +3,9 @@
 A :class:`Budget` is runtime state, like a MAS's tools, and never part of the
 spec. Each run gets its own :class:`RunMeter`, which counts the run's calls, cost
 and wall time and refuses a call before it starts once a limit is reached. The
-meter also holds the run's caps on calls and items in flight, and passes the
-run's events to a listener.
+meter also holds the run's caps on calls and items in flight, passes the run's
+events to a listener, and writes its records, events and model calls to the
+run's :class:`~xmas.store.RunLog`, when it has one.
 
 A run is stopped through its meter (:meth:`RunMeter.stop`, found by run id in
 :data:`RUNNING`): no call, step or item starts after that, waits for a free slot
@@ -27,9 +28,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 from xmas.errors import BudgetExceeded, EmptyResponse, RaceLost, Stopped
 from xmas.trace import AgentRecord, Event, Trace
+from xmas.utils import timestamp
 
 if TYPE_CHECKING:
     from xmas.llms.meta import CallMeta
+    from xmas.store import RunLog
 
 
 SLICE_S = 0.05
@@ -150,6 +153,8 @@ class RunMeter:
             meter is in :data:`RUNNING` under it until :meth:`close`.
         graph_id: The ``describe()`` id of the owner, when the run was given it.
         listener: Called with each of the run's events (:meth:`emit`), or ``None``.
+        log: Where the run's records, events and model calls are written as
+            they happen, or ``None``.
         stopped: Why the run was stopped (:meth:`stop`), or ``None``.
         halted: Set when the run is stopped.
     """
@@ -173,6 +178,7 @@ class RunMeter:
         self.run_id = uuid.uuid4().hex if run_id is None else run_id
         self.graph_id = graph_id
         self.listener = listener
+        self.log: RunLog | None = None
         self.started_s = time.monotonic()
         self.calls = 0
         self.cost_usd = 0.0
@@ -350,35 +356,53 @@ class RunMeter:
                 self.cost_usd += cost
 
     def metered[T](
-        self, call: Callable[[], tuple[T, CallMeta | None]], metas: list[CallMeta | None] | None = None
+        self,
+        call: Callable[[], tuple[T, CallMeta | None]],
+        metas: list[CallMeta | None] | None = None,
+        *,
+        llm: object = None,
+        node: str | None = None,
     ) -> tuple[T, CallMeta | None]:
         """Make one model call on this meter: in a free slot, refused at a limit, counted when it ends.
 
         ``call`` returns its result and the call's metadata, and sees the
         call's :func:`cancel_flag`. An empty answer and a cut call raise, but
         what they used is counted first. ``metas`` collects the metadata of
-        each finished call.
+        each finished call. The run's log gets the call, made by ``node`` on
+        ``llm``, whether it ended or failed.
         """
         kept = [] if metas is None else metas
         with self.slot():
             self.before_call()
             token = _cancel.set(self.flag())
+            meta: CallMeta | None = None
+            failed: BaseException | None = None
+            ts, started = timestamp(), time.perf_counter()
             try:
                 result, meta = call()
             except (EmptyResponse, Stopped) as error:
-                self.after_call(error.meta)
-                kept.append(error.meta)
+                failed, meta = error, error.meta
+                self.after_call(meta)
+                kept.append(meta)
+                raise
+            except BaseException as error:
+                failed = error
                 raise
             finally:
                 _cancel.reset(token)
+                if self.log is not None:
+                    self.log.call(node, llm, ts, time.perf_counter() - started, meta, failed)
             self.after_call(meta)
             kept.append(meta)
             return result, meta
 
     def keep(self, record: AgentRecord, system: object | None = None) -> None:
-        """Keep a finished visit's record, so a failed run still has it; ``system`` names an adopted system."""
+        """Keep a finished visit's record, so a failed run still has it, and log it; ``system`` names an adopted one."""
         with self._lock:
-            self.records_of(self.owner if system is None else system).append(record)
+            records = self.records_of(self.owner if system is None else system)
+            records.append(record)
+        if self.log is not None:
+            self.log.record(record, boxed=records is not self.records)
 
     def slot(self) -> AbstractContextManager[Any]:
         """Hold one of the run's ``max_parallel_calls`` slots for a model call; no cap holds nothing.
@@ -411,16 +435,21 @@ class RunMeter:
             places.release()
 
     def emit(self, kind: str, node: str, **fields: Any) -> None:
-        """Pass an event to the listener, which is called on the run's threads.
+        """Log an event and pass it to the listener, which is called on the run's threads.
 
         A listener that raises is warned about once and gets no more events
         this run: a viewer's bug does not end a paid run.
         """
         listener = self.listener
+        if listener is None and self.log is None:
+            return
+        event = Event(kind, node, self.run_id, self.elapsed_s, **fields)
+        if self.log is not None:
+            self.log.event(event)
         if listener is None:
             return
         try:
-            listener(Event(kind, node, self.run_id, self.elapsed_s, **fields))
+            listener(event)
         except Exception as error:
             with self._lock:
                 first = self.listener is listener
@@ -440,17 +469,21 @@ class VisitMeter:
     its own finished calls (``metas``, ``None`` for a model that gives none),
     so a visit that fails after paid attempts still records what they cost. A
     box's visit keeps the trace of its inner system when that fails (``inner``).
+    ``node`` names the visited node in the run's log of calls.
     """
 
-    def __init__(self, run: RunMeter) -> None:
+    def __init__(self, run: RunMeter, node: str | None = None) -> None:
         """Start a visit with no call made."""
         self.run = run
+        self.node = node
         self.metas: list[CallMeta | None] = []
         self.inner: Trace | None = None
 
-    def metered[T](self, call: Callable[[], tuple[T, CallMeta | None]]) -> tuple[T, CallMeta | None]:
-        """Make one model call on the run's meter and keep its metadata for the visit."""
-        return self.run.metered(call, self.metas)
+    def metered[T](
+        self, call: Callable[[], tuple[T, CallMeta | None]], llm: object = None
+    ) -> tuple[T, CallMeta | None]:
+        """Make one model call on ``llm`` on the run's meter and keep its metadata for the visit."""
+        return self.run.metered(call, self.metas, llm=llm, node=self.node)
 
     @property
     def meta(self) -> CallMeta | None:

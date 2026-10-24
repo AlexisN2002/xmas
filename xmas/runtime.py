@@ -7,7 +7,9 @@ which is xmas's own data.
 Each run gets its own :class:`~xmas.budget.RunMeter`, handed to the nodes in the
 run config under :data:`_RUN_KEY`. Nodes check the budget on it before each call
 and keep every finished visit's record there, so a failed run still returns
-what it did.
+what it did. When the system's store is a file, the meter also writes each
+record, event and model call to the run's :class:`~xmas.store.RunLog` as it
+happens, and the run's start and end are written beside them.
 
 In a version 2 system values are typed and render by
 :func:`~xmas.values.render_value`; steps run callables; a json agent answers in
@@ -88,7 +90,7 @@ from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
 from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
-from xmas.store import Store
+from xmas.store import RunLog, Store
 from xmas.tools import run_step, run_tool_loop
 from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, check_value, coerce_media, media_kind, parse_type, plain, render_value
@@ -308,7 +310,7 @@ def _call(
     kind from the cause.
     """
     try:
-        return meter.metered(lambda: _generate(llm, rendered))
+        return meter.metered(lambda: _generate(llm, rendered), llm=llm)
     except Exception as error:
         if not batch_error or not supports_meta(llm) or isinstance(error, BudgetExceeded | GraphBubbleUp):
             raise  # promptolution's get_response wrapped it already, the meter refused the call, or LangGraph signals
@@ -364,7 +366,7 @@ def _wrap(
         here: dict[str, Any] = {"visit": visits, "item": index, "item_key": key}
         if starts:
             meter.emit("start", name, **here)
-        started, visit, used = time.perf_counter(), VisitMeter(meter), Counter[str]()
+        started, visit, used = time.perf_counter(), VisitMeter(meter, name), Counter[str]()
         races = get_config().get("configurable", {}).get(_RACES_KEY)
         contest, entrants = (f"{races}:{race[0]}:{index}:{here['visit']}", race[1]) if race else (None, 0)
 
@@ -486,7 +488,7 @@ def _paint(
     An ``image`` takes exactly one picture, a ``list of image`` at least one;
     anything else raises :class:`~xmas.errors.BadFormat` with the count.
     """
-    (text, images), meta = meter.metered(lambda: _images(llm, prompt))
+    (text, images), meta = meter.metered(lambda: _images(llm, prompt), llm=llm)
     wanted = "at least one image" if vtype.item is not None else "one image"
     if not images or (vtype.item is None and len(images) > 1):
         raise BadFormat(node, (f"expected {wanted}, got {len(images)}",), meta)
@@ -1561,15 +1563,14 @@ def run_state(
     run_id = run_id or uuid.uuid4().hex
     if "/" in run_id:
         raise ValueError(f"Run id {run_id!r} holds a '/', which names the threads of a run's items and boxes.")
-    if store.run(run_id) is not None:
-        raise ValueError(f"Run id {run_id!r} is taken in {store!r}.")
     graph_id = mas.describe()["id"]
     meter = RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id)
     try:
-        store.save_run(run_id, graph_id, "running")
+        store.begin(run_id, graph_id, query)
     except BaseException:
         meter.close()
         raise
+    _log(meter, store)
     asking = _Asking(store, mas.asker, run_id, run_id, run_id)
     return _advance(mas, query, _initial_state(dict(values), prompts), meter, asking)
 
@@ -1621,6 +1622,7 @@ def resume(
     except BaseException:
         meter.close()
         raise
+    _log(meter, store)
     query = _query({name: snapshot.values["values"][name] for name in mas.inputs})
     return _advance(mas, query, Command(resume=_ready(store, snapshot.interrupts)), meter, asking)
 
@@ -1732,7 +1734,15 @@ def _advance(mas: MAS, query: str, start: MASState | Command[Any], meter: RunMet
             trace = _failed_trace(mas, query, Stopped(reason), meter)
         store.save_run(asking.run_id, cast("str", meter.graph_id), "stopped", (), meter.totals())
         _withdraw(mas, store, asking.run_id, reason)
+    if meter.log is not None:
+        meter.log.end(trace, meter.totals())
     return trace
+
+
+def _log(meter: RunMeter, store: Store) -> None:
+    """Give the meter its run's log, when the store is a file: one in memory logs nothing."""
+    if store.path is not None:
+        meter.log = RunLog(store, meter.run_id)
 
 
 def _query(values: Mapping[str, Any]) -> str:
@@ -1768,30 +1778,44 @@ def _run_all(
 ) -> list[Trace]:
     """Run each start (a query or the input values) with its prompt set, on a meter of its own.
 
+    Each run is logged to the system's store when it is a file (:class:`~xmas.store.RunLog`).
     A system that can pause runs unattended here: its questions go to its
-    asker, and its chains and boxes keep their threads in a store of the
-    batch's own, in memory.
+    asker, and its chains and boxes keep their threads in that file, else
+    in a store of the batch's own, in memory.
+
+    Raises:
+        ValueError: When ``run_id`` names a run the file holds already.
     """
     if not starts:
         return []
-    graph_id = mas.describe()["id"] if mas.version == 2 else None
+    store = mas._runs()
+    system_id = mas.describe()["id"] if mas.version == 2 or store.path is not None else None
+    graph_id = system_id if mas.version == 2 else None
     meters = [RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id) for _ in starts]
     states = [_initial_state(start, prompt_set) for start, prompt_set in zip(starts, prompts, strict=True)]
     graph, configs, durable = mas.compiled, [_run_config(mas, meter) for meter in meters], {}
     if pauses(mas):
-        store, asker = Store(), mas.asker
-        askings = [_Asking(store, asker, m.run_id, m.run_id, m.run_id, unattended=True) for m in meters]
+        threads, asker = store if store.path is not None else Store(), mas.asker
+        askings = [_Asking(threads, asker, m.run_id, m.run_id, m.run_id, unattended=True) for m in meters]
         configs = [_run_config(mas, meter, asking=asking) for meter, asking in zip(meters, askings, strict=True)]
-        graph, durable = graph.copy(update={"checkpointer": store}), {"durability": "exit"}
+        graph, durable = graph.copy(update={"checkpointer": threads}), {"durability": "exit"}
     try:
+        if store.path is not None:
+            for meter, query in zip(meters, queries, strict=True):
+                store.begin(meter.run_id, cast("str", system_id), query)
+                _log(meter, store)
         results: list[Any] = graph.batch(states, config=configs, return_exceptions=True, **durable)
     finally:
         for meter in meters:
             meter.close()
-    return [
+    traces = [
         trace_from_state(mas, query, result, meter)
         for query, result, meter in zip(queries, results, meters, strict=True)
     ]
+    for meter, trace in zip(meters, traces, strict=True):
+        if meter.log is not None:
+            meter.log.end(trace, meter.totals())
+    return traces
 
 
 def node_owner(mas: MAS, node: str) -> MAS:

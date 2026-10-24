@@ -1,15 +1,21 @@
-"""Durable runs: LangGraph checkpoints plus xmas's run and question rows in one SQLite database.
+"""The run log: LangGraph checkpoints plus every run's rows, in one SQLite database.
 
 :class:`Store` is a LangGraph checkpoint saver on the standard library's
 ``sqlite3``. Its ``checkpoints`` and ``writes`` tables are the ones
 ``langgraph-checkpoint-sqlite``'s ``SqliteSaver`` creates, column for column,
 filled through the same serializer calls, so either saver opens a file the
-other wrote. Beside them, ``xmas_runs`` holds one row per run and
-``xmas_questions`` one row per question a run put to a person.
+other wrote. Beside them, a run writes as it goes (:class:`RunLog`): its row
+in ``xmas_runs`` when it starts and when it ends, one row in ``xmas_records``
+the moment each visit's record is kept, one in ``xmas_events`` per event and
+one in ``xmas_calls`` per model call; ``xmas_questions`` holds one row per
+question a run put to a person. Records, events and calls are only added, each
+in a transaction of its own, so a run that dies keeps what it wrote, and
+:meth:`Store.trace` rebuilds its trace.
 
 Where the store lives is configuration, never a spec key: :func:`open_store`
-reads the ``XMAS_RUNS`` environment variable, and a store without a path lives
-in memory, so its pauses resume in the same process only.
+opens the file ``XMAS_RUNS`` names, else ``[store] runs`` in the configuration
+file, else :func:`~xmas.config.runs_path`. ``:memory:`` opens one in memory,
+which logs nothing and whose pauses resume in the same process only.
 
 Reading a checkpoint back builds LangGraph's safe types and :data:`XMAS_TYPES`
 only, xmas classes with their tuples restored; any other class in a checkpoint
@@ -19,17 +25,21 @@ read xmas values the same way.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import random
 import re
 import sqlite3
 import threading
+import uuid
+import warnings
+import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -46,16 +56,21 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from xmas.errors import ErrorKind
-from xmas.health import Flag, Health
+from xmas.errors import ErrorKind, classify
+from xmas.health import Flag, Health, summarize
+from xmas.human import Pause, Question
 from xmas.media import Ref
 from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
+
+if TYPE_CHECKING:
+    from xmas.llms.meta import CallMeta
 
 XMAS_TYPES: tuple[type, ...] = (AgentRecord, TokenUsage, ToolCall, Rejected, Trace, Event, ErrorKind, Health, Flag, Ref)
 """The xmas classes a checkpoint may hold besides LangGraph's own safe types."""
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS checkpoints (
     thread_id TEXT NOT NULL,
     checkpoint_ns TEXT NOT NULL DEFAULT '',
@@ -85,7 +100,14 @@ CREATE TABLE IF NOT EXISTS xmas_runs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     paused TEXT NOT NULL DEFAULT '[]',
-    totals TEXT
+    totals TEXT,
+    ended_at TEXT,
+    query TEXT,
+    output TEXT,
+    error TEXT,
+    error_kind TEXT,
+    steps TEXT,
+    result BLOB
 );
 CREATE TABLE IF NOT EXISTS xmas_questions (
     question_id TEXT PRIMARY KEY,
@@ -101,7 +123,74 @@ CREATE TABLE IF NOT EXISTS xmas_questions (
     payload TEXT
 );
 CREATE INDEX IF NOT EXISTS xmas_questions_run ON xmas_questions (run_id);
+CREATE TABLE IF NOT EXISTS xmas_records (
+    run_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    boxed INTEGER NOT NULL,
+    kept_at TEXT NOT NULL,
+    node TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    item INTEGER,
+    item_key TEXT,
+    visit INTEGER,
+    model TEXT,
+    served_model TEXT,
+    cost_usd REAL,
+    latency_s REAL,
+    tokens TEXT,
+    finish_reason TEXT,
+    error_kind TEXT,
+    error TEXT,
+    route TEXT,
+    capped INTEGER NOT NULL,
+    lost INTEGER NOT NULL,
+    inputs TEXT NOT NULL,
+    outputs TEXT NOT NULL,
+    raw_response TEXT NOT NULL,
+    rendered_prompt TEXT NOT NULL,
+    record BLOB NOT NULL,
+    PRIMARY KEY (run_id, position)
+);
+CREATE TABLE IF NOT EXISTS xmas_events (
+    run_id TEXT NOT NULL,
+    at_s REAL NOT NULL,
+    kind TEXT NOT NULL,
+    node TEXT NOT NULL,
+    item INTEGER,
+    item_key TEXT,
+    visit INTEGER,
+    status TEXT,
+    cost_usd REAL,
+    question TEXT,
+    wait_s REAL,
+    reason TEXT
+);
+CREATE INDEX IF NOT EXISTS xmas_events_run ON xmas_events (run_id);
+CREATE TABLE IF NOT EXISTS xmas_calls (
+    call_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    node TEXT,
+    ts TEXT NOT NULL,
+    model TEXT,
+    served_model TEXT,
+    tokens TEXT,
+    cost_usd REAL,
+    latency_s REAL,
+    finish_reason TEXT,
+    error_kind TEXT,
+    error TEXT,
+    params TEXT
+);
+CREATE INDEX IF NOT EXISTS xmas_calls_run ON xmas_calls (run_id);
 """
+_LOGGED = ("xmas_records", "xmas_events", "xmas_calls")
+_RUN_COLUMNS = "run_id, system_id, status, created_at, updated_at, paused, totals, ended_at"
+_CALL_COLUMNS = (
+    "call_id", "run_id", "node", "ts", "model", "served_model", "tokens", "cost_usd", "latency_s", "finish_reason",
+    "error_kind", "error", "params",
+)  # fmt: skip
+_SECRET = re.compile(r"(^|_)(key|secret|token|password|credentials?)$|auth|header", re.IGNORECASE)
+"""The call parameters a call row leaves out: keys, tokens, passwords and headers."""
 _CHECKPOINT_COLUMNS = "thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata"
 _FILTER_KEY = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
@@ -144,13 +233,15 @@ class RunRow:
     Attributes:
         run_id: The run's id, also its checkpoint thread.
         system_id: The ``describe()`` id of the system that ran it.
-        status: A run status, such as ``running``, ``paused`` or ``stopped``.
-        created_at: When the row was first saved, ISO UTC.
-        updated_at: When it was last saved, ISO UTC.
+        status: ``running``, ``paused``, or how the run ended (:class:`~xmas.errors.RunStatus`).
+        created_at: When the run started, ISO UTC.
+        updated_at: When the row was last saved, ISO UTC.
         paused: The ids of the questions the run waits on.
         totals: What the run had used when it was last saved, as
             :meth:`~xmas.budget.RunMeter.totals` gives it, so a resumed run's
             budget counts on; ``None`` until saved.
+        ended_at: When the run ended, ISO UTC; ``None`` while it runs or
+            waits, and for a run whose process ended first.
     """
 
     run_id: str
@@ -160,6 +251,7 @@ class RunRow:
     updated_at: str
     paused: tuple[str, ...] = ()
     totals: dict[str, Any] | None = None
+    ended_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,16 +286,16 @@ class QuestionRow:
 
 
 class Store(BaseCheckpointSaver[str]):
-    """A checkpoint saver and the run and question rows beside it, in one SQLite database.
+    """A checkpoint saver and the run log beside it (runs, records, events, calls, questions), in one SQLite database.
 
     One connection serves every thread, each statement under one lock. Async
     methods raise, as ``SqliteSaver``'s do.
     """
 
     def __init__(self, path: str | os.PathLike[str] | None = None, *, serde: SerializerProtocol | None = None) -> None:
-        """Open the database file at ``path``, created with its folder if missing, or one in memory when ``None``."""
+        """Open the database file at ``path``, made with its folder if missing; in memory for ``None``, ``:memory:``."""
         super().__init__(serde=serde or _Serializer(allowed_msgpack_modules=XMAS_TYPES))
-        self.path = Path(path).expanduser() if path is not None else None
+        self.path = Path(path).expanduser() if path is not None and str(path) != ":memory:" else None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path or ":memory:", check_same_thread=False)
@@ -362,24 +454,124 @@ class Store(BaseCheckpointSaver[str]):
         """Create or update a run's row; ``created_at`` stays as first saved, ``totals`` as last given."""
         now = _now()
         self._execute(
-            "INSERT INTO xmas_runs VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET"
+            "INSERT INTO xmas_runs (run_id, system_id, status, created_at, updated_at, paused, totals)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET"
             " system_id = excluded.system_id, status = excluded.status, updated_at = excluded.updated_at,"
             " paused = excluded.paused, totals = COALESCE(excluded.totals, totals)",
             (run_id, system_id, status, now, now, json.dumps(list(paused)), _json(totals)),
         )
         return cast(RunRow, self.run(run_id))
 
+    def begin(self, run_id: str, system_id: str, query: str) -> RunRow:
+        """Save a starting run's row, ``running``; a ``run_id`` saved already is refused with ``ValueError``."""
+        now = _now()
+        try:
+            self._execute(
+                "INSERT INTO xmas_runs (run_id, system_id, status, created_at, updated_at, query)"
+                " VALUES (?, ?, 'running', ?, ?, ?)",
+                (run_id, system_id, now, now, query),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Run id {run_id!r} is taken in {self!r}.") from None
+        return cast(RunRow, self.run(run_id))
+
     def run(self, run_id: str) -> RunRow | None:
         """Return a run's row, or ``None`` for an unknown id."""
-        return next(iter(self._runs("run_id = ?", run_id)), None)
+        rows = self._execute(f"SELECT {_RUN_COLUMNS} FROM xmas_runs WHERE run_id = ?", (run_id,))
+        return _run_row(rows[0]) if rows else None
 
-    def runs(self, status: str | None = None) -> tuple[RunRow, ...]:
-        """Return every run's row, or those with ``status``, oldest first."""
-        return self._runs("status = ?", status) if status is not None else self._runs("1")
+    def runs(
+        self, status: str | None = None, system_id: str | None = None, limit: int | None = None
+    ) -> tuple[RunRow, ...]:
+        """Return the runs' rows, oldest first: with ``status`` and ``system_id`` when given; the last ``limit``."""
+        wheres = [f"{name} = ?" for name, value in (("status", status), ("system_id", system_id)) if value is not None]
+        params: list[Any] = [value for value in (status, system_id) if value is not None]
+        sql = f"SELECT {_RUN_COLUMNS} FROM xmas_runs WHERE {' AND '.join(wheres) or '1'}"
+        sql += " ORDER BY created_at DESC, rowid DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return tuple(_run_row(row) for row in reversed(self._execute(sql, params)))
 
-    def _runs(self, where: str, *params: Any) -> tuple[RunRow, ...]:
-        rows = self._execute(f"SELECT * FROM xmas_runs WHERE {where} ORDER BY created_at", params)
-        return tuple(_run_row(row) for row in rows)
+    def trace(self, run_id: str) -> Trace:
+        """Rebuild a run's trace from its rows, its health summarized again from its records.
+
+        A run that ended or paused has the trace it returned. A run without an
+        end, whose process ended first, has every record it kept, in the
+        order kept, and an ``error`` saying so.
+
+        Raises:
+            KeyError: For an unknown ``run_id``.
+        """
+        rows = self._execute(
+            "SELECT system_id, status, paused, query, output, error, error_kind, steps, result"
+            " FROM xmas_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        if not rows:
+            raise KeyError(f"no run {run_id!r} in {self!r}")
+        system_id, status, paused, query, output, error, error_kind, steps, result = rows[0]
+        kept = self._kept(run_id)
+        if status == "running" or steps is None:
+            order, error = list(kept), "the run has no end in the store: it still runs, or its process ended first"
+        else:
+            order = json.loads(steps)
+        records = tuple(replace(kept[position], step=index) for index, position in enumerate(order))
+        ending = self._load(result) if result is not None else {"outputs": {}, "graph_id": system_id}
+        waits = set(json.loads(paused))
+        questions = tuple(
+            Question.from_dict(row.payload)
+            for row in self.questions(run_id)
+            if row.question_id in waits and row.payload is not None
+        )
+        return Trace(
+            query=query or "",
+            output=output or "",
+            records=records,
+            error=error,
+            error_kind=None if error_kind is None else ErrorKind(error_kind),
+            health=summarize(records),
+            outputs=ending["outputs"],
+            run_id=run_id,
+            graph_id=ending["graph_id"],
+            pause=Pause(run_id, questions) if status == "paused" else None,
+        )
+
+    def events(self, run_id: str) -> tuple[Event, ...]:
+        """Return a run's events in the order they happened."""
+        rows = self._execute(
+            "SELECT kind, node, run_id, at_s, item, item_key, visit, status, cost_usd, question, wait_s, reason"
+            " FROM xmas_events WHERE run_id = ? ORDER BY rowid",
+            (run_id,),
+        )
+        return tuple(Event(*row) for row in rows)
+
+    def calls(self, run_id: str) -> tuple[dict[str, Any], ...]:
+        """Return a run's model calls in the order they ended: each row by column, ``tokens`` and ``params`` read."""
+        rows = self._execute(
+            f"SELECT {', '.join(_CALL_COLUMNS)} FROM xmas_calls WHERE run_id = ? ORDER BY rowid", (run_id,)
+        )
+        calls = [dict(zip(_CALL_COLUMNS, row, strict=True)) for row in rows]
+        for call in calls:
+            call["tokens"], call["params"] = _loads(call["tokens"]), _loads(call["params"])
+        return tuple(calls)
+
+    def _kept(self, run_id: str, before: int | None = None) -> dict[int, AgentRecord]:
+        """Return the run's own records (not a box's inner ones) by position, in the order kept; those ``before``."""
+        rows = self._execute(
+            "SELECT position, record FROM xmas_records WHERE run_id = ? AND boxed = 0 AND position < ?"
+            " ORDER BY position",
+            (run_id, before if before is not None else 2**62),
+        )
+        return {position: self._load(blob) for position, blob in rows}
+
+    def _load(self, blob: bytes) -> Any:
+        """Read back what :meth:`_dump` wrote."""
+        return self.serde.loads_typed(("msgpack", blob))
+
+    def _dump(self, value: Any) -> bytes:
+        """Return the msgpack of a record, or of a trace's ending: dataclasses and plain values."""
+        return self.serde.dumps_typed(value)[1]
 
     def save_question(
         self,
@@ -462,27 +654,217 @@ class Store(BaseCheckpointSaver[str]):
         return tuple(ended)
 
     def delete(self, run_id: str) -> None:
-        """Delete a run's row, its questions, and its threads: ``run_id`` and every ``run_id/...``."""
+        """Delete a run's rows (run, questions, records, events, calls) and threads (``run_id``, ``run_id/...``)."""
         prefix = run_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
         self._delete("thread_id = ? OR thread_id LIKE ? ESCAPE '\\'", (run_id, prefix), run_id)
 
     def _delete(self, threads: str, params: Sequence[Any], run_id: str | None = None) -> None:
         """Delete the checkpoints and writes of the threads ``threads`` matches, and the rows of ``run_id``."""
         with self._lock, self._conn:
-            for table in ("xmas_runs", "xmas_questions") if run_id is not None else ():
+            for table in ("xmas_runs", "xmas_questions", *_LOGGED) if run_id is not None else ():
                 self._conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             for table in ("checkpoints", "writes"):
                 self._conn.execute(f"DELETE FROM {table} WHERE {threads}", params)
+
+
+class RunLog:
+    """One run's writes to a file store as the run goes: each record kept, each event, each model call, its end.
+
+    Each write is one insert in a transaction of its own, so a run that dies
+    keeps every row written before. A write that fails is warned about once,
+    and the run goes on without its log: a full disk does not end a paid run.
+    """
+
+    def __init__(self, store: Store, run_id: str) -> None:
+        """Log ``run_id``, whose row the store holds, counting positions on from its last record."""
+        self.store = store
+        self.run_id = run_id
+        (last,) = store._execute("SELECT MAX(position) FROM xmas_records WHERE run_id = ?", (run_id,))[0]
+        self._first = 0 if last is None else last + 1
+        self._positions = itertools.count(self._first)
+        self._kept: dict[_Visit, list[tuple[int, AgentRecord]]] = {}
+        self._failed = False
+
+    def _write(self, sql: str, params: Sequence[Any]) -> None:
+        if self._failed:
+            return
+        try:
+            self.store._execute(sql, params)
+        except sqlite3.Error as error:
+            self._failed = True
+            warnings.warn(
+                f"The run log of {self.run_id!r} in {self.store!r} failed ({error}); the run goes on unlogged.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+    def record(self, record: AgentRecord, *, boxed: bool = False) -> None:
+        """Write a visit's record the moment it is kept; ``boxed`` for a record of a box's inner system."""
+        position = next(self._positions)
+        if not boxed:
+            self._kept.setdefault(_visit(record), []).append((position, record))
+        tokens = None if record.tokens is None else json.dumps(record.tokens.to_dict())
+        self._write(
+            f"INSERT INTO xmas_records VALUES ({', '.join('?' * 25)})",
+            (
+                self.run_id,
+                position,
+                boxed,
+                _now(),
+                record.agent,
+                record.kind,
+                record.item,
+                record.item_key,
+                record.visit,
+                record.model,
+                record.served_model,
+                record.cost_usd,
+                record.latency_s,
+                tokens,
+                record.finish_reason,
+                None if record.error_kind is None else record.error_kind.value,
+                record.error,
+                None if record.route is None else json.dumps(list(record.route)),
+                record.capped,
+                record.lost,
+                json.dumps(record.inputs, ensure_ascii=False),
+                json.dumps(record.outputs, ensure_ascii=False),
+                record.raw_response,
+                record.rendered_prompt,
+                self.store._dump(record),
+            ),
+        )
+
+    def event(self, event: Event) -> None:
+        """Write one event of the run."""
+        self._write(
+            f"INSERT INTO xmas_events VALUES ({', '.join('?' * 12)})",
+            (
+                self.run_id,
+                event.at_s,
+                event.kind,
+                event.node,
+                event.item,
+                event.item_key,
+                event.visit,
+                event.status,
+                event.cost_usd,
+                event.question,
+                event.wait_s,
+                event.reason,
+            ),
+        )
+
+    def call(
+        self,
+        node: str | None,
+        llm: object,
+        ts: str,
+        latency_s: float,
+        meta: CallMeta | None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Write one model call as it ended: who made it, on which model, what it used, how it ended.
+
+        Its parameters are the model's ``call_params()``, when it has them,
+        without any key, token, password or header.
+        """
+        params = getattr(llm, "call_params", None)
+        sent = {key: value for key, value in params().items() if not _SECRET.search(key)} if callable(params) else None
+        kind = meta.error_kind if meta is not None else None
+        if kind is None and error is not None:
+            kind = classify(error)
+        self._write(
+            f"INSERT INTO xmas_calls ({', '.join(_CALL_COLUMNS)}) VALUES ({', '.join('?' * len(_CALL_COLUMNS))})",
+            (
+                uuid.uuid4().hex,
+                self.run_id,
+                node,
+                ts,
+                getattr(llm, "model", None) or getattr(llm, "model_id", None) or type(llm).__name__,
+                None if meta is None else meta.served_model,
+                None if meta is None or meta.tokens is None else json.dumps(meta.tokens.to_dict()),
+                None if meta is None else meta.cost_usd,
+                latency_s if meta is None else meta.latency_s,
+                None if meta is None else meta.finish_reason,
+                None if kind is None else kind.value,
+                None if error is None else f"{type(error).__name__}: {error}",
+                None if sent is None else json.dumps(sent, default=str),
+            ),
+        )
+
+    def end(self, trace: Trace, totals: Mapping[str, Any]) -> None:
+        """Write how the run ended or paused: its status, totals and outcome, and its records' order in ``trace``."""
+        status = trace.status.value
+        paused = [] if trace.pause is None else [question.id for question in trace.pause.questions]
+        self._write(
+            "UPDATE xmas_runs SET status = ?, updated_at = ?, paused = ?, totals = ?, ended_at = ?, query = ?,"
+            " output = ?, error = ?, error_kind = ?, steps = ?, result = ? WHERE run_id = ?",
+            (
+                status,
+                _now(),
+                json.dumps(paused),
+                _json(totals),
+                None if status == "paused" else _now(),
+                trace.query,
+                trace.output,
+                trace.error,
+                None if trace.error_kind is None else trace.error_kind.value,
+                json.dumps(self._steps(trace.records)),
+                self.store._dump({"outputs": trace.outputs, "graph_id": trace.graph_id}),
+                self.run_id,
+            ),
+        )
+
+    def _steps(self, records: Sequence[AgentRecord]) -> list[int]:
+        """Return the position of each of ``records`` in the log: kept by this log, else before it (before a pause)."""
+        earlier: dict[_Visit, list[tuple[int, AgentRecord]]] | None = None
+        steps = []
+        for record in records:
+            position = _take(self._kept.get(_visit(record), []), record)
+            if position is None:
+                if earlier is None:
+                    earlier = {}
+                    for kept, old in self.store._kept(self.run_id, before=self._first).items():
+                        earlier.setdefault(_visit(old), []).append((kept, old))
+                position = _take(earlier.get(_visit(record), []), record)
+            if position is None:  # pragma: no cover - every record of a trace was kept
+                self.record(record)
+                position = cast(int, _take(self._kept[_visit(record)], record))
+            steps.append(position)
+        return steps
+
+
+_Visit = tuple[str, int | None, int | None]
+
+
+def _visit(record: AgentRecord) -> _Visit:
+    """Return what tells a record from most others of its run: its node, item and visit."""
+    return record.agent, record.item, record.visit
+
+
+def _take(candidates: list[tuple[int, AgentRecord]], record: AgentRecord) -> int | None:
+    """Remove and return the position of the first candidate equal to ``record``, its step aside."""
+    for index, (position, kept) in enumerate(candidates):
+        if replace(record, step=kept.step) == kept:
+            del candidates[index]
+            return position
+    return None
 
 
 def _json(value: Mapping[str, Any] | None) -> str | None:
     return None if value is None else json.dumps(dict(value))
 
 
+def _loads(text: str | None) -> Any:
+    return None if text is None else json.loads(text)
+
+
 def _run_row(row: Sequence[Any]) -> RunRow:
-    run_id, system_id, status, created_at, updated_at, paused, totals = row
-    loaded = json.loads(totals) if totals is not None else None
-    return RunRow(run_id, system_id, status, created_at, updated_at, tuple(json.loads(paused)), loaded)
+    run_id, system_id, status, created_at, updated_at, paused, totals, ended_at = row
+    return RunRow(
+        run_id, system_id, status, created_at, updated_at, tuple(json.loads(paused)), _loads(totals), ended_at
+    )
 
 
 def _question_row(row: Sequence[Any]) -> QuestionRow:
@@ -502,7 +884,26 @@ def _question_row(row: Sequence[Any]) -> QuestionRow:
     )
 
 
-def open_store(location: str | None = None) -> Store:
-    """Open the store at ``location``, else at ``XMAS_RUNS``; in memory when neither names a file."""
-    location = location if location is not None else os.environ.get("XMAS_RUNS")
-    return Store(location or None)
+_OPEN: weakref.WeakValueDictionary[Path, Store] = weakref.WeakValueDictionary()
+_open_lock = threading.Lock()
+
+
+def open_store(location: str | os.PathLike[str] | None = None) -> Store:
+    """Open the store at ``location``, else where the configuration puts it, else at :func:`~xmas.config.runs_path`.
+
+    The configuration is ``XMAS_RUNS``, then ``[store] runs`` in the
+    configuration file. ``:memory:`` opens a store in memory, which logs no
+    run. A file already open in this process is shared, not opened twice.
+    """
+    from xmas.config import Config, runs_path  # here, not at the top: xmas.config imports the models
+
+    if location is None:
+        location = Config.load().run_store or runs_path()
+    if str(location) == ":memory:":
+        return Store()
+    path = Path(location).expanduser().resolve()
+    with _open_lock:
+        store = _OPEN.get(path)
+        if store is None:
+            store = _OPEN[path] = Store(path)
+        return store

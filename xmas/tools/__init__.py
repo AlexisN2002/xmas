@@ -510,7 +510,7 @@ def run_tool_loop(
 
     def turn(offered: list[Tool]) -> tuple[str, list[ToolCallRequest]]:
         nonlocal usage, meta
-        (text, requests), turn_meta = meter.metered(lambda: ask(offered))
+        (text, requests), turn_meta = meter.metered(lambda: ask(offered), llm=llm)
         if turn_meta is not None:
             meta = turn_meta if meta is None else meta.combine(turn_meta)
         usage = usage + _turn_usage(count_tokens, messages, text, requests)

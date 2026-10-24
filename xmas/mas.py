@@ -110,9 +110,9 @@ class MAS(BasePredictor):
         default_model: Name recorded for the default model in a serialized spec.
         budget: Limits for each run, or ``None`` for none; never part of the spec.
         asker: How a run asks a person, or ``None``; never part of the spec.
-        store: Where paused runs are kept: a store, a file path opened on
-            first use, or ``None`` for the one :func:`xmas.store.open_store`
-            opens on first use; never part of the spec.
+        store: Where runs are logged and paused runs kept: a store, or
+            ``None`` for the one :func:`xmas.store.open_store` opens on first
+            use; never part of the spec.
         max_visits: How often one agent of a version 1 cycle may run in a single
             query before its back edges close.
         last_trace: Trace of the most recent :meth:`__call__`, or ``None`` before any.
@@ -232,10 +232,11 @@ class MAS(BasePredictor):
             humans: Nodes that ask a person (:class:`~xmas.human.Human`).
             asker: How a run asks a person (:class:`~xmas.human.Asker`);
                 runtime state like ``llm``, never part of the spec.
-            store: Where paused runs are kept: a :class:`~xmas.store.Store`
-                or a file path. ``None`` opens the one ``XMAS_RUNS`` names,
-                else one in memory, when a run first needs it. Never part of
-                the spec.
+            store: Where runs are logged and paused runs kept: a
+                :class:`~xmas.store.Store`, a file path, or ``":memory:"``
+                for a store in memory that logs nothing. ``None`` opens the
+                configured file (:func:`~xmas.store.open_store`) when a run
+                first needs it. Never part of the spec.
 
         Raises:
             ValueError: If the system is not runnable. A version 2 system
@@ -280,7 +281,7 @@ class MAS(BasePredictor):
         self.max_visits = max_visits
         self.budget = budget
         self.asker = asker
-        self.store = Store(store) if isinstance(store, str | Path) else store
+        self.store = open_store(store) if isinstance(store, str | Path) else store
         self.default_model = default_model if default_model is not None else getattr(llm, "model_id", None)
         self.tools = tuple(tools)
         self.tool_index: ToolIndex | None = None  # built on first use, so tool-free systems never touch their sources
@@ -352,7 +353,7 @@ class MAS(BasePredictor):
         return self.info
 
     def _runs(self) -> Store:
-        """Return the run store, opening the one ``XMAS_RUNS`` names, else one in memory, on first use.
+        """Return the run store, opening the configured one (:func:`~xmas.store.open_store`) on first use.
 
         A path set as ``store`` after construction opens there.
         """

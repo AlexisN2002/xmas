@@ -642,3 +642,16 @@ def test_a_stopped_visit_keeps_its_record() -> None:
     holder["mas"] = pressed = MAS(agents, [("writer", "judge")], llm=MockLLM(press))
     stopped = pressed.run_state({"query": "q"}, run_id="s2")
     assert stopped.status == "stopped" and "judge" not in {record.agent for record in stopped.records}
+
+
+def test_a_paused_and_resumed_run_is_in_the_run_log() -> None:
+    mas = gated()
+    paused = run(mas, {"query": "cats"}, "logged")
+    store = mas._runs()
+    assert store.path is not None
+    kept = store.trace("logged")
+    assert kept == paused and kept.status == "paused" and open_ids(kept) == open_ids(paused)
+    done = resume(mas, "logged", {open_ids(paused)[0]: {"approved": True, **TOM}})
+    assert store.trace("logged") == done and done.status == "ok" and len(done.records) == 3
+    assert [row.answer is not None for row in store.questions("logged")] == [True]
+    assert {"pause", "resume"} <= {event.kind for event in store.events("logged")}

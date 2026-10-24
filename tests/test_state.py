@@ -322,3 +322,32 @@ def test_a_step_returning_a_path_writes_a_stored_ref(png: Path) -> None:
     first, second = (mas.run_state({"query": text}).outputs["png"] for text in ("one", "two"))
     assert (first.read_bytes(), second.read_bytes()) == (b"one", b"two")  # a copy each, not the rewritten file
     assert Path(first.location).parent.parent == Path(os.environ["XMAS_STORE"])
+
+
+def test_the_run_log_keeps_a_run_that_dies_midway() -> None:
+    @tool(writes={"loud": "text"})
+    def publish(draft: str) -> str:
+        """Publish a draft; the process ends here."""
+        raise KeyboardInterrupt
+
+    mas = MAS(
+        [Agent("writer", "Write {query}", "draft")],
+        [("writer", "publish")],
+        steps=[Step("publish", "publish")],
+        tools=[publish],
+        llm=MockLLM(meta=True),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        mas.run_state({"query": "cats"}, run_id="dies")
+    store = mas._runs()
+    died = store.trace("dies")
+    assert [record.agent for record in died.records] == ["writer"] and died.records[0].outputs == {
+        "draft": "echo:Write cats"
+    }
+    assert cast("Any", store.run("dies")).status == "running" and "no end in the store" in str(died.error)
+    assert [(event.kind, event.node) for event in store.events("dies")] == [
+        ("start", "writer"),
+        ("end", "writer"),
+        ("start", "publish"),
+    ]
+    assert [call["cost_usd"] for call in store.calls("dies")] == [0.01]

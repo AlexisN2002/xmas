@@ -100,6 +100,21 @@ class MockLLM(BaseLLM):
         return text, requests, META
 
 
+@pytest.fixture(autouse=True)
+def run_log_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Every test logs its runs under a data folder of its own, never into the home folder; yield that folder.
+
+    The patch is the fixture's own, so a test's ``monkeypatch.undo()`` keeps it.
+    """
+    home = tmp_path_factory.mktemp("data")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_DATA_HOME", str(home))
+        patch.setenv("XDG_CONFIG_HOME", str(home / "no-config"))
+        patch.delenv("XMAS_RUNS", raising=False)
+        patch.delenv("XMAS_CONFIG", raising=False)
+        yield home
+
+
 @pytest.fixture
 def mock_llm() -> MockLLM:
     """A model that echoes its prompt."""

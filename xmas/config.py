@@ -27,8 +27,9 @@ environment, then from a TOML file, ``$XMAS_CONFIG`` or else
 
 The environment variables are ``XMAS_BASE_URL``, ``XMAS_API_KEY``, ``XMAS_MODELS`` (a
 comma list that stands for the catalogue, so names check offline), ``XMAS_STORE``
-(media) and ``XMAS_RUNS`` (the run store). A tool server without a key leaves it to
-``XMAS_TOOLS_KEY``, which :class:`~xmas.tools.mcp.MCPTools` reads itself.
+(media) and ``XMAS_RUNS`` (the run store, else :func:`runs_path`). A tool server
+without a key leaves it to ``XMAS_TOOLS_KEY``, which :class:`~xmas.tools.mcp.MCPTools`
+reads itself.
 
 The catalogue is the list of model ids the endpoint serves. :func:`read_catalogue`
 takes a configured list, else asks the endpoint and keeps its answer for
@@ -89,6 +90,12 @@ def config_path(environ: Mapping[str, str] | None = None) -> Path:
     return Path(environ.get("XDG_CONFIG_HOME") or Path.home() / ".config").expanduser() / "xmas" / "config.toml"
 
 
+def runs_path(environ: Mapping[str, str] | None = None) -> Path:
+    """Return the run store's default file: ``xmas/runs.sqlite`` under ``${XDG_DATA_HOME:-~/.local/share}``."""
+    environ = os.environ if environ is None else environ
+    return Path(environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share").expanduser() / "xmas" / "runs.sqlite"
+
+
 @dataclass(frozen=True)
 class ToolServer:
     """A tool server a callable names by ``server:``; its key and the credentials in its address never show.
@@ -119,7 +126,8 @@ class Config:
         prices: Per model id, the price used when a response reports no cost.
         tools: Tool servers by the name callables use.
         media_store: Folder for stored media, or ``None`` for the default.
-        run_store: File of the run store, or ``None`` for the default.
+        run_store: File of the run store, or ``None`` for :func:`runs_path`;
+            ``:memory:`` for one in memory, which logs no run.
         source: The file that was read, or ``None`` when there was none.
     """
 
