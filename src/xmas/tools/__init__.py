@@ -313,9 +313,6 @@ def tool(
             ``str``, else json. Several writes need ``fn`` to return a mapping
             with exactly those keys.
 
-    Returns:
-        The :class:`Tool`, or a decorator producing one when ``fn`` is not given.
-
     Raises:
         ValueError: If the function cannot be described (missing hint or
             docstring, unschemable type, bad name).
