@@ -16,7 +16,10 @@ again); a source that refuses the caller ends the run.
 
 The same registry serves steps (version 2): a :class:`~xmas.nodes.Step` names a
 tool in ``uses`` and :func:`run_step` runs it with values from the graph. A tool
-reads its parameters (:attr:`Tool.reads`) and writes :attr:`Tool.writes`.
+reads its parameters (:attr:`Tool.reads`) and writes :attr:`Tool.writes`. A step
+that writes a picture, a sound or a file returns a :class:`~pathlib.Path` (copied
+into the store) or a :class:`~xmas.media.Ref`; a remote one sends media blocks
+(:meth:`ToolSource.call_media`).
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from langgraph.errors import GraphBubbleUp
 from pydantic import BaseModel, ValidationError
 
 from xmas.errors import BadFormat, BudgetExceeded, Stopped, XmasError
+from xmas.media import store
 from xmas.schemas import RETRY_NOTE
 from xmas.tools.schema import (
     arguments_from,
@@ -43,7 +47,7 @@ from xmas.tools.schema import (
     valid_tool_name,
 )
 from xmas.trace import TokenUsage, ToolCall
-from xmas.values import TEXT, ValueType, check_value, parse_type, type_of_hint
+from xmas.values import TEXT, ValueType, check_value, coerce_media, media_kind, parse_type, type_of_hint
 
 if TYPE_CHECKING:  # pragma: no cover
     from promptolution.llms.base_llm import BaseLLM
@@ -51,6 +55,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.agent import Agent
     from xmas.budget import RunMeter, VisitMeter
     from xmas.llms.meta import CallMeta, SupportsMeta
+    from xmas.llms.parts import Part
 
 
 def _return_type(fn: Callable[..., Any] | None) -> ValueType:
@@ -196,6 +201,14 @@ class ToolSource:
                 and the run ends.
         """
         raise NotImplementedError
+
+    def call_media(self, name: str, arguments: dict[str, Any]) -> list[tuple[bytes, str]]:  # noqa: ARG002
+        """Run one tool and return the media it sent, as ``(bytes, media type)`` blocks in order.
+
+        Raises:
+            XmasError: Always, unless the source sends media; otherwise as :meth:`call`.
+        """
+        raise XmasError(f"{self!r} returns text only, so {name!r} cannot write media")
 
 
 class LocalTools(ToolSource):
@@ -346,7 +359,11 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
     which would turn its result into text, and what it raises passes unchanged;
     a remote tool runs through ``source.call``, and a json write is the JSON its
     text holds. One write takes the whole result; several need a mapping with
-    exactly those keys.
+    exactly those keys. A media write takes a ref, or a :class:`~pathlib.Path`
+    whose bytes are copied into :func:`~xmas.media.store`, so a step that
+    rewrites one path per item leaves earlier refs intact; a remote tool's one
+    media write is its :meth:`~ToolSource.call_media` blocks, stored (exactly one
+    for a single value).
 
     Raises:
         XmasError: If the arguments do not match the parameters, or a remote
@@ -355,11 +372,14 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
     """
     writes = spec.writes
     kwargs = spec.validate(arguments)
+    only = next(iter(writes.values())) if len(writes) == 1 else None
     if spec.fn is not None:
         result = spec.fn(**kwargs)
+    elif only is not None and media_kind(only) is not None:
+        result = _stored_blocks(spec.name, source.call_media(spec.name, kwargs), only)
     else:
         text = source.call(spec.name, kwargs)
-        if len(writes) == 1 and next(iter(writes.values())) == TEXT:
+        if only == TEXT:
             result = text
         else:
             try:
@@ -373,6 +393,9 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
     else:
         got = sorted(result) if isinstance(result, Mapping) else type(result).__name__
         raise BadFormat(spec.name, (f"expected a mapping with keys {sorted(writes)}, got {got}",))
+    if any(media_kind(vtype) is not None for vtype in writes.values()):
+        media = store()
+        produced = {name: coerce_media(value, writes[name], store=media) for name, value in produced.items()}
     problems = [
         f"{name}: {problem}"
         for name, value in produced.items()
@@ -383,19 +406,30 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
     return produced
 
 
+def _stored_blocks(name: str, blocks: list[tuple[bytes, str]], vtype: ValueType) -> Any:
+    """Store a remote tool's media blocks: the one ref for a single value, every ref for a list."""
+    if vtype.item is None and len(blocks) != 1:
+        raise BadFormat(name, (f"expected one {vtype} block, got {len(blocks)}",))
+    media = store()
+    refs = [media.put(data, media_type) for data, media_type in blocks]
+    return refs if vtype.item is not None else refs[0]
+
+
 def _turn_usage(
     count: Callable[[str], float], messages: list[dict[str, Any]], text: str, requests: Sequence[ToolCallRequest]
 ) -> TokenUsage:
-    """Estimate one tool turn's tokens with ``count``: every message's content in, the text and call arguments out."""
+    """Estimate one tool turn's tokens with ``count``: every message's text in, the text and call arguments out."""
+    from xmas.llms.parts import content_text  # here, not at the top: xmas.llms imports this module
+
     return TokenUsage(
-        input_tokens=sum(int(count(str(item.get("content") or ""))) for item in messages),
+        input_tokens=sum(int(count(content_text(item.get("content") or ""))) for item in messages),
         output_tokens=int(count(text)) + sum(int(count(request.arguments)) for request in requests),
     )
 
 
 def run_tool_loop(
     llm: Any,
-    rendered: str,
+    rendered: str | Sequence[Part],
     tools: ToolIndex,
     max_rounds: int,
     system_prompt: str,
@@ -406,8 +440,10 @@ def run_tool_loop(
     """Answer one rendered prompt, letting the model call tools.
 
     At most ``max_rounds`` turns may request tools; calls within a turn run in
-    order. If the model is still asking after that, one more turn with the
-    tools withheld forces a text answer. With ``check``, a final answer it
+    order. A prompt of parts with media in it is the first user message's
+    content (:func:`~xmas.llms.parts.to_content`); later turns are text. If
+    the model is still asking after that, one more turn with the tools
+    withheld forces a text answer. With ``check``, a final answer it
     names a problem with stays in the conversation, and one more turn, tools
     withheld, asks again with :data:`~xmas.schemas.RETRY_NOTE`; that answer is
     returned unchecked. Every turn is checked against ``meter`` before it starts.
@@ -423,10 +459,15 @@ def run_tool_loop(
         XmasError: If a tool source refused the caller (``status`` 401, 403 or 429).
     """
     from xmas.llms.meta import supports_meta  # here, not at the top: xmas.llms imports this module
+    from xmas.llms.parts import has_media, record_text, to_content
 
+    if isinstance(rendered, str):
+        content: str | list[dict[str, Any]] = rendered
+    else:
+        content = to_content(rendered) if has_media(rendered) else record_text(rendered)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": rendered},
+        {"role": "user", "content": content},
     ]
     specs = [spec for spec, _ in tools.values()]
     calls: list[ToolCall] = []

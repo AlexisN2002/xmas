@@ -5,13 +5,15 @@ Needs the ``mcp`` extra: ``pip install 'xmas[mcp]'``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
 from collections.abc import Mapping
 from typing import Any
 
-from mcp.types import CallToolResult, TextContent
+from mcp.types import AudioContent, BlobResourceContents, CallToolResult, EmbeddedResource, ImageContent, TextContent
 
 from xmas.errors import XmasError
 from xmas.tools import Tool, ToolSource
@@ -56,6 +58,8 @@ class MCPTools(ToolSource):
                 ``too_many_concurrent`` refusals.
             writes: What a tool writes when it runs as a step, by tool name, as
                 ``{tool: {write: type}}``; a tool not listed writes ``{tool: text}``.
+                A media write, such as ``{"paint": {"png": "image"}}``, is read
+                from the result's media blocks (:meth:`call_media`).
 
         Raises:
             ValueError: If no key is given or set in the environment.
@@ -107,6 +111,17 @@ class MCPTools(ToolSource):
         """
         return result_text(self.session.call_tool(name, arguments))
 
+    def call_media(self, name: str, arguments: dict[str, Any]) -> list[tuple[bytes, str]]:
+        """Run one tool on the server and return its image, audio and blob blocks, decoded, in order.
+
+        Raises:
+            XmasError: As :meth:`call` (the same failures and refusals), or for
+                a block whose base64 is invalid.
+        """
+        result = self.session.call_tool(name, arguments)
+        result_text(result)  # raises for a failed or refused call, as call does
+        return _media_blocks(result)
+
     def close(self) -> None:
         """Close the session and stop the background loop. Idempotent."""
         self.session.close()
@@ -122,6 +137,20 @@ class MCPTools(ToolSource):
     def __repr__(self) -> str:
         """Name the endpoint, never the key."""
         return f"MCPTools({self.url!r})"
+
+
+def _media_blocks(result: CallToolResult) -> list[tuple[bytes, str]]:
+    """Return a result's image, audio and embedded blob blocks as ``(bytes, media type)``."""
+    encoded: list[tuple[str, str]] = []
+    for block in result.content:
+        if isinstance(block, ImageContent | AudioContent):
+            encoded.append((block.data, block.mime_type))
+        elif isinstance(block, EmbeddedResource) and isinstance(block.resource, BlobResourceContents):
+            encoded.append((block.resource.blob, block.resource.mime_type or "application/octet-stream"))
+    try:
+        return [(base64.b64decode(data, validate=True), media_type) for data, media_type in encoded]
+    except binascii.Error as exc:
+        raise XmasError(f"mcp: a media block's base64 is invalid: {exc}") from None
 
 
 def result_text(result: CallToolResult) -> str:
