@@ -7,12 +7,12 @@ from __future__ import annotations
 import random
 from typing import TYPE_CHECKING
 
-from xmas.mas import MAS
-from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.optimizer import MASOptimizer
 
 if TYPE_CHECKING:  # pragma: no cover
+    from xmas.mas import MAS
     from xmas.optimization.attribution import Attributor
+    from xmas.optimization.graph_updater import GraphUpdater
     from xmas.tasks.base import MASTask
 
 __all__ = [
@@ -39,7 +39,7 @@ class EvolutionaryTopologyOptimizer(MASOptimizer):
         history: Aggregate score of the incumbent after each step.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  the public constructor, kept for version 1 callers
         self,
         mas: MAS,
         task: MASTask,

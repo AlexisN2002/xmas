@@ -6,13 +6,16 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
-from promptolution.llms.base_llm import BaseLLM
 
-from xmas.trace import Trace
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from promptolution.llms.base_llm import BaseLLM
+
+    from xmas.trace import Trace
 
 __all__ = [
     "Attributor",
@@ -24,6 +27,10 @@ __all__ = [
     "prompt",
     "truncate",
 ]
+
+
+MIN_GROUP_SIZE = 2
+"""The fewest executions a judging call can contrast."""
 
 
 class Attributor(Protocol):
@@ -177,7 +184,7 @@ Then return JSON inside <attribution>...</attribution>.
         Raises:
             ValueError: If ``group_size`` is below two.
         """
-        if group_size < 2:
+        if group_size < MIN_GROUP_SIZE:
             raise ValueError(f"group_size must be at least 2 to contrast anything; got {group_size}.")
         self.llm = llm
         self.group_size = group_size
@@ -282,7 +289,7 @@ def groups(traces: list[Trace], size: int, rng: np.random.RandomState) -> list[l
     for indices in by_query.values():
         for start in range(0, len(indices), size):
             chunk = indices[start : start + size]
-            if len(chunk) < 2:
+            if len(chunk) < MIN_GROUP_SIZE:
                 continue
             rng.shuffle(chunk)
             chunks.append(chunk)

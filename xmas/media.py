@@ -30,11 +30,12 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Annotated, Any, Protocol
 from urllib.parse import urlsplit
 
-from pydantic_core import core_schema
+from pydantic import PlainSerializer, PlainValidator
 
 if TYPE_CHECKING:  # pragma: no cover
     from pydantic import GetCoreSchemaHandler, GetJsonSchemaHandler
     from pydantic.json_schema import JsonSchemaValue
+    from pydantic_core import CoreSchema
 
 __all__ = [
     "ACCEPTABLE",
@@ -116,7 +117,7 @@ def kind_of(media_type: str) -> str:
 
 def fits_kind(ref: Ref, kind: str) -> bool:
     """Whether ``ref`` is a value of ``kind``; every ref is a ``file``."""
-    return kind == "file" or ref.kind == kind
+    return kind in {"file", ref.kind}
 
 
 @dataclass(frozen=True)
@@ -211,17 +212,14 @@ class Ref:
         return data
 
     @classmethod
-    def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+    def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
         """Validate a ``Ref`` as itself and a mapping through :meth:`from_dict`; serialize through :meth:`to_dict`."""
-        return core_schema.no_info_plain_validator_function(
-            validate_ref,
-            serialization=core_schema.plain_serializer_function_ser_schema(lambda ref: ref.to_dict()),
+        return handler.generate_schema(
+            Annotated[Any, PlainValidator(validate_ref), PlainSerializer(lambda ref: ref.to_dict())]
         )
 
     @classmethod
-    def __get_pydantic_json_schema__(
-        cls, schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
-    ) -> JsonSchemaValue:
+    def __get_pydantic_json_schema__(cls, schema: CoreSchema, handler: GetJsonSchemaHandler) -> JsonSchemaValue:
         """Describe a ref inline, marked as a ``file``; :class:`Kind` narrows the mark."""
         return {
             "type": "object",
@@ -305,9 +303,7 @@ class Kind:
         if self.kind not in MEDIA_KINDS:
             raise ValueError(f"Kind takes one of {', '.join(MEDIA_KINDS)}, not {self.kind!r}")
 
-    def __get_pydantic_json_schema__(
-        self, schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
-    ) -> JsonSchemaValue:
+    def __get_pydantic_json_schema__(self, schema: CoreSchema, handler: GetJsonSchemaHandler) -> JsonSchemaValue:
         """Mark the ref's schema with ``"x-xmas-kind"``."""
         return {**handler.resolve_ref_schema(handler(schema)), "x-xmas-kind": self.kind}
 

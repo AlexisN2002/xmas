@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from http import HTTPStatus
 from typing import Any
 
 import httpx2
@@ -93,12 +94,12 @@ class McpSession:
     async def record_refusal(self, response: httpx2.Response) -> None:
         """Turn an HTTP refusal into the error the run ends with; the SDK would hang on it or group it."""
         status = response.status_code
-        if status == 429:
+        if status == HTTPStatus.TOO_MANY_REQUESTS:
             retry_after = retry_after_seconds(response.headers)
             self.refusal = XmasError(f"mcp: rate limited (429), retry after {retry_after}s", status, retry_after)
-        elif status == 401:
+        elif status == HTTPStatus.UNAUTHORIZED:
             self.refusal = XmasError("mcp: unauthorized (401): check XMAS_TOOLS_KEY", status)
-        elif status == 403:
+        elif status == HTTPStatus.FORBIDDEN:
             self.refusal = XmasError("mcp: forbidden (403)", status)
 
     async def own_session(self, ready: asyncio.Future[ClientSession], stop: asyncio.Event) -> None:
@@ -178,7 +179,7 @@ class McpSession:
         async with self.semaphore:
             return await self.call_once(name, arguments, resend=True)
 
-    async def call_once(self, name: str, arguments: dict[str, Any], resend: bool) -> CallToolResult:
+    async def call_once(self, name: str, arguments: dict[str, Any], *, resend: bool) -> CallToolResult:
         """One ``tools/call``; protocol errors become the errors a run sees."""
         session = await self.connect()
         try:

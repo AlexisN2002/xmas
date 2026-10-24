@@ -159,7 +159,7 @@ class CallLog:
         blocks["total"] = aggregate(self, self.records)
         return blocks
 
-    def to_jsonl(self, path: str | Path, append: bool = False) -> Path:
+    def to_jsonl(self, path: str | Path, append: bool = False) -> Path:  # noqa: FBT001, FBT002  public method, kept for version 1 callers
         """Write one JSON object per call.
 
         ``append`` adds to the end of an existing file instead of replacing it;

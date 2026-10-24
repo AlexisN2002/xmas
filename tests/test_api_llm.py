@@ -215,18 +215,21 @@ USAGE = {
 }
 
 
-def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch: pytest.MonkeyPatch) -> None:
-    rich = TokenUsage(input_tokens=100, output_tokens=40, cached_tokens=60, reasoning_tokens=25)
+RICH = TokenUsage(input_tokens=100, output_tokens=40, cached_tokens=60, reasoning_tokens=25)
+"""The counts in ``USAGE``, as xmas reads them."""
+
+
+def test_full_response_keeps_usage_cost_and_finish(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # the provider's cost, cache reads, reasoning and served model reach the meta and the record keywords
-    llm, sent = recording_llm(monkeypatch, [answer("hi", usage={**USAGE, "cost": 0.0123}, model="vendor/m-0613")])
+    llm, _ = recording_llm(monkeypatch, [answer("hi", usage={**USAGE, "cost": 0.0123}, model="vendor/m-0613")])
     assert llm.full_response is True
     assert supports_meta(llm)
     text, meta = llm.generate_with_meta("hello")
     assert text == "hi"
     assert (meta.cost_usd, meta.tokens, meta.served_model, meta.finish_reason) == (
         0.0123,
-        rich,
+        RICH,
         "vendor/m-0613",
         "stop",
     )
@@ -234,13 +237,13 @@ def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch
     fields = meta.record_fields()
     assert fields == {
         "cost_usd": 0.0123,
-        "tokens": rich,
+        "tokens": RICH,
         "finish_reason": "stop",
         "error_kind": None,
         "served_model": "vendor/m-0613",
     }
     record = AgentRecord("a", 0, "p", "p", {}, {}, **fields)
-    assert (record.cost_usd, record.tokens, record.served_model) == (0.0123, rich, "vendor/m-0613")
+    assert (record.cost_usd, record.tokens, record.served_model) == (0.0123, RICH, "vendor/m-0613")
     assert llm.get_token_count() == {
         "input_tokens": 1 + 5,
         "output_tokens": 1,
@@ -265,6 +268,9 @@ def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch
     assert llm.generate_with_meta("hello")[1].cost_usd is None
     assert llm.generate_with_meta("hello")[1].tokens is None
 
+
+def test_full_response_asks_again_after_an_empty_or_choiceless_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    price = TokenPrice(input_per_m=1.0, output_per_m=4.0, cached_input_per_m=0.5)
     # the client does not validate responses: a usage block without counts gives no tokens, not a TypeError
     gap = ChatCompletion.construct(**{**answer("hi").model_dump(), "usage": {}})
     llm, _ = recording_llm(monkeypatch, [gap, gap], price=price)
@@ -274,7 +280,7 @@ def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch
     # an empty answer is asked again, and both paid attempts are summed
     llm, sent = recording_llm(monkeypatch, [answer(None, usage=USAGE), answer("ok", usage=USAGE)])
     text, meta = llm.generate_with_meta("hello")
-    assert (text, len(sent), meta.tokens) == ("ok", 2, rich + rich)
+    assert (text, len(sent), meta.tokens) == ("ok", 2, RICH + RICH)
 
     # so is a response without choices, as promptolution asks again, in a plain call and in a tool turn
     no_choice = ChatCompletion.model_validate({**answer("x").model_dump(), "choices": []})
@@ -284,6 +290,8 @@ def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch
     turn = llm.get_tool_response([{"role": "user", "content": "hello"}], [add])
     assert (turn, len(sent)) == (("", [ToolCallRequest("c1", "add", '{"a": 40}')]), 2)
 
+
+def test_full_response_marks_an_answer_cut_by_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     # an empty answer cut by max_tokens is not sent again
     llm, sent = recording_llm(monkeypatch, [answer(None, finish="length")] * 6)
     with pytest.raises(EmptyResponse, match=r"^Empty content from model") as raised:
@@ -300,6 +308,8 @@ def test_full_response_keeps_usage_cost_finish_and_spares_subclasses(monkeypatch
     assert (text, meta.error_kind) == ("half an ans", ErrorKind.LENGTH_CUT)
     assert meta.record_fields()["error_kind"] is ErrorKind.LENGTH_CUT
 
+
+def test_full_response_spares_a_subclass_that_hooks_promptolution(monkeypatch: pytest.MonkeyPatch) -> None:
     # a subclass that hooks promptolution's path keeps it, unless it opts in explicitly
     hooked_prompts: list[str] = []
 
@@ -512,7 +522,8 @@ def test_image_answers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     llm, _ = recording_llm(monkeypatch, [painted("ok", "https://cdn.example/p.png")])
     with pytest.raises(EmptyResponse, match="not a base64 data URI") as refused:
         llm.generate_image_with_meta("Paint")
-    assert refused.value.kind is ErrorKind.BAD_FORMAT and refused.value.meta is not None
+    assert refused.value.kind is ErrorKind.BAD_FORMAT
+    assert refused.value.meta is not None
     llm, _ = recording_llm(monkeypatch, [painted("ok", "data:image/png;base64,!!")])
     with pytest.raises(XmasError, match="base64 is invalid"):
         llm.generate_image_with_meta("Paint")
@@ -522,7 +533,8 @@ def test_image_answers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     llm, _ = recording_llm(monkeypatch, [fetched], produces=("text", "image"))
     painter = Agent("painter", "Paint {query}", "picture", output_type="image")
     trace = MAS([painter], llm=llm, budget=Budget(max_cost_usd=1.0), version=2).run("a house")
-    assert trace.error_kind is ErrorKind.BAD_FORMAT and trace.health is not None
+    assert trace.error_kind is ErrorKind.BAD_FORMAT
+    assert trace.health is not None
     assert trace.health.budget["cost_usd"]["spent"] == pytest.approx(0.04)
 
     # what a model takes and gives are words a model may state
@@ -553,7 +565,8 @@ def test_a_hooked_subclass_cannot_send_parts(monkeypatch: pytest.MonkeyPatch, tm
         llm, parts, index_tools([add]), 2, "System.", approximate_tokens, RunMeter()
     )
     assert (text, [call.result for call in calls]) == ("42", ["42"])
-    assert meta is not None and meta.served_model == "m"
+    assert meta is not None
+    assert meta.served_model == "m"
     assert sent[0]["messages"][1] == {"role": "user", "content": to_content(parts)}
     assert sent[1]["messages"][1] == sent[0]["messages"][1]
     assert [message["role"] for message in sent[1]["messages"]] == ["system", "user", "assistant", "tool"]

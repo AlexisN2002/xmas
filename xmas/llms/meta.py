@@ -9,7 +9,6 @@ number it can trust.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -19,6 +18,8 @@ from xmas.errors import ErrorKind, kind_of_finish
 from xmas.trace import TokenUsage
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from openai.types.chat import ChatCompletion
     from openai.types.completion_usage import CompletionUsage
 

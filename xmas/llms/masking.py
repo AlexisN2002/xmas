@@ -5,7 +5,10 @@ Only the assistant's own tokens count; the chat-template scaffolding around them
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "assistant_span",

@@ -280,7 +280,8 @@ def test_a_mas_runs_remote_tools_and_ends_on_a_refusal(remote: MCPTools) -> None
 def test_one_remote_callable_is_a_tool_and_a_step(server: tuple[Server, str]) -> None:
     with MCPTools(server[1], KEY, writes={"tally": {"tally": "json"}}) as remote:
         listed = {spec.name: spec for spec in remote.tools()}
-        assert listed["shout"].reads == {"text": TEXT} and listed["shout"].writes == {"shout": TEXT}
+        assert listed["shout"].reads == {"text": TEXT}
+        assert listed["shout"].writes == {"shout": TEXT}
         assert listed["tally"].writes == {"tally": JSON}
 
         llm = MockLLM(turns=[("", [req("shout", '{"text": "hi"}')]), ("said hi", [])])
@@ -308,7 +309,8 @@ def test_media_writes_from_a_remote_tool(
     with MCPTools(server[1], KEY, writes={"paint": {"png": "image"}}) as remote:
         spec = {item.name: item for item in remote.tools()}["paint"]
         png = run_step(spec, remote, {"pages": 1})["png"]
-        assert isinstance(png, Ref) and png.location.startswith(str(tmp_path))
+        assert isinstance(png, Ref)
+        assert png.location.startswith(str(tmp_path))
         assert (png.read_bytes(), png.media_type) == (b"png-0", "image/png")
         with pytest.raises(BadFormat, match="expected one image block, got 2"):
             run_step(spec, remote, {"pages": 2})

@@ -61,7 +61,7 @@ def docker_reachable() -> bool:
     if shutil.which("docker") is None:
         return False
     try:
-        return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=20, check=False).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 

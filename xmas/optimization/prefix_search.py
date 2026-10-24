@@ -8,16 +8,24 @@ yours does not, the loop is fine and the method is not.
 
 from __future__ import annotations
 
-from xmas.mas import MAS
-from xmas.optimization.attribution import Attributor
+from typing import TYPE_CHECKING
+
 from xmas.optimization.optimizer import MASOptimizer
 from xmas.optimization.updaters import movable_agents, weakest
-from xmas.tasks.base import MASTask
+
+if TYPE_CHECKING:
+    from xmas.mas import MAS
+    from xmas.optimization.attribution import Attributor
+    from xmas.tasks.base import MASTask
 
 __all__ = [
     "PREFIXES",
     "PrefixSearchOptimizer",
 ]
+
+
+MIN_POPULATION = 2
+"""The incumbent plus one candidate: the smallest population that compares anything."""
 
 
 # Fixed phrases tried against an agent's prompt. Not a method, a fixture.
@@ -85,7 +93,7 @@ class PrefixSearchOptimizer(MASOptimizer):
             ValueError: If ``population`` is below two, which leaves the incumbent
                 nothing to be compared against.
         """
-        if population is not None and population < 2:
+        if population is not None and population < MIN_POPULATION:
             raise ValueError(f"population must be at least 2 (incumbent plus one candidate), got {population}.")
         super().__init__(mas, task, attributor=attributor)
         self.prefixes = prefixes if population is None else prefixes[: population - 1]
