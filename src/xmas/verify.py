@@ -258,8 +258,7 @@ def verify(
     """
     if level not in (0, 1, 2):
         raise ValueError(f"verify levels are 0, 1 and 2, got {level!r}")
-    raw = getattr(mas, "bundle", None)
-    bundle = None if raw is None else Path(raw)
+    bundle = mas.bundle
     files = {} if bundle is None else dict(read(bundle))
     parsed: list[ExampleFile] = []
     problems: list[str] = []
@@ -438,7 +437,7 @@ def _render_problems(mas: MAS, cases: Iterable[Example]) -> list[str]:
 
 
 def _empty(vtype: ValueType) -> Any:
-    """Return a stand-in value of a type: ``""`` for text, ``{}`` for json, a ref to nothing for media."""
+    """Return a placeholder value of a type: ``""`` for text, ``{}`` for json, a ref to nothing for media."""
     kind = media_kind(vtype)
     if kind is not None:
         ref = Ref(f"example.{kind}", _PLACEHOLDER_TYPES.get(kind, "application/octet-stream"))

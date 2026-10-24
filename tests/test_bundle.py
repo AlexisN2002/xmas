@@ -326,7 +326,7 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     made_servers: list[tuple[str, str | None, str | None, dict[str, Any]]] = []
 
     class Served(Offered):
-        """A stand-in for MCPTools that records how it was made."""
+        """A fake MCPTools that records how it was made."""
 
         def __init__(self, url: str, key: str | None = None, *, writes: Any = None, name: str | None = None) -> None:
             """Record the address, key, name and writes."""

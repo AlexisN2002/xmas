@@ -358,9 +358,9 @@ SHAPES: dict[str, tuple[str, list[tuple[str, str, str]], dict[str, str] | str]] 
         {"j": "join, 2 groups"},
     ),
     "on-error fallback into a join": (
-        "f p1 p2 fb j",
-        [("f", "p1", "plain"), ("f", "p2", "plain"), ("p1", "j", "plain"), ("p1", "fb", "error"),
-         ("fb", "j", "plain"), ("p2", "j", "plain")],
+        "f q1 q2 fb j",
+        [("f", "q1", "plain"), ("f", "q2", "plain"), ("q1", "j", "plain"), ("q1", "fb", "error"),
+         ("fb", "j", "plain"), ("q2", "j", "plain")],
         {"j": "join, 2 groups"},
     ),
     "ambiguous": (
@@ -400,7 +400,7 @@ def test_each_fan_in_shape_is_a_merge_or_a_join(shape: str) -> None:
     relayed = {name: tuple(r is not None for r in join.relays) for name, join in joins.items() if join.kind == "join"}
     assert relayed == {
         "parallel diamond": {"j": (False, False)},
-        "on-error fallback into a join": {"j": (True, False)},  # p1's ok route or fb
+        "on-error fallback into a join": {"j": (True, False)},  # q1's ok route or fb
         "loop exit joins a parallel chain": {"fin": (True, False)},  # m's else route
         "parallel join with an inner diamond": {"j": (False, False)},
     }.get(shape, {})

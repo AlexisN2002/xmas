@@ -362,7 +362,7 @@ CALLS = [
 
 
 def test_streaming_is_opt_in_and_equivalent() -> None:
-    # off by default: today's bytes; on: the same body plus stream and stream_options
+    # off by default: the plain bytes; on: the same body plus stream and stream_options
     plain, sent = wired([answer("ok").model_dump(mode="json")])
     assert plain.stream is False
     assert plain.generate_with_meta("hi")[0] == "ok"

@@ -611,7 +611,7 @@ def save_examples(
     Raises:
         ValueError: Without a folder to write to, for a zipped bundle, or as :func:`cases_from_trace` raises.
     """
-    folder = Path(path) if path is not None else getattr(mas, "bundle", None)
+    folder = Path(path) if path is not None else mas.bundle
     if folder is None:
         raise ValueError("save_examples writes into a bundle folder: save the system first, or give path=")
     if folder.is_file():

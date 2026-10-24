@@ -191,7 +191,7 @@ def _record_signals(
 ) -> list[tuple[str, str]]:
     """Return ``(signal, detail)`` for each signal one record shows, in the order of the table."""
     ok, text = record.error is None, _text(record)
-    failure = f"{getattr(record.error_kind, 'value', 'unknown')}: {record.error}"
+    failure = f"{'unknown' if record.error_kind is None else record.error_kind.value}: {record.error}"
     same = before.step if before is not None and before.error is None and _text(before) == text else None
     placeholders = extract_placeholders(record.prompt)
     missing = sorted((placeholders if values is None else placeholders & values) - set(record.inputs))
@@ -247,7 +247,7 @@ def _budget_use(meter: RunMeter | None, records: Sequence[AgentRecord]) -> dict[
 
 
 def _item_name(record: AgentRecord) -> str:
-    """Return how a flag names a record's item, such as ``item 2 (p3)``."""
+    """Return how a flag names a record's item, such as ``item 2 (page-3)``."""
     return f"item {record.item}" + ("" if record.item_key is None else f" ({record.item_key})")
 
 

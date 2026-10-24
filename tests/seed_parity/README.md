@@ -2,7 +2,7 @@
 
 A trimmed copy of the seed implementation, kept so that
 `xmas.optimization.attribution.ContrastiveAttributer` can be checked against the
-code it was ported from rather than against a golden file this repository wrote
+code it came from rather than against a golden file this repository wrote
 for itself.
 
 **Source:** `mas_lib/attribution/{base,absolute}.py` at `tritthart/mas-optimization`

@@ -1,4 +1,4 @@
-"""Parity between the xmas contrastive attributor and the seed it was ported from.
+"""Parity between the xmas contrastive attributor and the seed code it reproduces.
 
 The port changed the input type (traces rather than task state dicts), the prompt
 (one benchmark-specific paragraph removed, the terminal variable named rather than

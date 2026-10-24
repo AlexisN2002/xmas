@@ -191,29 +191,29 @@ def test_an_optimizer_keeps_people_where_they_are() -> None:
 def test_a_pause_lets_other_branches_end() -> None:
     llm = MockLLM(lambda p: p.split()[0])
     agents = [Agent(name, f"{name} {{{read}}}", f"{name}_out", [read]) for name, read in (
-        ("b1", "query"), ("b2", "b1_out"), ("b3", "b2_out"))]  # fmt: skip
-    agents.append(Agent("join", "join {approval} {b3_out}", "joined", ["approval", "b3_out"]))
+        ("n1", "query"), ("n2", "n1_out"), ("n3", "n2_out"))]  # fmt: skip
+    agents.append(Agent("join", "join {approval} {n3_out}", "joined", ["approval", "n3_out"]))
     ask = Human("approve", "approve", ["query"], "approval", question="Go on with {query}?")
-    edges = [("b1", "b2"), ("b2", "b3"), ("approve", "join"), ("b3", "join")]
+    edges = [("n1", "n2"), ("n2", "n3"), ("approve", "join"), ("n3", "join")]
     mas = people(agents, edges, [ask], llm=llm)
-    paused = run(mas, {"query": "q"}, "p1")
-    assert [record.agent for record in paused.records] == ["b1", "b2", "b3"]  # the branch ended before the pause
-    assert open_ids(paused) == ["p1/approve/1"]
-    done = resume(mas, "p1", {"p1/approve/1": {"approved": True, **TOM}})
-    assert [record.agent for record in done.records] == ["b1", "b2", "b3", "approve", "join"]
+    paused = run(mas, {"query": "q"}, "u1")
+    assert [record.agent for record in paused.records] == ["n1", "n2", "n3"]  # the branch ended before the pause
+    assert open_ids(paused) == ["u1/approve/1"]
+    done = resume(mas, "u1", {"u1/approve/1": {"approved": True, **TOM}})
+    assert [record.agent for record in done.records] == ["n1", "n2", "n3", "approve", "join"]
 
     # Two humans on two branches pause together; answering one keeps the other open under its id.
-    check = Human("check", "approve", ["b2_out"], "checked", question="Is {b2_out} right?")
-    agents[2] = Agent("b3", "b3 {b2_out} {checked}", "b3_out", ["b2_out", "checked"])
-    edges = [("b1", "b2"), ("b2", "check"), ("check", "b3"), ("approve", "join"), ("b3", "join")]
+    check = Human("check", "approve", ["n2_out"], "checked", question="Is {n2_out} right?")
+    agents[2] = Agent("n3", "n3 {n2_out} {checked}", "n3_out", ["n2_out", "checked"])
+    edges = [("n1", "n2"), ("n2", "check"), ("check", "n3"), ("approve", "join"), ("n3", "join")]
     both = people(agents, edges, [ask, check], llm=llm)
-    paused = run(both, {"query": "q"}, "p2")
-    assert sorted(open_ids(paused)) == ["p2/approve/1", "p2/check/1"]
-    still = resume(both, "p2", {"p2/check/1": {"approved": True, **TOM}})
-    assert still.status == "paused" and open_ids(still) == ["p2/approve/1"]
-    done = resume(both, "p2", {"p2/approve/1": {"approved": True, **TOM}})
+    paused = run(both, {"query": "q"}, "u2")
+    assert sorted(open_ids(paused)) == ["u2/approve/1", "u2/check/1"]
+    still = resume(both, "u2", {"u2/check/1": {"approved": True, **TOM}})
+    assert still.status == "paused" and open_ids(still) == ["u2/approve/1"]
+    done = resume(both, "u2", {"u2/approve/1": {"approved": True, **TOM}})
     assert done.status == "ok" and [r.agent for r in done.records].count("join") == 1
-    assert done["join"][0].inputs["b3_out"] == "b3"
+    assert done["join"][0].inputs["n3_out"] == "n3"
 
 
 def test_pauses_inside_chain_items() -> None:
@@ -269,10 +269,10 @@ def test_pauses_inside_boxes() -> None:
     box = Box("review", boxed_inner(), reads={"topic": "query"}, writes={"approval": "approval"})
     side = Agent("side", "Side {query}", "aside")
     mas = people([side], boxes=[box], outputs={"approval": "json", "aside": "text"}, llm=MockLLM(lambda p: "s"))
-    paused = run(mas, {"query": "q"}, "b1")
-    assert open_ids(paused) == ["b1/review/1/approve/1"]
+    paused = run(mas, {"query": "q"}, "n1")
+    assert open_ids(paused) == ["n1/review/1/approve/1"]
     assert paused.agents == ("side",)
-    done = resume(mas, "b1", {"b1/review/1/approve/1": {"approved": True, **TOM}})
+    done = resume(mas, "n1", {"n1/review/1/approve/1": {"approved": True, **TOM}})
     assert done.status == "ok" and done.outputs["approval"]["approved"] is True
     (record,) = done["review"]
     assert record.kind == "box" and [(r.agent, r.kind) for r in cast("Any", record.inner).records] == [
@@ -294,9 +294,9 @@ def test_pauses_inside_boxes() -> None:
     chain = people(
         [], boxes=[box_in], each=each, inputs={"pages": "list of text"}, outputs={"approval": "list of json"}
     )
-    paused = run(chain, {"pages": ["x", "y"]}, "b2")
-    assert sorted(open_ids(paused)) == ["b2/review/1/approve/0/1", "b2/review/1/approve/1/1"]  # box visit, item
-    done = resume(chain, "b2", {qid: {"approved": True, **TOM} for qid in open_ids(paused)})
+    paused = run(chain, {"pages": ["x", "y"]}, "n2")
+    assert sorted(open_ids(paused)) == ["n2/review/1/approve/0/1", "n2/review/1/approve/1/1"]  # box visit, item
+    done = resume(chain, "n2", {qid: {"approved": True, **TOM} for qid in open_ids(paused)})
     assert [a["approved"] for a in done.outputs["approval"]] == [True, True]
 
     # A box visited twice in a loop: each visit pauses on its own thread.
@@ -304,11 +304,11 @@ def test_pauses_inside_boxes() -> None:
     loop = Edge("again", "review", EdgeKind.WHILE, when="not approval.approved", max_visits=2)
     edges: list[tuple[str, str] | Edge] = [("review", "again"), loop, Edge("again", END, EdgeKind.ELSE)]
     looped = people([again], edges, boxes=[box], llm=MockLLM(lambda p: "{}"), outputs={"verdict": "json"})
-    paused = run(looped, {"query": "q"}, "b3")
-    assert open_ids(paused) == ["b3/review/1/approve/1"]
-    second = resume(looped, "b3", {"b3/review/1/approve/1": {"approved": False, **TOM}})
-    assert open_ids(second) == ["b3/review/2/approve/1"]
-    done = resume(looped, "b3", {"b3/review/2/approve/1": {"approved": True, **TOM}})
+    paused = run(looped, {"query": "q"}, "n3")
+    assert open_ids(paused) == ["n3/review/1/approve/1"]
+    second = resume(looped, "n3", {"n3/review/1/approve/1": {"approved": False, **TOM}})
+    assert open_ids(second) == ["n3/review/2/approve/1"]
+    done = resume(looped, "n3", {"n3/review/2/approve/1": {"approved": True, **TOM}})
     assert [r.agent for r in done.records] == ["review", "again", "review", "again"]
 
 
@@ -490,14 +490,14 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
     holder: dict[str, MAS] = {}
 
     def late(prompt: str) -> str:
-        if prompt.startswith("b2"):
+        if prompt.startswith("n2"):
             holder["mas"].answer("e1", {"e1/approve/1": {"approved": True, **TOM}})
         return prompt.split()[0]
 
-    agents = [Agent("b1", "b1 {query}", "b1_out"), Agent("b2", "b2 {b1_out}", "b2_out", ["b1_out"])]
+    agents = [Agent("n1", "n1 {query}", "n1_out"), Agent("n2", "n2 {n1_out}", "n2_out", ["n1_out"])]
     ask = Human("approve", "approve", ["query"], "approval", question="Go on with {query}?")
-    outputs = {"approval": "json", "b2_out": "text"}
-    holder["mas"] = mas = people(agents, [("b1", "b2")], [ask], llm=MockLLM(late), outputs=outputs)
+    outputs = {"approval": "json", "n2_out": "text"}
+    holder["mas"] = mas = people(agents, [("n1", "n2")], [ask], llm=MockLLM(late), outputs=outputs)
     events: list[Event] = []
     done = run(mas, {"query": "q"}, "e1", events)
     assert done.status == "ok" and {"pause", "resume"}.isdisjoint(e.kind for e in events)

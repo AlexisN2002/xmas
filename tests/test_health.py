@@ -134,7 +134,7 @@ def test_items_and_item_budgets_are_flagged_per_chain() -> None:
     def page(
         agent: str, step: int, output: str | None, item: int, cost: float | None = 0.02, **later: Any
     ) -> AgentRecord:
-        return rec(agent, step, output, item=item, item_key=f"p{item}", latency_s=50.0, cost_usd=cost, **later)
+        return rec(agent, step, output, item=item, item_key=f"page-{item}", latency_s=50.0, cost_usd=cost, **later)
 
     records = [
         page("drafter", 0, "draft A", 0),
@@ -151,10 +151,10 @@ def test_items_and_item_budgets_are_flagged_per_chain() -> None:
     chains = {"drafter": (["drafter", "checker"], budget), "captioner": (["captioner"], {})}
     health = summarize(records, chains=chains)
     assert [(flag.signal, flag.node, flag.step, flag.detail) for flag in health.flags] == [
-        ("item_failed", "checker", 3, "item 1 (p1) failed: outage: ConnectionError: down"),
+        ("item_failed", "checker", 3, "item 1 (page-1) failed: outage: ConnectionError: down"),
         ("stuck", "drafter", 6, "the same output as step 4"),
-        ("item_over_budget", "checker", 7, "item 2 (p2) cost 0.08 USD, over its budget of 0.05"),
-        ("item_over_budget", "checker", 7, "item 2 (p2) took 200 s, over its budget of 120"),
+        ("item_over_budget", "checker", 7, "item 2 (page-2) cost 0.08 USD, over its budget of 0.05"),
+        ("item_over_budget", "checker", 7, "item 2 (page-2) took 200 s, over its budget of 120"),
     ]
     assert health.items == {
         "drafter": {"items": 3, "failed": 1, "cost_usd": [0.04, None, pytest.approx(0.08)]},

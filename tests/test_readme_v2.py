@@ -1208,8 +1208,8 @@ def test_people_claims_without_a_block() -> None:
 
     # an asker that replays recorded answers lets a system with people run unattended
     asked = gate()
-    paused = asked.run_state({"query": QUERY}, run_id="p1")
-    done = asked.resume("p1", {paused.pause.questions[0].id: {"approved": True, "who": "tom"}})  # type: ignore[union-attr]
+    paused = asked.run_state({"query": QUERY}, run_id="r1")
+    done = asked.resume("r1", {paused.pause.questions[0].id: {"approved": True, "who": "tom"}})  # type: ignore[union-attr]
     replayed = gate()
     replayed.asker = ReplayAsker([done])
     again = json.loads(replayed.run(QUERY).output)
