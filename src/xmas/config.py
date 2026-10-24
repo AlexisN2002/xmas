@@ -65,16 +65,9 @@ from xmas.media import TEXT_ONLY, Capabilities
 from xmas.tools import ToolSource
 
 CONFIG_ENV = "XMAS_CONFIG"
-"""The environment variable naming the configuration file."""
-
 MODELS_ENV = "XMAS_MODELS"
-"""The environment variable holding a comma list of model ids, used as the catalogue."""
-
 CATALOGUE_TTL_S = 300.0
-"""How long an endpoint's answer to ``GET /models`` is used before it is asked again."""
-
 FETCH_TIMEOUT_S = 5.0
-"""How long :func:`read_catalogue` waits for the endpoint."""
 
 _SCALARS: dict[str, dict[str, type]] = {
     "endpoint": {"base_url": str, "api_key": str, "api_key_env": str, "catalogue": list, "stream": bool},
@@ -85,11 +78,7 @@ _SCALARS: dict[str, dict[str, type]] = {
 }
 _TABLES = ("endpoint", "models", "tools", "store")
 _SHAPES = {str: "a string", bool: "true or false", float: "a number", dict: "a table", list: "a list of model ids"}
-
-
-def _words(value: list[Any]) -> bool:
-    """Whether every item is a string."""
-    return all(isinstance(item, str) for item in value)
+_PARAM_WORDS: dict[tuple[type, ...], str] = {(str,): "a text", (int,): "a whole number"}
 
 
 def config_path(environ: Mapping[str, str] | None = None) -> Path:
@@ -167,12 +156,12 @@ class Config:
         file = Path(path).expanduser() if path is not None else config_path(environ)
         values = _read_file(file, environ) if file.is_file() else {}
         listed = [name.strip() for name in environ.get(MODELS_ENV, "").split(",") if name.strip()]
-        from_env: dict[str, Any] = {
+        from_env = {
             "base_url": environ.get("XMAS_BASE_URL"),
             "api_key": environ.get("XMAS_API_KEY"),
-            "catalogue": tuple(listed) if listed else None,
-            "media_store": Path(environ["XMAS_STORE"]).expanduser() if environ.get("XMAS_STORE") else None,
-            "run_store": Path(environ["XMAS_RUNS"]).expanduser() if environ.get("XMAS_RUNS") else None,
+            "catalogue": listed or None,
+            "media_store": environ.get("XMAS_STORE"),
+            "run_store": environ.get("XMAS_RUNS"),
         }
         for layer in (from_env, given):
             values.update({key: value for key, value in layer.items() if value is not None and value != ""})
@@ -180,6 +169,9 @@ class Config:
             values["base_url"] = str(values["base_url"]).rstrip("/")
         if values.get("catalogue") is not None:
             values["catalogue"] = tuple(values["catalogue"])
+        for key in ("media_store", "run_store"):
+            if key in values:
+                values[key] = Path(values[key]).expanduser()
         return cls(**values, source=file if file.is_file() else None)
 
     def __repr__(self) -> str:
@@ -200,16 +192,19 @@ def _read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"{path}: not a TOML file ({exc})") from None
 
-    def checked(table: Any, kind: str, where: str) -> dict[str, Any]:
+    def checked(table: Any, kind: str | None, where: str) -> dict[str, Any]:
         if not isinstance(table, dict):
             raise ValueError(f"{path}: {where} is a table, not {type(table).__name__}")
+        if kind is None:  # a table of tables, such as [models."<id>"]
+            return table
         allowed = _SCALARS[kind]
         for key, value in table.items():
             if key not in allowed:
                 raise ValueError(f"{path}: unknown key '{where}.{key}'; {where} takes {', '.join(allowed)}")
             want = allowed[key]
             fits = isinstance(value, (int, float)) if want is float else isinstance(value, want)
-            if isinstance(value, bool) is not (want is bool) or not fits or (key == "catalogue" and not _words(value)):
+            words = key != "catalogue" or all(isinstance(item, str) for item in value)
+            if isinstance(value, bool) is not (want is bool) or not fits or not words:
                 raise ValueError(f"{path}: {where}.{key} is {_SHAPES[want]}, not {type(value).__name__}")
         for key, alias in (("api_key", "api_key_env"), ("key", "key_env")):
             if key in table and alias in table:
@@ -223,15 +218,14 @@ def _read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
     store = checked(data.get("store", {}), "store", "store")
     values: dict[str, Any] = {
         "base_url": endpoint.get("base_url"),
-        "api_key": endpoint.get("api_key")
-        or (environ.get(endpoint["api_key_env"]) if "api_key_env" in endpoint else None),
+        "api_key": _secret(endpoint, "api_key", environ),
         "catalogue": endpoint.get("catalogue"),
         "stream": endpoint.get("stream", False),
-        "media_store": Path(store["media"]).expanduser() if "media" in store else None,
-        "run_store": Path(store["runs"]).expanduser() if "runs" in store else None,
+        "media_store": store.get("media"),
+        "run_store": store.get("runs"),
     }
     prices, streams = {}, {}
-    for model, entry in _subtables(data, "models", path).items():
+    for model, entry in checked(data.get("models", {}), None, "models").items():
         where = f"models.{json.dumps(model)}"
         checked(entry, "model", where)
         if "stream" in entry:
@@ -243,29 +237,21 @@ def _read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
                 raise ValueError(f"{path}: {where}.price needs {' and '.join(missing)}")
             prices[model] = TokenPrice(**{key: float(value) for key, value in price.items()})
     tools = {}
-    for name, entry in _subtables(data, "tools", path).items():
+    for name, entry in checked(data.get("tools", {}), None, "tools").items():
         where = f"tools.{name}"
         checked(entry, "tool", where)
         if "url" not in entry:
             raise ValueError(f"{path}: {where} needs url")
-        secret = entry.get("key") or (environ.get(entry["key_env"]) if "key_env" in entry else None)
-        tools[name] = ToolServer(entry["url"], secret)
-    if ("api_key" in endpoint or any("key" in entry for entry in data.get("tools", {}).values())) and _shared(path):
+        tools[name] = ToolServer(entry["url"], _secret(entry, "key", environ))
+    keyed = "api_key" in endpoint or any("key" in entry for entry in data.get("tools", {}).values())
+    if keyed and path.stat().st_mode & (stat.S_IRGRP | stat.S_IROTH):
         warnings.warn(f"{path} holds a key and others can read it; chmod 600 {path}", UserWarning, stacklevel=3)
     return {**{k: v for k, v in values.items() if v is not None}, "prices": prices, "streams": streams, "tools": tools}
 
 
-def _subtables(data: Mapping[str, Any], table: str, path: Path) -> dict[str, Any]:
-    """Return ``data[table]``, a table of tables such as ``[models."<id>"]``."""
-    entries = data.get(table, {})
-    if not isinstance(entries, dict):
-        raise ValueError(f"{path}: {table} is a table, not {type(entries).__name__}")
-    return entries
-
-
-def _shared(path: Path) -> bool:
-    """Whether the group or others may read ``path``."""
-    return bool(path.stat().st_mode & (stat.S_IRGRP | stat.S_IROTH))
+def _secret(table: Mapping[str, Any], key: str, environ: Mapping[str, str]) -> str | None:
+    """Return the ``key`` a table states, else the environment variable its ``<key>_env`` names."""
+    return table.get(key) or (environ.get(table[f"{key}_env"]) if f"{key}_env" in table else None)
 
 
 def _shown(url: str) -> str:
@@ -297,7 +283,6 @@ def _cache_file(base_url: str, api_key: str | None) -> Path:
 
 
 def _kept(file: Path) -> tuple[float, tuple[str, ...]] | None:
-    """Return the kept answer's time and ids, or ``None`` when there is none readable."""
     try:
         kept = json.loads(file.read_text(encoding="utf-8"))
         return float(kept["fetched"]), tuple(str(name) for name in kept["ids"])
@@ -357,7 +342,6 @@ def read_catalogue(
 
 
 def _bare(name: str) -> str:
-    """Return ``name`` lower-cased, without a ``vendor/`` prefix."""
     return name.rsplit("/", 1)[-1].lower()
 
 
@@ -496,10 +480,7 @@ class ModelEntry(Capabilities):
         for key, value in entry.items():
             if key in PARAMS:
                 if isinstance(value, bool) or not isinstance(value, PARAMS[key]):
-                    want = (
-                        "a text" if PARAMS[key] == (str,) else "a whole number" if PARAMS[key] == (int,) else "a number"
-                    )
-                    raise ValueError(f"{where} {key} is {want}, not {value!r}")
+                    raise ValueError(f"{where} {key} is {_PARAM_WORDS.get(PARAMS[key], 'a number')}, not {value!r}")
                 params.append((key, value))
         if model is None and not params:
             return stated
@@ -528,7 +509,6 @@ class Unconfigured(BaseLLM):
         self.accepts, self.produces = capabilities.accepts, capabilities.produces
 
     def _fail(self, *_: Any, **__: Any) -> NoReturn:
-        """Fail: there is no endpoint to ask."""
         raise ValueError(
             f"model {self.model!r} has no endpoint: set XMAS_BASE_URL, or base_url under [endpoint] in {config_path()}"
         )

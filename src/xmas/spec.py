@@ -103,58 +103,45 @@ _WORDS = {
 
 
 def validate_spec(data: dict[str, Any]) -> dict[str, Any]:
-    """Check the top-level shape of a spec and return it.
-
-    Each agent mapping is checked by :meth:`xmas.Agent.from_dict`.
-
-    Args:
-        data: Candidate spec, typically parsed from YAML.
-
-    Returns:
-        The same mapping.
+    """Check the top-level shape of a version 1 spec and return it; each agent is checked by ``Agent.from_dict``.
 
     Raises:
-        ValueError: If a key is unknown, the version is unsupported, the agents
-            are not a non-empty list of mappings, or an edge or the default model
-            has the wrong type.
+        ValueError: If a key is unknown, the version is not 1, the agents are not a non-empty list of mappings,
+            or an edge or the default model has the wrong type.
     """
     unknown = set(data) - {"version", "agents", "edges", "default_model"}
     if unknown:
         raise ValueError(f"Unknown spec keys: {sorted(unknown)}.")
-
     version = data.get("version", 1)
     if version != 1:
         raise ValueError(f"Unsupported spec version {version!r}; this build reads version 1.")
-
     agents = data.get("agents")
     if not isinstance(agents, list) or not agents:
         raise ValueError("Spec needs a non-empty 'agents' list.")
     for index, agent in enumerate(agents):
         if not isinstance(agent, dict):
             raise ValueError(f"Agent {index} is not a mapping.")
-
     edges = data.get("edges", [])
     if not isinstance(edges, list):
         raise ValueError("Spec needs 'edges' to be a list.")
     for edge in edges:
         if not isinstance(edge, list) or len(edge) != 2 or not all(isinstance(node, str) for node in edge):
             raise ValueError(f"Edge {edge!r} must be a two-element list of strings.")
-
-    default_model = data.get("default_model")
-    if default_model is not None and not isinstance(default_model, str):
+    if not isinstance(data.get("default_model", ""), str | None):
         raise ValueError("Spec needs 'default_model' to be a string or null.")
-
     return data
 
 
-def _check_fields(entry: Any, where: str, fields: dict[str, Any], required: frozenset[str] = frozenset()) -> None:
+def _check_fields(
+    entry: Any, where: str, fields: dict[str, Any], required: frozenset[str] = frozenset(), note: str = ""
+) -> None:
     """Refuse a mapping with an unknown or missing key or a value of the wrong type."""
     if not isinstance(entry, dict):
         raise ValueError(f"{where} must be a mapping.")
     unknown, missing = sorted(set(entry) - set(fields)), sorted(required - set(entry))
     if unknown or missing:
         problem = f"has unknown keys {unknown}" if unknown else f"is missing the keys {missing}"
-        raise ValueError(f"{where} {problem}; it takes {sorted(fields)}.")
+        raise ValueError(f"{where} {problem}; it takes {sorted(fields)}{note if unknown else ''}.")
     for key, value in entry.items():
         if isinstance(value, bool) or not isinstance(value, fields[key]):
             raise ValueError(f"{where} needs {key!r} to be {_WORDS[fields[key]]}, got {value!r}.")
@@ -182,13 +169,7 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"{label} {index} must be a mapping with a string 'name'.")
             _check_fields(entry, f"{label} {entry['name']!r}", fields, required)
     for name, entry in data.get("callables", {}).items():
-        unknown = sorted(set(entry) - set(_CALLABLE)) if isinstance(entry, dict) else []
-        if unknown:
-            raise ValueError(
-                f"Callable {name!r} has unknown keys {unknown}; it takes {sorted(_CALLABLE)} (use a YAML comment "
-                "for a note)."
-            )
-        _check_fields(entry, f"Callable {name!r}", _CALLABLE, frozenset({"kind"}))
+        _check_fields(entry, f"Callable {name!r}", _CALLABLE, frozenset({"kind"}), " (use a YAML comment for a note)")
         if entry["kind"] not in ("python", "mcp"):
             raise ValueError(f"Callable {name!r} needs 'kind' to be 'python' or 'mcp', not {entry['kind']!r}.")
         if "params" in entry and entry["kind"] != "python":

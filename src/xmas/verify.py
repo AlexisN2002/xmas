@@ -23,14 +23,12 @@ from __future__ import annotations
 import time
 import warnings
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import yaml
-
 from xmas.budget import Budget
-from xmas.bundle import CALLABLES, LOCK, WIRING, Lock, LockDiff, code_hashes, compare, files_of, parse_prompt, read
+from xmas.bundle import LOCK, LockDiff, check_lock, code_hashes, files_of, owned, read, same, systems
 from xmas.check import check_system
 from xmas.config import Catalogue, Config, read_catalogue, resolve_names
 from xmas.examples import FOLDER, UNSET, Check, Example, ExampleFile, parse_examples, run_checks, written
@@ -53,7 +51,6 @@ PER_EXAMPLE_USD = 0.02
 STATUSES = ("pass", "fail", "skipped", "error")
 """How an example ended: its checks passed or failed, it was not run, or it could not run."""
 
-_OWNED = ("prompts/", "boxes/")
 _PLACEHOLDER_TYPES = {"image": "image/png", "audio": "audio/wav", "document": "application/pdf", "table": "text/csv"}
 
 
@@ -99,15 +96,7 @@ class ExampleResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form."""
-        return {
-            "name": self.name,
-            "node": self.node,
-            "status": self.status,
-            "failures": list(self.failures),
-            "cost_usd": self.cost_usd,
-            "latency_s": self.latency_s,
-            "notes": list(self.notes),
-        }
+        return _lists(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -160,7 +149,7 @@ class VerifyReport:
             width = max((len(result.name) for result in self.examples), default=0)
             status = max((len(result.status) for result in self.examples), default=0)
             for result in self.examples:
-                cost = "cost unknown" if result.cost_usd is None else f"{result.cost_usd:.4f} USD"
+                cost = _usd(result.cost_usd)
                 took = "<0.1 s" if result.latency_s < 0.1 else f"{result.latency_s:.1f} s"
                 lines.append(f"level 2: {result.name:<{width}}  {result.status:<{status}}  {cost}  {took}")
                 lines += [f"  - {failure}" for failure in result.failures]
@@ -174,14 +163,8 @@ class VerifyReport:
             return ["level 0: not saved: no lock"]
         if self.lock.clean and not self.unsaved:
             return [f"level 0: unchanged since saved (bundle {self.digest}, {self.files} files)"]
-        found = [
-            ("changed", self.lock.changed),
-            ("added", self.lock.added),
-            ("missing", self.lock.missing),
-            ("code changed", self.lock.code_changed),
-            ("in memory, not saved", self.unsaved),
-        ]
-        return [f"level 0: {label}: {', '.join(paths)}" for label, paths in found if paths]
+        found = [*asdict(self.lock).items(), ("in memory, not saved", self.unsaved)]
+        return [f"level 0: {label.replace('_', ' ')}: {', '.join(paths)}" for label, paths in found if paths]
 
     def _names(self) -> str:
         catalogue = self.catalogue
@@ -193,7 +176,7 @@ class VerifyReport:
 
     def _verdict(self) -> str:
         counts = {status: sum(r.status == status for r in self.examples) for status in STATUSES}
-        cost = "cost unknown" if self.cost_usd is None else f"{self.cost_usd:.4f} USD"
+        cost = _usd(self.cost_usd)
         tally = ", ".join(f"{n} {status}" for status, n in counts.items() if n and status != "pass")
         examples = f"{counts['pass']} example{'s' * (counts['pass'] != 1)} passed" + (f", {tally}" if tally else "")
         if self.ok:
@@ -207,20 +190,12 @@ class VerifyReport:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form, ``ok`` included."""
-        lock = self.lock
         catalogue = self.catalogue
         return {
             "ok": self.ok,
             "level": self.level,
             "bundle": None if self.bundle is None else str(self.bundle),
-            "lock": None
-            if lock is None
-            else {
-                "changed": list(lock.changed),
-                "added": list(lock.added),
-                "missing": list(lock.missing),
-                "code_changed": list(lock.code_changed),
-            },
+            "lock": None if self.lock is None else _lists(asdict(self.lock)),
             "digest": self.digest,
             "files": self.files,
             "unsaved": list(self.unsaved),
@@ -242,6 +217,14 @@ class VerifyReport:
     def __str__(self) -> str:
         """Return :meth:`lines` as one text."""
         return "\n".join(self.lines())
+
+
+def _usd(cost: float | None) -> str:
+    return "cost unknown" if cost is None else f"{cost:.4f} USD"
+
+
+def _lists(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: list(value) if isinstance(value, tuple) else value for key, value in data.items()}
 
 
 def verify(
@@ -317,29 +300,13 @@ def _level0(mas: MAS, files: Mapping[str, bytes]) -> dict[str, Any]:
     """Compare the bundle's files with its lock, and the system in memory with the files."""
     if LOCK not in files:
         return {}
-    disk = {path: data for path, data in files.items() if path != LOCK}
-    owned = files_of(mas)
-    on_disk = {path for path in disk if path in (WIRING, CALLABLES) or path.startswith(_OWNED)}
-    unsaved = tuple(path for path in sorted({*owned, *on_disk}) if not _same(path, owned.get(path), disk.get(path)))
-    try:
-        saved = Lock.from_yaml(files[LOCK].decode("utf-8", "replace"))
-    except ValueError:  # edited by hand: the lock itself changed since saved
-        return {"lock": LockDiff(changed=(LOCK,)), "unsaved": unsaved}
-    return {
-        "lock": compare(saved, disk, code_hashes(mas)),
-        "unsaved": unsaved,
-        "digest": saved.bundle[:16],
-        "files": len(saved.files),
-    }
-
-
-def _same(path: str, ours: bytes | None, theirs: bytes | None) -> bool:
-    """Whether two versions of a bundle file say the same: YAML as loaded, prompts as text and form."""
-    if ours is None or theirs is None:
-        return False
-    if path.endswith(".md"):
-        return parse_prompt(ours.decode("utf-8"), path) == parse_prompt(theirs.decode("utf-8"), path)
-    return bool(yaml.safe_load(ours) == yaml.safe_load(theirs))
+    ours = files_of(mas)
+    unsaved = tuple(
+        path for path in sorted({*ours, *filter(owned, files)}) if not same(path, ours.get(path), files.get(path))
+    )
+    saved, diff = check_lock(files, code_hashes(mas))
+    found = {"lock": diff, "unsaved": unsaved}
+    return found if saved is None else {**found, "digest": saved.bundle[:16], "files": len(saved.files)}
 
 
 def _sources(
@@ -347,8 +314,7 @@ def _sources(
 ) -> tuple[dict[str, bytes], Path | None]:
     """Return the examples files keyed by their paths in a bundle, and the folder their media paths start from."""
     if examples is None:
-        found = {path: data for path, data in files.items() if path.startswith(f"{FOLDER}/")}
-        return found, bundle if bundle is not None and bundle.is_dir() else None
+        return dict(files), bundle if bundle is not None and bundle.is_dir() else None
     path = Path(examples)
     if path.is_file():
         root = path.parent.parent if path.parent.name == FOLDER else path.parent
@@ -363,17 +329,12 @@ def _sources(
     return {item.relative_to(root).as_posix(): item.read_bytes() for item in inside}, root
 
 
-def _systems(mas: MAS) -> list[MAS]:
-    """Return ``mas`` and the system of every box in it, at any depth."""
-    return [mas, *(system for box in mas.boxes.values() for system in _systems(box.system))]
-
-
 def _level1(
     mas: MAS, sources: tuple[dict[str, bytes], Path | None], config: Config | None
 ) -> tuple[list[ExampleFile], list[str], dict[str, tuple[str, ...]], Catalogue]:
     """Check the system, read the examples, render every prompt and look up every model name; no model call."""
     problems: list[str] = []
-    for system in _systems(mas):
+    for _, system in systems(mas):
         if system.version == 2:
             try:
                 check_system(system)
@@ -459,7 +420,7 @@ def _render_problems(mas: MAS, cases: Iterable[Example]) -> list[str]:
         if example.node is not None:
             inputs.setdefault(example.node, []).append(example.inputs)
     lines = []
-    for system in _systems(mas):
+    for _, system in systems(mas):
         for agent in system.agents.values():
             owner = node_owner(system, agent.name)
             types = owner.info.types if owner.info is not None else {}
@@ -478,7 +439,7 @@ def _render_problems(mas: MAS, cases: Iterable[Example]) -> list[str]:
 
 def _empty(vtype: ValueType) -> Any:
     """Return a stand-in value of a type: ``""`` for text, ``{}`` for json, a ref to nothing for media."""
-    kind = media_kind(vtype.item if vtype.item is not None else vtype)
+    kind = media_kind(vtype)
     if kind is not None:
         ref = Ref(f"example.{kind}", _PLACEHOLDER_TYPES.get(kind, "application/octet-stream"))
         return [ref] if vtype.item is not None else ref
@@ -488,7 +449,7 @@ def _empty(vtype: ValueType) -> Any:
 def _model_names(mas: MAS) -> dict[str, str]:
     """Return each catalogue id the agents bind, at every depth, with who binds it: ``{id: "agents a, b"}``."""
     bound: dict[str, list[str]] = {}
-    for system in _systems(mas):
+    for _, system in systems(mas):
         for agent in system.agents.values():
             name = agent.model if agent.model is not None else system.default_model
             if name is not None:

@@ -27,7 +27,7 @@ from xmas.agent import Agent
 from xmas.budget import Budget
 from xmas.bundle import LOCK, Lock, compare, read
 from xmas.config import Config, Unconfigured, config_path
-from xmas.examples import FOLDER, parse_examples
+from xmas.examples import parse_examples
 from xmas.mas import MAS
 from xmas.values import TEXT, ValueType, media_kind, plain
 from xmas.verify import VerifyWarning
@@ -97,12 +97,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with _warnings_as_lines():
             return int(globals()[f"_{args.command}"](args))
-    except _UsageError as error:
+    except (_UsageError, ValueError) as error:
         print(f"xmas {args.command}: {error}", file=sys.stderr)
-        return 2
-    except ValueError as error:
-        print(f"xmas {args.command}: {error}", file=sys.stderr)
-        return 1
+        return 2 if isinstance(error, _UsageError) else 1
     finally:
         if joined:
             sys.path.remove(here)
@@ -171,8 +168,7 @@ def _summary(description: Mapping[str, Any]) -> str:
 def _check(args: argparse.Namespace) -> int:
     mas = _load(args, resolve=False)
     problems: list[str] = []
-    examples = {path: data for path, data in read(args.bundle).items() if path.startswith(f"{FOLDER}/")}
-    parse_examples(examples, Path(args.bundle) if Path(args.bundle).is_dir() else None, problems=problems)
+    parse_examples(read(args.bundle), Path(args.bundle) if Path(args.bundle).is_dir() else None, problems=problems)
     for problem in problems:
         print(f"- {problem}")
     print(f"{len(problems)} problem(s)" if problems else f"ok: {_summary(mas.describe())}")
@@ -217,15 +213,13 @@ def _show(args: argparse.Namespace) -> int:
 def _value(text: str, vtype: ValueType) -> Any:
     if vtype == TEXT:
         return text
-    if media_kind(vtype) is not None:
+    if vtype.item is None and media_kind(vtype) is not None:
         return Path(text)
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
         raise _UsageError(f"a {vtype} input is JSON, not {text!r}") from None
-    if vtype.item is not None and media_kind(vtype.item) is not None and isinstance(value, list):
-        return [Path(item) for item in value]
-    return value
+    return [Path(item) for item in value] if media_kind(vtype) is not None and isinstance(value, list) else value
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -266,12 +260,9 @@ def _diff(args: argparse.Namespace) -> int:
             raise ValueError(f"{args.bundle} has no {LOCK}; give a second bundle to compare with")
         lock = Lock.from_yaml(left.pop(LOCK).decode("utf-8"))
         found = compare(lock, left)
-        result: dict[str, Any] = {"changed": found.changed, "added": found.added, "missing": found.missing}
-        if args.json:
-            print(json.dumps({key: list(value) for key, value in result.items()}, indent=2))
-        else:
-            lines = [f"{label}: {path}" for label, paths in result.items() for path in paths]
-            print("\n".join(lines) or f"unchanged since saved ({LOCK})")
+        result = {key: list(getattr(found, key)) for key in ("changed", "added", "missing")}
+        lines = [f"{label}: {path}" for label, paths in result.items() for path in paths]
+        print(json.dumps(result, indent=2) if args.json else "\n".join(lines) or f"unchanged since saved ({LOCK})")
         return 0 if found.clean else 1
     right = read(args.other)
     left.pop(LOCK, None)
@@ -289,12 +280,9 @@ def _diff(args: argparse.Namespace) -> int:
         if left[path] != right[path]
     }
     report = {"added": sorted(set(right) - set(left)), "removed": sorted(set(left) - set(right)), "changed": changed}
-    if args.json:
-        print(json.dumps(report, indent=2))
-    else:
-        lines = [f"{label}: {path}" for label in ("added", "removed") for path in report[label]]
-        lines += [text.rstrip("\n") for text in changed.values()]
-        print("\n".join(lines) or "same files")
+    lines = [f"{label}: {path}" for label in ("added", "removed") for path in report[label]]
+    lines += [text.rstrip("\n") for text in changed.values()]
+    print(json.dumps(report, indent=2) if args.json else "\n".join(lines) or "same files")
     return 1 if report["added"] or report["removed"] or changed else 0
 
 
