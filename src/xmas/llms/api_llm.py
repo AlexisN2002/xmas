@@ -9,19 +9,22 @@ import os
 import re
 import time
 from collections.abc import Callable, Coroutine, Sequence
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 import openai
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
 from promptolution.llms import api_llm as promptolution
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 
+from xmas.budget import SLICE_S, CancelFlag, cancel_flag
 from xmas.errors import MONEY_WORDS, EmptyResponse, ErrorKind, XmasError
 from xmas.llms.call_log import CallLog, CallRecord
-from xmas.llms.meta import CallMeta, TokenPrice, meta_from_completion
+from xmas.llms.meta import CallMeta, TokenPrice, cut_meta, meta_from_completion
 from xmas.llms.parts import Part, has_media, record_text, to_content
 from xmas.llms.scoring import ScoredSequence
 from xmas.media import Capabilities
@@ -34,6 +37,23 @@ from xmas.utils import approximate_tokens, error_message, retry_after_seconds, t
 # prompt of a batch runs as its own task). Delete it, _Completion and the two hook
 # overrides once promptolution returns the completion.
 _completion_id: ContextVar[list[str | None] | None] = ContextVar("xmas_completion_id", default=None)
+
+_STREAM = {"stream": True, "stream_options": {"include_usage": True}}
+"""What a streamed request adds to the request, after its other keys."""
+
+
+@dataclass
+class _Progress:
+    """What one streamed attempt sent and has received so far, for the meta of a call cut before it finished."""
+
+    messages: list[dict[str, Any]] | None = None
+    text: list[str] = field(default_factory=list)
+    model: str | None = None
+
+
+# _ask's thread sets an attempt's progress; the request coroutine, scheduled from
+# that thread, runs in a copy of its context and fills it.
+_progress: ContextVar[_Progress | None] = ContextVar("xmas_progress", default=None)
 
 _IMAGE_MODALITIES = ("image", "text")
 """What an image request asks for: OpenRouter's ``modalities``, images first."""
@@ -67,9 +87,16 @@ class APILLM(promptolution.APILLM):
     answer again with promptolution's attempt count and backoff, unless the model
     was cut or refused; every paid attempt is summed into the meta.
 
+    A call made in a run ends within a moment once the run is stopped
+    (:func:`~xmas.budget.cancel_flag`): the request is cancelled, which closes
+    its connection, and :class:`~xmas.errors.Stopped` carries what the call
+    used. Only a streamed call (``stream=True``) keeps the answer received
+    before the cut.
+
     Attributes:
         full_response: Whether the engine reads this model through
             :meth:`generate_with_meta` and :meth:`get_tool_response_meta`.
+        stream: Whether requests ask for the answer as a stream of chunks.
         price: The price used for a call whose response reports no cost.
         accepts: The kinds the model reads, as stated: ``"text"``, and
             ``"image"`` or ``"audio"`` for a model that sees or hears.
@@ -88,6 +115,7 @@ class APILLM(promptolution.APILLM):
         price: TokenPrice | None = None,
         accepts: Sequence[str] = ("text",),
         produces: Sequence[str] = ("text",),
+        stream: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the model.
@@ -108,6 +136,10 @@ class APILLM(promptolution.APILLM):
             accepts: The kinds the model reads; a MAS sends media only to a
                 model that accepts their kind.
             produces: The kinds the model answers with.
+            stream: ``True`` adds ``"stream": true`` and ``"stream_options":
+                {"include_usage": true}`` to each request and builds the
+                answer from its chunks, so a cut call keeps its text so far;
+                ``False`` sends promptolution's request unchanged.
             **kwargs: Forwarded to promptolution's ``APILLM``.
 
         Raises:
@@ -123,6 +155,7 @@ class APILLM(promptolution.APILLM):
         self.backend_tag = backend_tag
         self.full_response: bool = not _overrides_call_path(type(self)) if full_response is None else full_response
         self.price = price
+        self.stream = stream
         stated = Capabilities.parse({"accepts": accepts, "produces": produces}, "APILLM")
         self.accepts, self.produces = stated.accepts, stated.produces
         api_key = api_key or os.environ.get("XMAS_API_KEY")
@@ -172,11 +205,16 @@ class APILLM(promptolution.APILLM):
         params.update(self._call_kwargs)
         # Headers can carry credentials, so they never reach a record.
         params.pop("extra_headers", None)
+        if self.stream:
+            params.update(_STREAM)
         return params
 
     async def _ainvoke_once(self, prompt: str, system_prompt: str) -> ChatCompletion:
-        """Make one request, noting the provider's completion id for the caller."""
-        completion = await super()._ainvoke_once(prompt, system_prompt)
+        """Make one request, promptolution's or streamed, noting the provider's completion id for the caller."""
+        if self.stream:
+            completion = await self._send(self._request(prompt, system_prompt))
+        else:
+            completion = await super()._ainvoke_once(prompt, system_prompt)
         slot = _completion_id.get()
         if slot is not None:
             slot[0] = completion.id
@@ -440,18 +478,20 @@ class APILLM(promptolution.APILLM):
         needs a choice, and its text may be empty when it calls tools or
         finished cleanly. An empty answer
         that was cut or refused raises at once, since the same request would
-        only repeat it.
+        only repeat it. Inside a metered call the waits end once the call's
+        :func:`~xmas.budget.cancel_flag` is set (:meth:`_wait`).
         """
         paid: CallMeta | None = None
+        flag = cancel_flag()
         for attempt in range(self.max_retries + 1):
             started = time.perf_counter()
-            deadline = self.gather_timeout_s + 5.0  # as long as promptolution's _get_response waits for a batch
-            future = asyncio.run_coroutine_threadsafe(send(), self._loop)
+            progress = _Progress()
+            token = _progress.set(progress)
             try:
-                completion: ChatCompletion = future.result(timeout=deadline)
-            except FuturesTimeout:
-                future.cancel()
-                raise TimeoutError(f"{what} timed out after {deadline}s") from None
+                future = asyncio.run_coroutine_threadsafe(send(), self._loop)
+            finally:
+                _progress.reset(token)
+            completion = self._wait(future, what, flag, started, progress, paid)
             meta = meta_from_completion(completion, time.perf_counter() - started, self.price)
             paid = meta if paid is None else paid.combine(meta)
             if completion.choices:
@@ -470,8 +510,49 @@ class APILLM(promptolution.APILLM):
                 if tool_turn or not empty:
                     return completion, paid
             if attempt < self.max_retries:
-                time.sleep(self.retry_base_delay_s * (2**attempt))
+                delay = self.retry_base_delay_s * (2**attempt)
+                if flag is None:
+                    time.sleep(delay)
+                elif flag.wait(delay):
+                    flag.check(paid)
         raise EmptyResponse(f"Empty content from model after {self.max_retries + 1} attempts", meta=paid)
+
+    def _wait(
+        self,
+        future: Future[ChatCompletion],
+        what: str,
+        flag: CancelFlag | None,
+        started: float,
+        progress: _Progress,
+        paid: CallMeta | None,
+    ) -> ChatCompletion:
+        """Wait for one attempt until promptolution's batch deadline, checking ``flag`` every :data:`SLICE_S`.
+
+        Raises:
+            Stopped: Once ``flag`` is set; the request is cancelled, and the
+                error carries the paid attempts plus the cut one's meta
+                (:func:`~xmas.llms.meta.cut_meta`) and the text it received.
+            TimeoutError: If the attempt outlives the deadline.
+        """
+        deadline = self.gather_timeout_s + 5.0  # as long as promptolution's _get_response waits for a batch
+        ends = time.monotonic() + deadline
+        while True:
+            try:
+                return future.result(timeout=deadline if flag is None else min(SLICE_S, ends - time.monotonic()))
+            except FuturesTimeout:
+                if flag is not None and flag.is_set():
+                    future.cancel()
+                    received = "".join(progress.text)
+                    tokens = (
+                        None
+                        if progress.messages is None
+                        else _turn_usage(approximate_tokens, progress.messages, received, [])
+                    )
+                    cut = cut_meta(time.perf_counter() - started, tokens, progress.model, self.price)
+                    flag.check(cut if paid is None else paid.combine(cut), received)
+                if flag is None or time.monotonic() >= ends:
+                    future.cancel()
+                    raise TimeoutError(f"{what} timed out after {deadline}s") from None
 
     async def _retrying(self, send: Callable[[], Coroutine[Any, Any, ChatCompletion]]) -> ChatCompletion:
         """Await ``send()``, retrying with promptolution's backoff unless the error is permanent."""
@@ -494,15 +575,34 @@ class APILLM(promptolution.APILLM):
         403 "Key limit exceeded", 429 "insufficient_quota"), which asking again
         only repeats. Connection errors, timeouts, 5xx and a plain 429 are retried.
         """
+        return await self._retrying(lambda: self._send(kwargs))
 
-        async def send() -> ChatCompletion:
-            async with self._sem:
-                completion: ChatCompletion = await asyncio.wait_for(
-                    self.client.chat.completions.create(**kwargs), timeout=self.call_timeout_s
-                )
+    async def _send(self, kwargs: dict[str, Any]) -> ChatCompletion:
+        """Make one request in a slot of promptolution's semaphore, within its per-call timeout."""
+        async with self._sem:
+            return await asyncio.wait_for(self._completion(kwargs), timeout=self.call_timeout_s)
+
+    async def _completion(self, kwargs: dict[str, Any]) -> ChatCompletion:
+        """Send ``kwargs``; when streaming, with :data:`_STREAM` added, the chunks assembled (:func:`assemble`)."""
+        if not self.stream:
+            completion: ChatCompletion = await self.client.chat.completions.create(**kwargs)
             return completion
-
-        return await self._retrying(send)
+        progress = _progress.get() or _Progress()
+        progress.messages = kwargs["messages"]
+        progress.text.clear()  # a retry starts its answer anew
+        chunks: list[ChatCompletionChunk] = []
+        stream = await self.client.chat.completions.create(
+            **kwargs, stream=True, stream_options={"include_usage": True}
+        )
+        try:
+            async for chunk in stream:
+                chunks.append(chunk)
+                progress.model = chunk.model or progress.model
+                if chunk.choices and chunk.choices[0].delta.content:
+                    progress.text.append(chunk.choices[0].delta.content)
+        finally:
+            await stream.close()
+        return assemble(chunks)
 
     @property
     def model(self) -> str:
@@ -550,6 +650,61 @@ class APILLM(promptolution.APILLM):
             scored_tokens=scored.token_count,
         )
         return scored
+
+
+def assemble(chunks: Sequence[ChatCompletionChunk]) -> ChatCompletion:
+    """Build the chat completion a streamed answer's chunks make, as the provider would have sent it whole.
+
+    The text, refusal and each tool call's arguments are joined (calls by
+    their index), OpenRouter's ``images`` collected; the finish reason, usage,
+    a top-level ``cost``, the model and the id are the last ones sent. A
+    stream with no text has ``None`` content, as a whole answer without any.
+    """
+    text: list[str] = []
+    refusal: list[str] = []
+    calls: dict[int, dict[str, Any]] = {}
+    images: list[Any] = []
+    body: dict[str, Any] = {"id": "", "object": "chat.completion", "created": 0, "model": ""}
+    finish: str | None = None
+    chose = False
+    for chunk in chunks:
+        body.update(
+            id=chunk.id or body["id"], created=chunk.created or body["created"], model=chunk.model or body["model"]
+        )
+        extra = chunk.model_extra or {}
+        if "cost" in extra:
+            body["cost"] = extra["cost"]
+        if chunk.usage is not None:
+            body["usage"] = chunk.usage.model_dump()
+        if not chunk.choices:
+            continue
+        chose = True
+        choice = chunk.choices[0]
+        delta = choice.delta
+        text.append(delta.content or "")
+        refusal.append(delta.refusal or "")
+        images.extend((delta.model_extra or {}).get("images") or [])
+        for call in delta.tool_calls or []:
+            entry = calls.setdefault(
+                call.index, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            entry["id"] = call.id or entry["id"]
+            entry["type"] = call.type or entry["type"]
+            if call.function is not None:
+                entry["function"]["name"] += call.function.name or ""
+                entry["function"]["arguments"] += call.function.arguments or ""
+        finish = choice.finish_reason or finish
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(text) or None,
+        "refusal": "".join(refusal) or None,
+    }
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    if images:
+        message["images"] = images
+    body["choices"] = [{"index": 0, "finish_reason": finish, "message": message}] if chose else []
+    return ChatCompletion.construct(**body)
 
 
 def _image_urls(message: ChatCompletionMessage) -> list[str]:
