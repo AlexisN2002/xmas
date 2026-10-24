@@ -91,7 +91,10 @@ cost, finish reason and served model on the agent's record, as tool turns
 already do; a subclass that overrides a hook of promptolution's path keeps that
 path, and `full_response=False` keeps it for any model. `APILLM(price=TokenPrice(...))` prices the tokens of a call
 whose response reports no cost; without a price, that cost stays unknown
-(`None`), never `0`.
+(`None`), never `0`. `APILLM(accepts=("text", "image"), produces=("text",))`
+states what the model takes and gives (see Version 2: media values); a
+prompt with a picture or a sound goes out as content parts, and a prompt
+without one keeps its exact request bytes.
 
 ::: xmas.llms.api_llm.APILLM
 
@@ -108,6 +111,14 @@ carries the HTTP `status` when there is one.
 ::: xmas.llms.meta.TokenPrice
 
 ::: xmas.llms.meta.CallMeta
+
+::: xmas.llms.meta
+    options:
+      members:
+        - SupportsParts
+        - SupportsImages
+        - supports_parts
+        - supports_images
 
 ## Tools
 
@@ -153,7 +164,7 @@ version 2 system can do:
   json value or a list reaches a prompt as one line of JSON, and a list may be
   read where json is declared (`fits`). `check_value` checks every item of a
   list; an item may be `null`. Images, audio, documents, tables and files are
-  type words the format knows, but the check refuses them.
+  values too, passed by reference (see Version 2: media values).
 - **Answer forms.** `Agent(..., output_type="json", schema={...})` makes the
   agent answer in JSON. Its prompt ends with format lines no optimizer can
   drop; an answer that does not fit gets exactly one retry, then the run fails
@@ -177,8 +188,9 @@ A version 2 spec (`version: 2`) has the keys `inputs`, `outputs`, `agents`
 (`model`, `prompt`, `for each`, `reads`, `writes: {name: type}`, `tools`,
 `schema`, `retry`), `steps` (`uses`, `for each`, `reads`, `writes`, `retry`),
 `boxes` (`for each`, `reads`, `writes`, `system`), `edges` (a string is a
-chain of edges, `a -> b -> c`), `state`, `frozen`, `health`, `callables` (what
-each callable reads and writes), `default_model` and `prompts`. An agent's
+chain of edges, `a -> b -> c`), `state`, `frozen`, `health`, `models` (what
+each named model accepts and produces), `callables` (what each callable reads
+and writes), `default_model` and `prompts`. An agent's
 `reads` is a list of values or a map `{placeholder: value}`; its `prompt` names
 an entry of `prompts` that several agents may share, by default its own name.
 Models
@@ -208,6 +220,11 @@ system whose inputs are not exactly `{query: text}` (`run_state(values)` runs it
         - check_value
         - fits
         - render_value
+        - FILE
+        - MEDIA
+        - media_kind
+        - plain
+        - coerce_media
 
 ::: xmas.schemas
     options:
@@ -354,6 +371,112 @@ one prompt, through the first agent that shares it, unless one of them is frozen
         - find_chains
         - collapse
         - ITEM_BUDGET_KEYS
+
+## Version 2: media values
+
+A value of type `image`, `audio`, `document`, `table` or `file`, or a list of
+them, is a `Ref`: a location, a media type, a size and a sha256. State,
+records and traces hold refs, never bytes; `Trace.to_dict()` writes each ref
+as its `to_dict()`. `run_state` turns a `Path` input into `Ref.from_path` (a
+reference to your file, whose checksum `read_bytes` checks on every read). A
+step that returns a `Path` writes a copy into the store; a `Ref` passes; bytes
+are refused ("return a Path or a Ref, Ref.from_bytes stores bytes"). A model's
+pictures and an MCP tool's image, audio and blob blocks go to the store too
+(`MCPTools(..., writes={"paint": {"png": "image"}})`). The store is
+`FileStore(XMAS_STORE)`, by default `~/.cache/xmas/store`, read on every
+call and never a spec key; it writes `<root>/<sha[:2]>/<sha><ext>` once,
+through a temporary file.
+
+**Capabilities.** What a model takes and gives comes from the first of: the
+system's `models` entry for its binding name (`MAS(..., models={...})` or a
+spec's `models: {vision-model: {accepts: [image]}}`), the model object's
+`accepts` and `produces` attributes, or text only. `MAS.capabilities(agent)`
+answers it. A `models` entry holds `accepts` and `produces` only. Text and
+json are always taken and given. `check_system` reports, among its other
+problems:
+
+- `agent 'judge' reads image 'png', but model 'text-model' accepts only text;
+  bind a model that accepts image (models: {text-model: {accepts: [image]}})
+  or convert it first with a step`; for the default model the fix reads
+  `give it accepts = ("text", "image")`.
+- `agent 'writer' reads document 'house'; a model reads a document through a
+  conversion step, such as one using xmas.convert.document_text` (a table:
+  `table_rows`). A `file` read reaches the prompt as the ref's JSON line.
+- `agent 'painter' writes image 'picture', but model 'text-model' produces
+  only text; bind a model that produces image (models: {text-model:
+  {produces: [image]}})`, and `agent 'painter' writes image and has tools; an
+  image answer takes none`. An agent writing audio, a document, a table or a
+  file is refused: a model answers with text, json or image.
+- `model 'vision-model' accepts image but cannot send content parts; use
+  APILLM, or give it generate_parts_with_meta and full_response = True`, and
+  the same for `produces image but cannot answer with images` and
+  `generate_image_with_meta`. A subclass of `APILLM` that overrides a hook of
+  promptolution's path has `full_response` false and is refused here.
+- `models names 'x', which no agent binds`; `models entry 'x' has key
+  'temperature'; it takes accepts and produces (model parameters come with the
+  .mas bundle)`; `models entry 'x' accepts
+  'video'; a model may accept image, audio`.
+- `step 'draw' passes image 'png' to remote tool 'paint'; remote tools read no
+  media`.
+
+**Parts.** An agent that reads an image or audio renders its prompt with
+`render_parts`: the text as `safe_format` gives it, with each ref in its
+place. A list labels its items `[pages 0]`, `[pages 1]`, ... (0-based, as
+`item`), and a `None` item reads `(none)`. The record's `rendered_prompt`
+holds `marker` lines such as `[image slide-1.png, image/png, 182 KB]` in place
+of the refs, and its `inputs` the refs' JSON lines; a json agent's format lines
+join the last text part. `to_content` makes the request content (a data URI or
+the URL of a remote image, `input_audio` for wav and mp3) and refuses a part
+over `MAX_PART_BYTES`. A tool agent sends the parts in its first message. An
+agent with `output_type="image"` calls `generate_image_with_meta`; an `image`
+write needs exactly one picture and a `list of image` at least one, else the
+answer is `bad_format`.
+
+**Conversions.** `xmas.convert.document_text` (text, Markdown and HTML) and
+`table_rows` (CSV and TSV) are callables a step uses, so a model reads a
+document or a table only through a visible node. Any other type is refused
+with a message that asks for a step of your own.
+
+::: xmas.media
+    options:
+      members:
+        - Ref
+        - Store
+        - FileStore
+        - store
+        - Kind
+        - Image
+        - Audio
+        - Document
+        - Table
+        - File
+        - Capabilities
+        - TEXT_ONLY
+        - MEDIA_KINDS
+        - DOCUMENT_TYPES
+        - TABLE_TYPES
+        - ACCEPTABLE
+        - PRODUCIBLE
+        - MAX_PART_BYTES
+        - kind_of
+        - fits_kind
+
+::: xmas.llms.parts
+    options:
+      members:
+        - Part
+        - render_parts
+        - record_text
+        - marker
+        - has_media
+        - to_content
+        - content_text
+
+::: xmas.convert
+    options:
+      members:
+        - document_text
+        - table_rows
 
 ## Prompts
 
