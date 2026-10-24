@@ -324,8 +324,9 @@ def _wrap(
     on, and the retries it used: a kind the node's ``retry`` names runs the body
     again, on the same visit meter, while attempts are left. A visit that raises
     gets a failed record (:func:`_failed_record`) holding every paid call,
-    unless the error ends the run (:data:`~xmas.errors.RUN_ENDS`). When an
-    error edge routes the error's kind, the visit takes it and writes only
+    unless the error ends the run (:data:`~xmas.errors.RUN_ENDS`); a visit a
+    stop cut after it made a call keeps one, with what its calls used and the
+    answer received before the cut. When an error edge routes the error's kind, the visit takes it and writes only
     ``error`` (``{kind, message, node}``, when ``writes_error``); otherwise the
     error goes on. Version 1 raises.
 
@@ -377,14 +378,19 @@ def _wrap(
             raise
         except Exception as error:
             kind = _kind_of(error)
-            if mas.version != 2 or kind in RUN_ENDS:
-                meter.emit("end", name, status="failed", **here)
+            stopped = kind is ErrorKind.STOPPED
+            cut = stopped and bool(visit.metas or visit.inner)
+            if mas.version != 2 or (kind in RUN_ENDS and not cut):
+                meter.emit("end", name, status="stopped" if stopped else "failed", **here)
                 raise
-            target = None if decision is None else decision.on_error(kind)
+            target = None if decision is None or cut else decision.on_error(kind)
             record = _failed_record(mas, name, error, kind, time.perf_counter() - started, target, visit)
             record = dataclasses.replace(record, **here, retries=used.total())
+            if cut:  # the answer received before the cut
+                record = dataclasses.replace(record, raw_response=getattr(error, "text", ""))
             meter.keep(record, mas)
-            meter.emit("end", name, status="failed" if target is None else "routed", cost_usd=record.cost_usd, **here)
+            status = "stopped" if stopped else "failed" if target is None else "routed"
+            meter.emit("end", name, status=status, cost_usd=record.cost_usd, **here)
             if target is None:
                 raise
             routed: dict[str, Any] = {"records": [record], "routes": {name: [target]}}

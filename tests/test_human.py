@@ -18,6 +18,7 @@ from langgraph.checkpoint.serde.event_hooks import SerdeEvent, register_serde_ev
 from tests.conftest import MockLLM, SeeingLLM, req
 from xmas import MAS, Agent, Box, Budget, runtime
 from xmas.edges import Edge, EdgeKind
+from xmas.errors import ErrorKind, Stopped
 from xmas.graph import END
 from xmas.human import Human, Question, ReplayAsker
 from xmas.nodes import Step
@@ -599,3 +600,19 @@ def test_a_model_without_parts_fails_clearly(png: Path) -> None:
     llm.full_response = False  # after the check: the parts path is off when the run calls it
     trace = mas.run_state({"page": png})
     assert trace.status == "failed" and "SeeingLLM cannot send pictures or sound" in str(trace.error)
+
+
+def test_a_stopped_visit_keeps_its_record() -> None:
+    """P3: through MAS.stop; here the model raises the stop on the visit's second call."""
+    llm = MockLLM(answers=["not json", Stopped("stopped")], meta=True)
+    events: list[Event] = []
+    mas = MAS([Agent("judge", "Judge {query}", "verdict", output_type="json")], llm=llm)
+    trace = mas.run_state({"query": "q"}, on_event=events.append)
+    assert trace.status == "stopped"
+    (record,) = trace.records
+    assert (record.error_kind, record.cost_usd, record.route) == (ErrorKind.STOPPED, 0.01, None)
+    assert [(e.kind, e.status) for e in events] == [("start", None), ("end", "stopped")]
+    refused = MAS(
+        [Agent("judge", "Judge {query}", "verdict", output_type="json")], llm=MockLLM(answers=[Stopped("stopped")])
+    )
+    assert refused.run_state({"query": "q"}).records == ()  # no call made, no record
