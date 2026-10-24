@@ -11,16 +11,18 @@ Note:
 """
 
 from xmas.agent import Agent
-from xmas.budget import Budget
+from xmas.budget import Budget, CancelFlag, cancel_flag, contestant
 from xmas.chains import ForEach
 from xmas.edges import Edge, EdgeKind
-from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, RunStatus
+from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, RaceLost, RunStatus, Stopped
 from xmas.graph import END, START
 from xmas.health import Health, HealthSettings
+from xmas.human import Asker, Human, Pause, Question, ReplayAsker, answer_value
 from xmas.llms import APILLM, ScoredSequence
 from xmas.mas import MAS
 from xmas.media import Audio, Capabilities, Document, File, Image, Ref, Table
 from xmas.nodes import Box, Step
+from xmas.store import Store as RunStore
 from xmas.tasks import GSM8KTask, MASTask
 from xmas.trace import AgentRecord, Event, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType
@@ -36,11 +38,13 @@ __all__ = [
     "TEXT",
     "Agent",
     "AgentRecord",
+    "Asker",
     "Audio",
     "BadFormat",
     "Box",
     "Budget",
     "BudgetExceeded",
+    "CancelFlag",
     "Capabilities",
     "Document",
     "Edge",
@@ -52,16 +56,26 @@ __all__ = [
     "GSM8KTask",
     "Health",
     "HealthSettings",
+    "Human",
     "Image",
     "MASTask",
+    "Pause",
+    "Question",
+    "RaceLost",
     "Ref",
+    "ReplayAsker",
     "RunStatus",
+    "RunStore",
     "ScoredSequence",
     "Step",
+    "Stopped",
     "Table",
     "TokenUsage",
     "ToolCall",
     "Trace",
     "ValueType",
     "__version__",
+    "answer_value",
+    "cancel_flag",
+    "contestant",
 ]
