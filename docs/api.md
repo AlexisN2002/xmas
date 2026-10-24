@@ -74,6 +74,7 @@ which retries every error.
         - BudgetExceeded
         - Stopped
         - RaceLost
+        - Unanswered
         - EmptyResponse
         - BadFormat
         - classify
@@ -510,10 +511,10 @@ question answered or past its deadline. The budget counts on from the pause
 human's record and `waited_s` in health. A question past its deadline takes its
 `default`, with `timed_out` true. An `Asker` (`MAS(..., asker=...)`) is asked
 once per question and may answer at once; `withdraw(question, reason)` is
-called for each open question of a paused run that is stopped. `run`,
+called for each open question of a run that is stopped, paused or running. `run`,
 `run_batch`, `predict` and the optimizers never wait: an open question takes its
-default, else the run fails with "human node 'x' got no answer in an unattended
-run". `ReplayAsker(traces)` answers from recorded human records.
+default, else the run fails with `Unanswered: human node 'x' got no answer in an
+unattended run`, from a chain item or a box too. `ReplayAsker(traces)` answers from recorded human records.
 
 The **run store** (`MAS(..., store=RunStore(path))`, a path, or `XMAS_RUNS`;
 in memory by default) is a LangGraph checkpoint saver on one SQLite file, its
@@ -531,13 +532,16 @@ sees the stop on its `cancel_flag()` and is cut (`Stopped`, with the paid
 event is emitted, and a visit cut after a call keeps a failed record. A paused
 run is marked stopped instead; `False` means no such run is running or paused.
 A run id given to `run_state` that is running ("is in use by a running run") or
-kept in the store ("is taken") is refused. `APILLM(stream=True)` streams, so a
+kept in the store ("is taken") is refused, and so is a `/` in the id of a run
+that can pause, since it names the threads of the run's items and boxes. `APILLM(stream=True)` streams, so a
 cut call keeps its partial answer; the default request is unchanged.
 
 **`first of`** edges (`EdgeKind.FIRST`, `a -> b: first of` in a spec) from one
 node form a race of agents, steps or boxes that write the same values and go on
-to one node or all end the run. Each contestant runs under
-`contestant(meter.race(key))`, the key being the source, the item and the visit;
+to one node or all end the run; a box holding a human does not race. Each
+contestant runs under
+`contestant(meter.race(key))`, the key being the run (each box visit and chain
+item has its own), the source, the item and the visit;
 the first to finish wins (`RunMeter.win`) and writes, the others are cut
 (`RaceLost`) or their writes dropped, and each keeps a record with `lost` set
 and its paid cost, its `end` event `lost`. A contestant that fails goes no

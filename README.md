@@ -717,7 +717,8 @@ A person answers in one of four forms:
 Every answer also holds `who`, `asked_at`, `answered_at`, `comment` and `timed_out`. The
 question and the labels may name the node's reads, paths too, such as `{plan.title}`. The
 visit keeps a record of kind `human`: what was shown, the answer as `raw_response`, a cost
-of 0 and the wait in `wait_s`.
+of 0 and the wait in `wait_s`. An edited value must have the type of the value it
+replaces, and a host's `answered_at` is an ISO time with its zone.
 
 A pause outlives the process when the run store is a file: `MAS(..., store="runs.db")`,
 or the variable `XMAS_RUNS`. A new process builds the same system and calls `resume`. A
@@ -729,7 +730,7 @@ time. By default the store is in memory, so a run resumes in the same process on
 whose `ask(question)` answers at once or returns `None`. It may also have
 `withdraw(question, reason)`, called when a paused run is stopped. `run`, `run_batch` and
 the optimizers never wait: a question the asker leaves open takes its default, or the run
-fails and names the node. `ReplayAsker(traces)` answers from recorded runs, so an
+fails and names the node, from inside a chain item or a box too. `ReplayAsker(traces)` answers from recorded runs, so an
 optimizer can rerun a system with people in it.
 
 ## Stop
@@ -753,7 +754,8 @@ print(trace.status, trace.error)  # stopped Stopped: stopped
 
 The trace comes back within moments of the Stop and keeps every record so far. A visit
 cut after a call keeps a failed record with what its calls used. No `on error` edge
-catches a stop. A paused run is marked stopped, and its open questions are withdrawn.
+catches a stop. A paused run is marked stopped, and its open questions are withdrawn,
+as are those of a run stopped while it runs.
 
 A Python step, a promptolution batch call or an MCP tool call is not cut. The run ends
 at the next boundary after it, and a step may poll `xmas.cancel_flag()` to end early.
@@ -785,6 +787,7 @@ All `first of` edges of one node form one race. The winner's writes stand. The o
 calls are cut, and each loser keeps a record with `lost` set and what it paid. A step
 that races cannot be cut: it runs to its end, and its writes are dropped. Contestants
 write the same values and go on to the same node, which runs once, or all end the run.
+A box with a person inside does not race: a contestant never waits for an answer.
 If every contestant fails, the race fails with the last failure. Inside a `for each`
 chain, each item races on its own.
 
