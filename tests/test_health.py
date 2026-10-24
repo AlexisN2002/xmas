@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from xmas.budget import Budget, RunMeter
 from xmas.errors import ErrorKind
 from xmas.health import Flag, Health, HealthSettings, summarize
@@ -22,7 +24,7 @@ def rec(
     error_kind: ErrorKind | None = None,
     **later: Any,
 ) -> AgentRecord:
-    """Build a record; ``later`` sets the other fields (rejected, error, route, capped)."""
+    """Build a record; ``later`` sets the other fields (rejected, error, route, capped, item, ...)."""
     outputs = {} if output is None else {"out": output}
     return AgentRecord(agent, step, prompt, prompt, inputs or {}, outputs, error_kind=error_kind, **later)
 
@@ -126,6 +128,47 @@ def test_a_healthy_run_reports_nothing() -> None:
     healthy = summarize([rec("w", 0, "a draft", prompt="Write {query}", inputs={"query": "cats"}), rec("j", 1, "ok")])
     assert healthy == Health()
     assert healthy.to_dict() == {}
+
+
+def test_items_and_item_budgets_are_flagged_per_chain() -> None:
+    def page(
+        agent: str, step: int, output: str | None, item: int, cost: float | None = 0.02, **later: Any
+    ) -> AgentRecord:
+        return rec(agent, step, output, item=item, item_key=f"p{item}", latency_s=50.0, cost_usd=cost, **later)
+
+    records = [
+        page("drafter", 0, "draft A", 0),
+        page("checker", 1, "fits", 0),
+        page("drafter", 2, "draft A", 1),  # the same text as item 0's draft: another item, not stuck
+        page("checker", 3, None, 1, error_kind=ErrorKind.OUTAGE, error="ConnectionError: down", cost=None),
+        page("drafter", 4, "draft B", 2),
+        page("checker", 5, "refit", 2, route=("drafter",)),
+        page("drafter", 6, "draft B", 2),  # the same text within item 2: stuck
+        page("checker", 7, "fits", 2),
+        rec("assemble", 8, "deck"),
+    ]
+    budget = {"cost_usd": 0.05, "wall_s": 120.0}
+    chains = {"drafter": (["drafter", "checker"], budget), "captioner": (["captioner"], {})}
+    health = summarize(records, chains=chains)
+    assert [(flag.signal, flag.node, flag.step, flag.detail) for flag in health.flags] == [
+        ("item_failed", "checker", 3, "item 1 (p1) failed: outage: ConnectionError: down"),
+        ("stuck", "drafter", 6, "the same output as step 4"),
+        ("item_over_budget", "checker", 7, "item 2 (p2) cost 0.08 USD, over its budget of 0.05"),
+        ("item_over_budget", "checker", 7, "item 2 (p2) took 200 s, over its budget of 120"),
+    ]
+    assert health.items == {
+        "drafter": {"items": 3, "failed": 1, "cost_usd": [0.04, None, pytest.approx(0.08)]},
+        "captioner": {"items": 0, "failed": 0, "cost_usd": []},
+    }
+    data = summarize(records[:2], chains={"drafter": chains["drafter"]}).to_dict()
+    assert data == {"items": {"drafter": {"items": 1, "failed": 0, "cost_usd": [0.04]}}}
+    assert json.loads(json.dumps(data)) == data
+
+    alone = summarize(records)  # no chain given: item failures still flag, no item report
+    assert [flag.signal for flag in alone.flags] == ["item_failed", "stuck"]
+    assert alone.items == {}
+    assert "items" not in alone.to_dict()
+    assert summarize(records[:2]).to_dict() == {}
 
 
 def test_list_values_check_and_fit() -> None:

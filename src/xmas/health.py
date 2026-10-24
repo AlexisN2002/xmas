@@ -1,20 +1,21 @@
 """Health: what looked wrong in a finished run, read from its records.
 
 :func:`summarize` runs at the end of every run and never changes it: a flag is
-information for the person reading the trace, not a rule. It reads three things:
+information for the person reading the trace, not a rule. It reads four things:
 
 - per record, a :class:`Flag` for each signal it shows, in this order: ``retried``,
-  ``bad_format``, ``error_routed``, ``empty``, ``stuck``, ``unfilled``, ``leak``,
-  ``long``, ``short``;
+  ``bad_format``, ``error_routed``, ``item_failed``, ``empty``, ``stuck``,
+  ``unfilled``, ``leak``, ``long``, ``short``, ``item_over_budget``;
 - per ``while`` edge, how often the loop was taken and whether its cap was hit;
-- per run, each limit the budget sets, with what the run spent of it.
+- per run, each limit the budget sets, with what the run spent of it;
+- per ``for each`` chain, its items, the failed ones and what each cost.
 """
 
 from __future__ import annotations
 
 import re
 import statistics
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -93,11 +94,15 @@ class Health:
             ``{"taken": n, "cap_hit": bool}``.
         budget: Per limit the budget sets (``"calls"``, ``"cost_usd"``,
             ``"wall_s"``): ``{"spent": x, "limit": y}``.
+        items: Per ``for each`` chain, keyed by its head: ``{"items": n,
+            "failed": k, "cost_usd": [...]}``, one cost per item in item order,
+            ``None`` where a record's cost is unknown.
     """
 
     flags: tuple[Flag, ...] = ()
     loops: dict[str, dict[str, Any]] = field(default_factory=dict)
     budget: dict[str, dict[str, float]] = field(default_factory=dict)
+    items: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form with only the parts that report something; empty for a healthy run."""
@@ -108,6 +113,8 @@ class Health:
             data["loops"] = {edge: dict(entry) for edge, entry in self.loops.items()}
         if self.budget:
             data["budget"] = {limit: dict(entry) for limit, entry in self.budget.items()}
+        if self.items:
+            data["items"] = {head: {**entry, "cost_usd": list(entry["cost_usd"])} for head, entry in self.items.items()}
         return data
 
 
@@ -118,6 +125,7 @@ def summarize(
     settings: HealthSettings | None = None,
     while_edges: Iterable[tuple[str, str]] = (),
     values: Iterable[str] | None = None,
+    chains: Mapping[str, tuple[Sequence[str], Mapping[str, float]]] | None = None,
 ) -> Health:
     """Read a run's records, in run order, for the health signals.
 
@@ -126,12 +134,17 @@ def summarize(
     ``(source, target)`` loops. ``values`` are the system's value names: a
     placeholder naming none of them is literal prompt text, so it is not
     ``unfilled``; when ``None``, every placeholder outside a record's inputs is.
+    ``chains`` maps each chain's head to its nodes and its item budget
+    (``cost_usd``, ``wall_s``); an item over a limit is flagged on its last
+    record, and an unknown cost or latency is never over.
     """
     settings = settings or HealthSettings()
+    items, over = _items(records, chains or {})
     return Health(
-        flags=_flags(records, settings, None if values is None else frozenset(values)),
+        flags=_flags(records, settings, None if values is None else frozenset(values), over),
         loops=_loops(records, while_edges),
         budget=_budget_use(meter),
+        items=items,
     )
 
 
@@ -140,20 +153,27 @@ def _text(record: AgentRecord) -> str:
     return "\n".join(record.outputs.values())
 
 
-def _flags(records: Sequence[AgentRecord], settings: HealthSettings, values: frozenset[str] | None) -> tuple[Flag, ...]:
-    """Return every record's flags, in record order."""
+def _flags(
+    records: Sequence[AgentRecord],
+    settings: HealthSettings,
+    values: frozenset[str] | None,
+    over: Mapping[int, list[tuple[str, str]]],
+) -> tuple[Flag, ...]:
+    """Return every record's flags, in record order; ``over`` holds the item budget flags by record position."""
     leaks = [re.compile(pattern) for pattern in (*DEFAULT_LEAKS, *settings.leak)]
     lengths: dict[str, list[int]] = {}
     for record in records:
         if record.error is None:
             lengths.setdefault(record.agent, []).append(len(_text(record)))
     medians = {node: statistics.median(sizes) for node, sizes in lengths.items() if len(sizes) >= settings.min_samples}
-    previous: dict[str, AgentRecord] = {}
+    previous: dict[tuple[str, int | None], AgentRecord] = {}
     flags: list[Flag] = []
-    for record in records:
-        found = _record_signals(record, previous.get(record.agent), leaks, medians.get(record.agent), settings, values)
+    for position, record in enumerate(records):
+        mine = (record.agent, record.item)
+        found = _record_signals(record, previous.get(mine), leaks, medians.get(record.agent), settings, values)
+        found += over.get(position, [])
         flags.extend(Flag(signal, record.agent, record.step, detail) for signal, detail in found)
-        previous[record.agent] = record
+        previous[mine] = record
     return tuple(flags)
 
 
@@ -172,9 +192,11 @@ def _record_signals(
     if record.error_kind == ErrorKind.BAD_FORMAT:
         found.append(("bad_format", "the answer did not match its form after the retry"))
     if record.error is not None:
-        if record.route:  # an unrouted failure ended the run, and the trace's error says so
-            kind = "unknown" if record.error_kind is None else record.error_kind.value
+        kind = "unknown" if record.error_kind is None else record.error_kind.value
+        if record.route:
             found.append(("error_routed", f"{kind}: {record.error}"))
+        elif record.item is not None:  # elsewhere an unrouted failure ended the run, and the trace's error says so
+            found.append(("item_failed", f"{_item_name(record)} failed: {kind}: {record.error}"))
         return found
     text = _text(record)
     if not text.strip():
@@ -230,3 +252,40 @@ def _budget_use(meter: RunMeter | None) -> dict[str, dict[str, float]]:
         if limit is not None:
             use[name] = {"spent": spent, "limit": limit}
     return use
+
+
+def _item_name(record: AgentRecord) -> str:
+    """Return how a flag names a record's item, such as ``item 2 (p3)``."""
+    return f"item {record.item}" + ("" if record.item_key is None else f" ({record.item_key})")
+
+
+def _total(parts: Iterable[float | None]) -> float | None:
+    """Return the sum, or ``None`` when any part is unknown."""
+    numbers = list(parts)
+    return None if None in numbers else sum(number for number in numbers if number is not None)
+
+
+def _items(
+    records: Sequence[AgentRecord], chains: Mapping[str, tuple[Sequence[str], Mapping[str, float]]]
+) -> tuple[dict[str, dict[str, Any]], dict[int, list[tuple[str, str]]]]:
+    """Return ``Health.items`` and the item budget flags keyed by the position of each item's last record."""
+    items: dict[str, dict[str, Any]] = {}
+    over: dict[int, list[tuple[str, str]]] = {}
+    for head, (nodes, budget) in chains.items():
+        by_item: dict[int, list[int]] = {}
+        for position, record in enumerate(records):
+            if record.agent in nodes and record.item is not None:
+                by_item.setdefault(record.item, []).append(position)
+        costs: list[float | None] = [None] * (max(by_item, default=-1) + 1)
+        failed = 0
+        for item, positions in by_item.items():
+            mine = [records[position] for position in positions]
+            costs[item] = cost = _total(record.cost_usd for record in mine)
+            wall = _total(record.latency_s for record in mine)
+            failed += any(record.error is not None and not record.route for record in mine)
+            for limit, spent, said in (("cost_usd", cost, "cost {:g} USD"), ("wall_s", wall, "took {:g} s")):
+                if limit in budget and spent is not None and spent > budget[limit]:
+                    detail = f"{_item_name(mine[-1])} {said.format(spent)}, over its budget of {budget[limit]:g}"
+                    over.setdefault(positions[-1], []).append(("item_over_budget", detail))
+        items[head] = {"items": len(costs), "failed": failed, "cost_usd": costs}
+    return items, over
