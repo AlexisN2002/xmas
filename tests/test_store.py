@@ -223,10 +223,11 @@ def test_swaps_with_langgraph_sqlite_saver_both_ways(tmp_path: Path, serde_event
 def test_runs_and_questions_tables(tmp_path: Path) -> None:
     store = Store(tmp_path / "runs.db")
     assert [c[1] for c in table_info(tmp_path / "runs.db", "xmas_runs")] == [
-        "run_id", "system_id", "status", "created_at", "updated_at", "paused",
+        "run_id", "system_id", "status", "created_at", "updated_at", "paused", "totals",
     ]  # fmt: skip
     assert [c[1] for c in table_info(tmp_path / "runs.db", "xmas_questions")] == [
-        "question_id", "run_id", "node", "form", "shown", "asked_at", "answered_at", "answer", "who",
+        "question_id", "run_id", "node", "form", "shown", "asked_at", "answered_at", "answer", "who", "deadline",
+        "payload",
     ]  # fmt: skip
 
     started = store.save_run("r_1", "sys-a", "running")

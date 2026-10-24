@@ -27,7 +27,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -84,7 +84,8 @@ CREATE TABLE IF NOT EXISTS xmas_runs (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    paused TEXT NOT NULL DEFAULT '[]'
+    paused TEXT NOT NULL DEFAULT '[]',
+    totals TEXT
 );
 CREATE TABLE IF NOT EXISTS xmas_questions (
     question_id TEXT PRIMARY KEY,
@@ -95,7 +96,9 @@ CREATE TABLE IF NOT EXISTS xmas_questions (
     asked_at TEXT NOT NULL,
     answered_at TEXT,
     answer TEXT,
-    who TEXT
+    who TEXT,
+    deadline TEXT,
+    payload TEXT
 );
 CREATE INDEX IF NOT EXISTS xmas_questions_run ON xmas_questions (run_id);
 """
@@ -145,6 +148,9 @@ class RunRow:
         created_at: When the row was first saved, ISO UTC.
         updated_at: When it was last saved, ISO UTC.
         paused: The ids of the questions the run waits on.
+        totals: What the run had used when it was last saved, as
+            :meth:`~xmas.budget.RunMeter.totals` gives it, so a resumed run's
+            budget counts on; ``None`` until saved.
     """
 
     run_id: str
@@ -153,6 +159,7 @@ class RunRow:
     created_at: str
     updated_at: str
     paused: tuple[str, ...] = ()
+    totals: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +176,8 @@ class QuestionRow:
         answered_at: When it was answered, ISO UTC; ``None`` while open.
         answer: The answer; ``None`` while open.
         who: Who answered; ``None`` while open or for a default taken on timeout.
+        deadline: When the question's default is taken, ISO UTC; ``None`` without a timeout.
+        payload: The whole question as :meth:`~xmas.human.Question.to_dict` gives it.
     """
 
     question_id: str
@@ -180,6 +189,8 @@ class QuestionRow:
     answered_at: str | None = None
     answer: dict[str, Any] | None = None
     who: str | None = None
+    deadline: str | None = None
+    payload: dict[str, Any] | None = None
 
 
 class Store(BaseCheckpointSaver[str]):
@@ -356,14 +367,21 @@ class Store(BaseCheckpointSaver[str]):
 
     # Runs and questions
 
-    def save_run(self, run_id: str, system_id: str, status: str, paused: Sequence[str] = ()) -> RunRow:
-        """Create or update a run's row; ``created_at`` stays as first saved."""
+    def save_run(
+        self,
+        run_id: str,
+        system_id: str,
+        status: str,
+        paused: Sequence[str] = (),
+        totals: Mapping[str, Any] | None = None,
+    ) -> RunRow:
+        """Create or update a run's row; ``created_at`` stays as first saved, ``totals`` as last given."""
         now = _now()
         self._execute(
-            "INSERT INTO xmas_runs VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET"
+            "INSERT INTO xmas_runs VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET"
             " system_id = excluded.system_id, status = excluded.status, updated_at = excluded.updated_at,"
-            " paused = excluded.paused",
-            (run_id, system_id, status, now, now, json.dumps(list(paused))),
+            " paused = excluded.paused, totals = COALESCE(excluded.totals, totals)",
+            (run_id, system_id, status, now, now, json.dumps(list(paused)), _json(totals)),
         )
         return cast(RunRow, self.run(run_id))
 
@@ -378,14 +396,32 @@ class Store(BaseCheckpointSaver[str]):
         return tuple(_run_row(r) for r in self._execute(f"SELECT * FROM xmas_runs{where} ORDER BY created_at", params))
 
     def save_question(
-        self, question_id: str, run_id: str, node: str, form: str, shown: Mapping[str, str], asked_at: str | None = None
+        self,
+        question_id: str,
+        run_id: str,
+        node: str,
+        form: str,
+        shown: Mapping[str, str],
+        asked_at: str | None = None,
+        *,
+        deadline: str | None = None,
+        payload: Mapping[str, Any] | None = None,
     ) -> QuestionRow:
         """Record a question as asked, ``asked_at`` now unless given; an id already saved is refused."""
         try:
             self._execute(
-                "INSERT INTO xmas_questions (question_id, run_id, node, form, shown, asked_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (question_id, run_id, node, form, json.dumps(dict(shown)), asked_at or _now()),
+                "INSERT INTO xmas_questions (question_id, run_id, node, form, shown, asked_at, deadline, payload)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    question_id,
+                    run_id,
+                    node,
+                    form,
+                    json.dumps(dict(shown)),
+                    asked_at or _now(),
+                    deadline,
+                    _json(payload),
+                ),
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"question {question_id!r} is already saved") from None
@@ -413,6 +449,27 @@ class Store(BaseCheckpointSaver[str]):
         rows = self._execute("SELECT * FROM xmas_questions WHERE run_id = ? ORDER BY asked_at, rowid", (run_id,))
         return tuple(_question_row(r) for r in rows)
 
+    def due(self, now: datetime | None = None) -> tuple[RunRow, ...]:
+        """Return the paused runs with an open question whose deadline has passed at ``now``, oldest first."""
+        moment = now or datetime.now(UTC)
+        rows = self._execute(
+            "SELECT DISTINCT run_id, deadline FROM xmas_questions WHERE answer IS NULL AND deadline IS NOT NULL"
+        )
+        late = {run_id for run_id, deadline in rows if datetime.fromisoformat(deadline) <= moment}
+        return tuple(run for run in self.runs("paused") if run.run_id in late)
+
+    def prune_runs(self, older_than_days: float) -> tuple[str, ...]:
+        """Delete the runs that ended (not running or paused) over ``older_than_days`` ago; return their ids."""
+        cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+        ended = [
+            run.run_id
+            for run in self.runs()
+            if run.status not in ("running", "paused") and datetime.fromisoformat(run.updated_at) < cutoff
+        ]
+        for run_id in ended:
+            self.delete(run_id)
+        return tuple(ended)
+
     def delete(self, run_id: str) -> None:
         """Delete a run's row, its questions, and its threads: ``run_id`` and every ``run_id/...``."""
         prefix = run_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
@@ -426,13 +483,18 @@ class Store(BaseCheckpointSaver[str]):
                 )
 
 
+def _json(value: Mapping[str, Any] | None) -> str | None:
+    return None if value is None else json.dumps(dict(value))
+
+
 def _run_row(row: Sequence[Any]) -> RunRow:
-    run_id, system_id, status, created_at, updated_at, paused = row
-    return RunRow(run_id, system_id, status, created_at, updated_at, tuple(json.loads(paused)))
+    run_id, system_id, status, created_at, updated_at, paused, totals = row
+    loaded = json.loads(totals) if totals is not None else None
+    return RunRow(run_id, system_id, status, created_at, updated_at, tuple(json.loads(paused)), loaded)
 
 
 def _question_row(row: Sequence[Any]) -> QuestionRow:
-    question_id, run_id, node, form, shown, asked_at, answered_at, answer, who = row
+    question_id, run_id, node, form, shown, asked_at, answered_at, answer, who, deadline, payload = row
     return QuestionRow(
         question_id,
         run_id,
@@ -443,6 +505,8 @@ def _question_row(row: Sequence[Any]) -> QuestionRow:
         answered_at,
         json.loads(answer) if answer is not None else None,
         who,
+        deadline,
+        json.loads(payload) if payload is not None else None,
     )
 
 
