@@ -66,7 +66,7 @@ from xmas.budget import RUNNING, RunMeter, VisitMeter, contestant
 from xmas.check import SENT, step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
 from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, RaceLost, XmasError, classify
-from xmas.graph import END, back_edges, join_nodes
+from xmas.graph import END, START, back_edges, join_nodes
 from xmas.health import summarize
 from xmas.human import Asker, Human, Pause, Question, answer_value, question_id
 from xmas.llms.meta import SupportsImages, SupportsMeta, SupportsParts, supports_meta, supports_parts
@@ -85,6 +85,7 @@ from xmas.values import JSON, TEXT, ValueType, check_value, coerce_media, media_
 if TYPE_CHECKING:  # pragma: no cover
     from promptolution.llms.base_llm import BaseLLM
 
+    from xmas.budget import Budget
     from xmas.chains import Chain
     from xmas.llms.meta import CallMeta
     from xmas.mas import MAS
@@ -488,42 +489,52 @@ def _images(llm: BaseLLM, prompt: Prompt) -> tuple[tuple[str, list[tuple[bytes, 
     return (text, list(images)), meta
 
 
+def render_prompt(
+    agent: Agent, template: str, values: Mapping[str, Any], types: Mapping[str, ValueType]
+) -> tuple[Prompt, str, dict[str, str]]:
+    """Render an agent's prompt from the values it reads, as a visit sends it.
+
+    Each read renders by its type, text when ``types`` does not name it, and a
+    read absent from ``values`` renders as ``""``. An image or audio read goes
+    to the model as a content part (``render_parts``), and the record text
+    shows a marker in its place. Returns what is sent, the record text, and
+    the rendered inputs by placeholder.
+    """
+    inputs = {
+        placeholder: render_value(values.get(name), types.get(name, TEXT), present=name in values)
+        for placeholder, name in agent.reads.items()
+    }
+    shown = {placeholder for placeholder, name in agent.reads.items() if media_kind(types.get(name, TEXT)) in SENT}
+    if not shown:
+        prompt = safe_format(template, inputs)
+        return prompt, prompt, inputs
+    text = {placeholder: line for placeholder, line in inputs.items() if placeholder not in shown}
+    parts, rendered = render_parts(template, text, {p: values.get(agent.reads[p]) for p in shown})
+    return parts, rendered, inputs
+
+
 def _agent_body(
     mas: MAS, agent: Agent, llm: BaseLLM, count_tokens: Callable[[str], float], types: Mapping[str, ValueType]
 ) -> _NodeBody:
     """Build what an agent does in one visit.
 
-    Inputs render by their types (text when ``types`` does not name them, as
-    in version 1). An image or audio read goes to the model as a content part
-    (``render_parts``), and the record shows a marker in its place. A json
-    agent's prompt ends with its form's format block, and its answer is parsed
-    into the value it writes: a plain agent retries in a second call
-    (:func:`_answer_plain`), an agent with tools in one more turn of its
-    conversation, tools withheld. An agent writing an image keeps the model's
-    picture (:func:`_paint`).
+    The prompt renders by :func:`render_prompt`. A json agent's prompt ends
+    with its form's format block, and its answer is parsed into the value it
+    writes: a plain agent retries in a second call (:func:`_answer_plain`), an
+    agent with tools in one more turn of its conversation, tools withheld. An
+    agent writing an image keeps the model's picture (:func:`_paint`).
     """
     written = parse_type(agent.output_type)
     form = compile_form(agent.schema) if written == JSON else None
     paints = media_kind(written) == "image"
     tools = mas.resolve_tools(agent) if agent.tools else None
     batch_error = mas.version != 2
-    reads = agent.reads
-    reads_run = mas.version == 2 and "run" in reads.values()
-    shown = {placeholder for placeholder, name in reads.items() if media_kind(types.get(name, TEXT)) in SENT}
+    reads_run = mas.version == 2 and "run" in agent.reads.values()
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         template = state["prompts"].get(agent.name, agent.prompt)
         values = {**state["values"], "run": _run_value(meter.run, mas)} if reads_run else state["values"]
-        inputs = {
-            placeholder: render_value(values.get(name), types.get(name, TEXT), present=name in values)
-            for placeholder, name in reads.items()
-        }
-        prompt: Prompt
-        if shown:
-            text = {placeholder: line for placeholder, line in inputs.items() if placeholder not in shown}
-            prompt, rendered = render_parts(template, text, {p: values.get(reads[p]) for p in shown})
-        else:
-            prompt = rendered = safe_format(template, inputs)
+        prompt, rendered, inputs = render_prompt(agent, template, values, types)
         if form is not None:
             block = f"\n\n{form.format_block()}"
             prompt, rendered = _joined(prompt, block), rendered + block
@@ -1760,3 +1771,100 @@ def _run_all(
         trace_from_state(mas, query, result, meter)
         for query, result, meter in zip(queries, results, meters, strict=True)
     ]
+
+
+def node_owner(mas: MAS, node: str) -> MAS:
+    """Return the system that runs ``node``: ``mas``, or for a member of a ``for each`` chain the system an item runs.
+
+    Raises:
+        ValueError: For a node inside a box, whose example belongs to the box's
+            system, or a name that is no node at all.
+    """
+    for chain in _chains(mas).values():
+        if node in chain.nodes:
+            return chain.system
+    if node in mas.nodes:
+        return mas
+    for box in mas.boxes.values():
+        try:
+            node_owner(box.system, node)
+        except ValueError:
+            continue
+        raise ValueError(f"node {node!r} sits inside box {box.name!r}: give the example to the box's system")
+    raise ValueError(f"{node!r} is no node of the system; its nodes: {sorted(mas.nodes)}")
+
+
+def node_types(system: MAS, node: Agent | Step | Box | Human) -> tuple[dict[str, ValueType], dict[str, ValueType]]:
+    """Return what a node reads and writes, ``{value: type}``, as one visit in ``system`` sees them.
+
+    A version 1 system's values are text.
+    """
+    types = system.info.types if system.info is not None else {}
+    if isinstance(node, Agent):
+        reads, writes = list(node.reads.values()), [node.output]
+    elif isinstance(node, Step):
+        read_map, write_map = step_maps(node, system.resolve_callable(node)[0])
+        reads, writes = list(read_map.values()), list(write_map.values())
+    elif isinstance(node, Box):
+        return node.types()
+    else:
+        reads, writes = list(node.reads.values()), [node.answer]
+    return {name: types.get(name, TEXT) for name in reads}, {name: types.get(name, TEXT) for name in writes}
+
+
+def run_node(mas: MAS, node: str, values: Mapping[str, Any], *, budget: Budget | None = None) -> Trace:
+    """Run one node on given values, as one visit of a run would, and return the trace of that visit.
+
+    ``values`` are the node's reads by value name, each checked against its
+    type. A read left out renders as absent, as at a visit before anything
+    wrote it; ``run`` comes from the visit's own meter, and ``error`` is given
+    like any read. A member of a ``for each`` chain runs in the system an item
+    runs. No edge out of the node is followed, so no predicate runs, and an
+    error fails the trace with its kind. The visit runs on a meter of its own
+    under ``budget``. The trace's ``outputs`` hold the node's writes, typed.
+
+    Raises:
+        ValueError: Before any call, for a node inside a box, a human node, a
+            name that is no node, or values that are not its reads or do not
+            fit their types.
+    """
+    system = node_owner(mas, node)
+    target = system.nodes[node]
+    if isinstance(target, Human):
+        raise ValueError(f"node {node!r} is a human node: it asks a person and takes no example")
+    reads, writes = node_types(system, target)
+    problems = [f"{name!r} is no read of {node!r}, which reads {sorted(reads)}" for name in values if name not in reads]
+    problems += [
+        f"{name!r} is not {reads[name]}: {problem}"
+        for name, value in values.items()
+        if name in reads and (problem := check_value(value, reads[name])) is not None
+    ]
+    if problems:
+        raise ValueError(f"The values do not fit node {node!r}:\n" + "\n".join(f"- {line}" for line in problems))
+    types = system.info.types if system.info is not None else {}
+    body: _NodeBody
+    if isinstance(target, Agent):
+        llm = system.resolve_llm(target)
+        body = _agent_body(system, target, llm, get_token_counter(llm), types)
+    elif isinstance(target, Step):
+        body = _step_body(system, target, types)
+    else:
+        body = _box_body(target, types)
+    builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(MASState)
+    builder.add_node(node, _wrap(system, node, body), input_schema=MASState)  # type: ignore[arg-type]
+    builder.add_edge(START, node)
+    builder.add_edge(node, END)
+    meter = RunMeter(budget, owner=system)
+    query = _query(values)
+    try:
+        state = _initial_state(dict(values), system.prompts())
+        graph: Any = builder.compile()
+        result = graph.invoke(state, config=_run_config(system, meter))
+    except Exception as error:
+        return _failed_trace(system, query, error, meter)
+    finally:
+        meter.close()
+    produced, records = result["values"], result["records"]
+    outputs = {name: produced[name] for name in writes if name in produced}
+    output = _raw(records[-1].outputs, plain(outputs)) if records else ""
+    return _trace(system, query, records, meter, output=output, outputs=outputs)
