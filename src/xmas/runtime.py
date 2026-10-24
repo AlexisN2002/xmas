@@ -49,7 +49,7 @@ from xmas.edges import ANY_ERROR, Edge, EdgeKind
 from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, classify
 from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
-from xmas.llms.meta import SupportsImages, SupportsMeta, SupportsParts, supports_meta
+from xmas.llms.meta import SupportsImages, SupportsMeta, SupportsParts, supports_meta, supports_parts
 from xmas.llms.parts import Part, render_parts
 from xmas.media import store
 from xmas.nodes import Box, Step
@@ -173,6 +173,8 @@ def _generate(llm: BaseLLM, rendered: Prompt) -> tuple[str, CallMeta | None]:
     made sure the model has.
     """
     if not isinstance(rendered, str):
+        if not supports_parts(llm):
+            raise TypeError(f"{type(llm).__name__} cannot send pictures or sound: it has no parts path turned on")
         return cast("SupportsParts", llm).generate_parts_with_meta(rendered)
     if supports_meta(llm):
         return cast("SupportsMeta", llm).generate_with_meta(rendered)
