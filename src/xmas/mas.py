@@ -38,7 +38,7 @@ from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import validate_spec, validate_spec_v2
 from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools
 from xmas.trace import Event, Trace
-from xmas.values import TEXT, ValueType, check_value, parse_type
+from xmas.values import TEXT, ValueType, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
@@ -380,21 +380,7 @@ class MAS(BasePredictor):
         Raises:
             ValueError: Listing every missing, extra or mistyped input, before any call.
         """
-        if self.version == 2:
-            problems = [f"input {name!r} is missing" for name in self.inputs if name not in values]
-            problems += [f"{name!r} is no input of this system" for name in values if name not in self.inputs]
-            for name, vtype in self.inputs.items():
-                problem = check_value(values[name], vtype) if name in values else None
-                if problem is not None:
-                    problems.append(f"input {name!r} is no {vtype}: {problem}")
-        else:
-            problems = [] if "query" in values else ["input 'query' is missing"]
-            problems += [f"input {name!r} is not text" for name, value in values.items() if not isinstance(value, str)]
-        if problems:
-            lines = "\n".join(f"- {problem}" for problem in problems)
-            raise ValueError(f"run_state got inputs this system does not take:\n{lines}")
-        trace: Trace = runtime.run_state(self, values, self.prompts(), on_event)  # type: ignore[attr-defined]
-        return trace
+        return runtime.run_state(self, values, self.prompts(), on_event)
 
     def run_batch(self, queries: list[str]) -> list[Trace]:
         """Run the MAS over several inputs, concurrently where the LLM allows; one trace per query, in order."""

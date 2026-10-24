@@ -42,7 +42,7 @@ from xmas.predicates import BUILTINS, KEYWORDS, Predicate, PredicateError, parse
 from xmas.prompts import extract_placeholders
 from xmas.routes import Join, RouteGraph
 from xmas.schemas import compile_form
-from xmas.values import JSON, KINDS, LIST_PREFIX, TEXT, ValueType, parse_type
+from xmas.values import JSON, KINDS, LIST_PREFIX, TEXT, ValueType, fits, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
@@ -136,11 +136,6 @@ def _schema_type(item: Tool, parameter: str) -> str:
 def _available(vtype: ValueType) -> bool:
     """Return whether a system may use a type: an available kind, or a list of an available type."""
     return vtype in AVAILABLE or (vtype.item is not None and _available(vtype.item))
-
-
-def _fits(value: ValueType, wanted: ValueType) -> bool:
-    """Return whether a value of type ``value`` may be read where ``wanted`` is declared: equal, or a list as json."""
-    return value == wanted or (wanted == JSON and value.item is not None)
 
 
 def _value_problems(name: str, vtype: ValueType) -> Iterator[str]:
@@ -369,7 +364,7 @@ def _read_problems(
                 yield f"{name!r} reads {value!r}, but its writers {writers[value]} do not run before it"
             elif value not in mas.inputs and set(writers[value]) <= failed:
                 yield f"{name!r} runs only when {writers[value][0]!r} fails, so it cannot read {value!r}"
-            if parameter is None or _fits(types[value], parameter[1]):
+            if parameter is None or fits(types[value], parameter[1]):
                 continue
             inside, _, word = parameter
             if name in mas.boxes:

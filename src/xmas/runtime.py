@@ -40,7 +40,6 @@ from langgraph.types import Send
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 from promptolution.utils.token_counter import get_token_counter
 
-from xmas import check
 from xmas.agent import Agent
 from xmas.budget import RunMeter, VisitMeter
 from xmas.check import step_maps
@@ -55,13 +54,13 @@ from xmas.prompts import safe_format
 from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
 from xmas.tools import run_step, run_tool_loop
-from xmas.trace import AgentRecord, Rejected, TokenUsage, ToolCall, Trace
+from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, check_value, parse_type, render_value
 
 if TYPE_CHECKING:  # pragma: no cover
-    import networkx as nx
     from promptolution.llms.base_llm import BaseLLM
 
+    from xmas.chains import Chain
     from xmas.llms.meta import CallMeta
     from xmas.mas import MAS
 
@@ -74,9 +73,6 @@ _RUN_KEY = "xmas_run"
 
 _ITEM_KEY = "xmas_item"
 """Key of the chain item a run works on, ``(index, key)``, in ``config["configurable"]``."""
-
-_RESERVED_READS: Mapping[str, ValueType] = getattr(check, "RESERVED_READS", {"error": JSON, "run": JSON})
-"""The values the engine supplies and no node writes: ``error`` after a routed failure, ``run`` at read time."""
 
 
 class MASState(TypedDict):
@@ -144,22 +140,9 @@ def _item() -> tuple[int, str | None] | None:
     return item
 
 
-def _known(cls: type, fields: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the ``fields`` the dataclass ``cls`` defines, for the record and trace fields the engine sets."""
-    names = {field.name for field in dataclasses.fields(cls)}
-    return {name: value for name, value in fields.items() if name in names}
-
-
-def _chains(mas: MAS) -> dict[str, Any]:
-    """Return the system's ``for each`` chains by head; none without any."""
-    chains: dict[str, Any] = getattr(mas.info, "chains", None) or {}
-    return chains
-
-
-def _placeholders(agent: Agent) -> dict[str, str]:
-    """Return what an agent reads, ``{placeholder: value}``."""
-    reads: dict[str, str] = getattr(agent, "reads", None) or {name: name for name in agent.inputs}
-    return reads
+def _chains(mas: MAS) -> dict[str, Chain]:
+    """Return the system's ``for each`` chains by head; none in version 1."""
+    return mas.info.chains if mas.info is not None else {}
 
 
 def _run_value(meter: RunMeter, mas: MAS) -> dict[str, Any]:
@@ -218,13 +201,17 @@ def _wrap(
     ``error`` (``{kind, message, node}``, when ``writes_error``); otherwise the
     error goes on. Version 1 raises.
     """
-    retry: Mapping[str, int] = getattr(mas, "retry", {}).get(name, {})
+    retry = mas.retry.get(name, {})
 
     def node(state: MASState) -> dict[str, Any]:
         meter = _current_meter(mas)
         meter.start()  # the run's wall clock starts with its first agent, not with the batch
         index, key = _item() or (None, None)
-        here = {"visit": 1 + sum(record.agent == name for record in state["records"]), "item": index, "item_key": key}
+        here: dict[str, Any] = {
+            "visit": 1 + sum(record.agent == name for record in state["records"]),
+            "item": index,
+            "item_key": key,
+        }
         meter.emit("start", name, **here)
         started = time.perf_counter()
         visit = VisitMeter(meter)
@@ -256,7 +243,7 @@ def _wrap(
                 raise
             target = None if decision is None else decision.on_error(kind)
             record = _failed_record(mas, name, error, kind, time.perf_counter() - started, target, visit)
-            record = dataclasses.replace(record, **_known(AgentRecord, {**here, "retries": used.total()}))
+            record = dataclasses.replace(record, **here, retries=used.total())
             meter.keep(record, mas)
             meter.emit("end", name, status="failed" if target is None else "routed", cost_usd=record.cost_usd, **here)
             if target is None:
@@ -266,7 +253,7 @@ def _wrap(
                 routed["values"] = {"error": {"kind": kind.value, "message": record.error, "node": name}}
             return routed
         stamps = {**here, "retries": used.total()} if mas.version == 2 else {}
-        record = dataclasses.replace(record, latency_s=time.perf_counter() - started, **_known(AgentRecord, stamps))
+        record = dataclasses.replace(record, latency_s=time.perf_counter() - started, **stamps)
         meter.keep(record, mas)
         meter.emit("end", name, status="ok", cost_usd=record.cost_usd, **here)
         return {**update, "records": [record]}
@@ -327,7 +314,7 @@ def _agent_body(
     form = compile_form(agent.schema) if parse_type(agent.output_type) == JSON else None
     tools = mas.resolve_tools(agent) if agent.tools else None
     batch_error = mas.version != 2
-    reads = _placeholders(agent)
+    reads = agent.reads
     reads_run = mas.version == 2 and "run" in reads.values()
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
@@ -632,8 +619,8 @@ def _out_edges(mas: MAS) -> dict[str, list[Edge]]:
     A chain's members are left out: the head stands for the chain, its exits
     leaving from it.
     """
-    edges: tuple[Edge, ...] = getattr(mas.info, "edges", mas.edges)
-    flow: nx.DiGraph[str] = getattr(mas.info, "flow", mas.graph)
+    info = mas._checked()
+    edges, flow = info.edges, info.flow
     out: dict[str, list[Edge]] = {}
     for edge in edges:
         out.setdefault(edge.source, []).append(edge)
@@ -649,18 +636,18 @@ def _relay(state: MASState) -> dict[str, Any]:  # noqa: ARG001 (a node's signatu
     return {}
 
 
-def _entry(name: str, chains: Mapping[str, Any]) -> str:
+def _entry(name: str, chains: Mapping[str, Chain]) -> str:
     """Return the node an edge into ``name`` lands on: a chain head's ``in`` node, else ``name``."""
     return f"__each__.{name}.in" if name in chains else name
 
 
-def _exit(name: str, chains: Mapping[str, Any]) -> str:
+def _exit(name: str, chains: Mapping[str, Chain]) -> str:
     """Return the node an edge out of ``name`` leaves from: a chain head's ``out`` node, else ``name``."""
     return f"__each__.{name}.out" if name in chains else name
 
 
 def _add_joins(
-    builder: StateGraph[MASState, Any, MASState, MASState], joins: Mapping[str, Join], chains: Mapping[str, Any]
+    builder: StateGraph[MASState, Any, MASState, MASState], joins: Mapping[str, Join], chains: Mapping[str, Chain]
 ) -> tuple[set[tuple[str, str]], dict[tuple[str, str], str]]:
     """Add one barrier per join: it waits for each of the join's groups once per pass.
 
@@ -765,7 +752,7 @@ def _wire_v2(
             builder.add_conditional_edges(source, _router(source, targets), sorted(set(targets.values())))
 
 
-def _items(chain: Any, values: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
+def _items(chain: Chain, values: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
     """Return a chain's items with their keys, from the list at its path.
 
     A missing path or ``None`` is no item. Anything else that is not a list,
@@ -800,7 +787,7 @@ def _cost(records: list[AgentRecord]) -> float | None:
     return None if not costs or None in costs else sum(cast("list[float]", costs))
 
 
-def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS, chain: Any) -> None:
+def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS, chain: Chain) -> None:
     """Add a chain's three nodes: a pass starts and fans out, each item runs, the writes are gathered.
 
     An item runs ``chain.system`` on the item and the outside values it reads,
@@ -843,7 +830,7 @@ def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS,
                 mine = [
                     record
                     for record in run.records_of(system)[kept:]
-                    if record.agent in chain.nodes and getattr(record, "item", None) == index
+                    if record.agent in chain.nodes and record.item == index
                 ]
                 run.emit("item_end", head, status="failed", cost_usd=_cost(mine), **where)
                 if kind in RUN_ENDS or kind is ErrorKind.MONEY:
@@ -881,7 +868,7 @@ def compile_mas(mas: MAS) -> Any:
     members = {name for chain in chains.values() for name in chain.nodes}
     schema: type[MASState] = _ChainState if chains else MASState
     builder: StateGraph[MASState, Any, MASState, MASState] = StateGraph(schema)
-    types = {**_RESERVED_READS, **mas.info.types} if mas.info is not None else {}
+    types = mas.info.types if mas.info is not None else {}
     bodies: dict[str, _NodeBody] = {}
     for agent in mas.agents.values():
         if agent.name not in members:
@@ -915,7 +902,7 @@ def compile_mas(mas: MAS) -> Any:
 
 def _reads(mas: MAS, value: str) -> bool:
     """Return whether any agent, step or predicate of a version 2 system reads ``value``."""
-    nodes = [*(_placeholders(agent).values() for agent in mas.agents.values())]
+    nodes = [*(agent.reads.values() for agent in mas.agents.values())]
     nodes += [step_maps(step, mas.resolve_callable(step)[0])[0].values() for step in mas.steps.values()]
     paths = {path[0] for predicate in mas._checked().predicates.values() for path in predicate.paths()}
     return value in paths or any(value in names for names in nodes)
@@ -955,11 +942,11 @@ def _trace(mas: MAS, query: str, records: list[AgentRecord], meter: RunMeter, **
         settings=mas.health,
         while_edges=mas.while_edges,
         values=values,
-        **({"chains": chains} if chains else {}),
+        chains=chains,
     )
     if mas.version == 2 and mas is meter.owner:
         ending.update(run_id=meter.run_id, graph_id=meter.graph_id)
-    return Trace(query=query, records=numbered, health=health, **_known(Trace, ending))
+    return Trace(query=query, records=numbered, health=health, **ending)
 
 
 def trace_from_state(mas: MAS, query: str, result: Any, meter: RunMeter) -> Trace:
@@ -970,7 +957,7 @@ def trace_from_state(mas: MAS, query: str, result: Any, meter: RunMeter) -> Trac
     """
     if isinstance(result, BaseException):
         return _failed_trace(mas, query, result, meter)
-    outputs: Mapping[str, ValueType] = getattr(mas, "outputs", {})
+    outputs = mas.outputs
     if not outputs:
         return _trace(mas, query, result["records"], meter, output=_output(mas, result["records"]))
     values = result["values"]
@@ -1026,7 +1013,7 @@ def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> lis
 
 
 def run_state(
-    mas: MAS, values: Mapping[str, Any], prompts: dict[str, str], on_event: Callable[[Any], None] | None = None
+    mas: MAS, values: Mapping[str, Any], prompts: dict[str, str], on_event: Callable[[Event], None] | None = None
 ) -> Trace:
     """Run a MAS on its declared inputs with a given prompt set; a failure is recorded in the trace, not raised.
 
@@ -1048,7 +1035,8 @@ def run_state(
 def _check_inputs(mas: MAS, values: Mapping[str, Any]) -> None:
     """Refuse values that are not the system's inputs, listing every problem."""
     if mas.version != 2:
-        problems = [f"{name!r} is not text" for name, value in values.items() if not isinstance(value, str)]
+        problems = [] if "query" in values else ["input 'query' is missing"]
+        problems += [f"{name!r} is not text" for name, value in values.items() if not isinstance(value, str)]
     else:
         problems = [f"input {name!r} is missing" for name in mas.inputs if name not in values]
         problems += [f"{name!r} is no input of {sorted(mas.inputs)}" for name in values if name not in mas.inputs]
@@ -1067,7 +1055,7 @@ def _run_all(
     starts: list[str | Mapping[str, Any]],
     queries: list[str],
     prompts: list[dict[str, str]],
-    on_event: Callable[[Any], None] | None = None,
+    on_event: Callable[[Event], None] | None = None,
 ) -> list[Trace]:
     """Run each start (a query or the input values) with its prompt set, on a meter of its own."""
     if not starts:

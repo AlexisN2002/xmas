@@ -18,15 +18,11 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from xmas import trace
 from xmas.errors import BudgetExceeded, EmptyResponse
-from xmas.trace import AgentRecord, Trace
+from xmas.trace import AgentRecord, Event, Trace
 
 if TYPE_CHECKING:
     from xmas.llms.meta import CallMeta
-
-_EVENT: Any = getattr(trace, "Event", None)
-"""The event class a listener receives."""
 
 
 @dataclass(frozen=True)
@@ -108,7 +104,7 @@ class RunMeter(_Metering):
         budget: Budget | None = None,
         owner: object | None = None,
         *,
-        listener: Callable[[Any], None] | None = None,
+        listener: Callable[[Event], None] | None = None,
         graph_id: str | None = None,
     ) -> None:
         """Start the clock with every counter at zero."""
@@ -230,10 +226,10 @@ class RunMeter(_Metering):
         this run: a viewer's bug does not end a paid run.
         """
         listener = self.listener
-        if listener is None or _EVENT is None:
+        if listener is None:
             return
         try:
-            listener(_EVENT(kind, node, self.run_id, self.elapsed_s, **fields))
+            listener(Event(kind, node, self.run_id, self.elapsed_s, **fields))
         except Exception as error:
             with self._lock:
                 first = self.listener is listener
