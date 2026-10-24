@@ -2,7 +2,7 @@
 name = "xmas"
 description = "A lightweight framework for building and optimizing multi-agent systems."
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Tom Zehle" }]
 requires-python = ">=3.12,<3.13"
 dynamic = ["version"]
