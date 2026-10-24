@@ -147,6 +147,8 @@ class GraphUpdater:
             if parent is None:
                 prompt, output = NEW_AGENT_PROMPT.format(name=name), self.output_of(mas, name)
                 agents[name] = Agent(name, prompt, output=output, inputs=inputs[name])
+            elif sorted(parent.inputs) == sorted(inputs[name]):
+                agents[name] = parent.copy()  # its reads stay as they are, renamed ones included
             else:
                 agents[name] = parent.copy(inputs=inputs[name])
             if parent is None or sorted(parent.inputs) != sorted(inputs[name]):
@@ -240,7 +242,7 @@ class GraphUpdater:
             upstream = ancestors(graph, name)
             available = set(mas.inputs).union(*(writes[node] for node in upstream if node in writes))
             kept = [value for value in (parent.inputs if parent is not None else []) if value in available]
-            fresh = sorted(set().union(*(writes[source] for source in feeding)) - set(kept))
+            fresh = sorted(set().union(*(writes.get(source, set()) for source in feeding)) - set(kept))
             resolved[name] = [*kept, *fresh] or list(mas.inputs)
         return resolved
 
@@ -256,11 +258,15 @@ class GraphUpdater:
         return sorted((source, target) for source, target in pairs if not {source, target}.intersection(SENTINELS))
 
     def fixed_of(self, mas: MAS) -> Fixed | None:
-        """Return what no mutation of a version 2 system may change, or ``None`` for version 1."""
+        """Return what no mutation of a version 2 system may change, or ``None`` for version 1.
+
+        Frozen nodes, the ends of conditional edges and every member of a ``for
+        each`` chain are held, so no mutation breaks a chain.
+        """
         if mas.version != 2:
             return None
         conditional = [edge for edge in mas.edges if edge.kind is not EdgeKind.PLAIN]
-        held = set(mas.frozen).union(*({edge.source, edge.target} for edge in conditional))
+        held = set(mas.frozen).union(mas.each, *({edge.source, edge.target} for edge in conditional))
         return Fixed(
             nodes=frozenset(held.difference(SENTINELS)),
             code=frozenset([*mas.steps, *mas.boxes]),

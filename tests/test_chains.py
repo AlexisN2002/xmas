@@ -14,6 +14,9 @@ import yaml
 from xmas import MAS, Agent, Box, Budget, ErrorKind, RunStatus
 from xmas.edges import Edge, EdgeKind
 from xmas.nodes import Step
+from xmas.optimization.graph_updater import GraphUpdater
+from xmas.optimization.synthesis import MechanicalSynthesizer
+from xmas.optimization.topology import TopologyBudget
 from xmas.tools import tool
 
 from .conftest import (
@@ -297,3 +300,32 @@ def test_a_box_and_shared_prompts_in_a_chain() -> None:
     assert metered.run_state({"plan": PLAN, "house": "plain"}).error is None
     assert {"drafter", "checker", "captioner", "figure_checker", "noter"} <= set(asked)
 
+
+def test_topology_search_never_breaks_a_chain() -> None:
+    @tool(writes={"words": "json"})
+    def count_words(draft: str) -> int:
+        """Count the words of a draft."""
+        return len(draft.split())
+
+    mas = MAS(
+        [
+            Agent("writer", "Write page {slide}", "draft", inputs={"slide": "page"}),
+            Agent("summarizer", "Sum up {words}", "summary", ["words"]),
+            Agent("polisher", "Polish {summary}", "final", ["summary"]),
+        ],
+        [("writer", "count"), ("count", "summarizer"), ("summarizer", "polisher")],
+        steps=[Step("count", "count_words")],
+        inputs={"plan": "json"},
+        each={"writer": {"item": "page", "in": "plan.slides", "key": "id"}, "count": "page in plan.slides"},
+        llm=MockLLM(lambda prompt: "one two"),
+        tools=[count_words],
+    )
+    updater = GraphUpdater(MechanicalSynthesizer(), TopologyBudget(min_agents=2, max_agents=5, max_edges=8), seed=0)
+    fixed = updater.fixed_of(mas)
+    assert fixed is not None and {"writer", "count"} <= fixed.nodes  # chain members are held
+    candidates = updater.propose(mas, {}, 4)
+    assert candidates
+    for candidate in candidates:
+        assert candidate.each == mas.each and candidate.agents["writer"].reads == {"slide": "page"}
+        assert {(e.source, e.target) for e in candidate.edges} >= {("writer", "count"), ("count", "summarizer")}
+        assert candidate.run_state(plan_of("a", "b")).error is None

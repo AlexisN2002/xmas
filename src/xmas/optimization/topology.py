@@ -101,7 +101,7 @@ class Fixed:
     closes are not counted, and runnability is left to the system's own check.
 
     Attributes:
-        nodes: Frozen nodes and conditional-edge endpoints. No operator adds,
+        nodes: Frozen nodes, conditional-edge endpoints and chain members. No operator adds,
             removes or moves an edge touching one, or removes the node.
         code: Steps and boxes. Their plain edges may move, but only agents are
             invented and dropped.
