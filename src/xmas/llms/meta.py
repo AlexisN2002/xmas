@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletion
     from openai.types.completion_usage import CompletionUsage
 
+    from xmas.llms.parts import Part
     from xmas.tools import Tool, ToolCallRequest
 
 
@@ -135,6 +136,46 @@ class SupportsMeta(Protocol):
 def supports_meta(llm: object) -> bool:
     """Whether the engine takes ``llm``'s metadata path: it has the methods and ``full_response`` is ``True``."""
     return isinstance(llm, SupportsMeta) and llm.full_response is True
+
+
+@runtime_checkable
+class SupportsParts(Protocol):
+    """A model that reads pictures and sound in a prompt, when ``full_response`` is ``True``.
+
+    A class that hooks the text path (such as one overriding ``_ainvoke_once``)
+    is off by default, so its hook is never bypassed by a parts request.
+    """
+
+    full_response: bool
+
+    def generate_parts_with_meta(
+        self, parts: Sequence[Part], system_prompt: str = DEFAULT_SYS_PROMPT
+    ) -> tuple[str, CallMeta]:
+        """Return the answer to a prompt of text and media parts, and the call's metadata."""
+        ...
+
+
+@runtime_checkable
+class SupportsImages(Protocol):
+    """A model that answers with images, when ``full_response`` is ``True``."""
+
+    full_response: bool
+
+    def generate_image_with_meta(
+        self, prompt: str | Sequence[Part], system_prompt: str = DEFAULT_SYS_PROMPT
+    ) -> tuple[str, list[tuple[bytes, str]], CallMeta]:
+        """Return the answer's text, its images as ``(bytes, media type)`` pairs, and the call's metadata."""
+        ...
+
+
+def supports_parts(llm: object) -> bool:
+    """Whether ``llm`` can be sent media parts: it has the method and ``full_response`` is ``True``."""
+    return isinstance(llm, SupportsParts) and llm.full_response is True
+
+
+def supports_images(llm: object) -> bool:
+    """Whether ``llm`` can answer with images: it has the method and ``full_response`` is ``True``."""
+    return isinstance(llm, SupportsImages) and llm.full_response is True
 
 
 def meta_from_completion(completion: ChatCompletion, latency_s: float, price: TokenPrice | None) -> CallMeta:
