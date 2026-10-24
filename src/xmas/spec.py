@@ -12,12 +12,11 @@ node may run ``for each`` item of a list and ``retry`` on some error kinds; an
 agent may read values under placeholders of other names and share a prompt
 with other agents under a ``prompt`` name. Its ``models`` section says, per
 bound model name, which kinds beyond text the model ``accepts`` and
-``produces``, and the catalogue id it stands for (``model``, default the
-name); never a URL, a key or a model parameter. A callable names code by
-``import`` or a tool server by name (``server``), and may bind constant
-``params``. Its ``humans`` are the
-nodes that ask a person (:class:`xmas.human.Human`), and an edge may be one of a
-``first of`` race.
+``produces``, the catalogue id it stands for (``model``, default the name)
+and model parameters such as ``temperature``; never a URL or a key. A
+callable names code by ``import`` or a tool server by name (``server``), and
+may bind constant ``params``. Its ``humans`` are the nodes that ask a person
+(:class:`xmas.human.Human`), and an edge may be one of a ``first of`` race.
 """
 
 from __future__ import annotations

@@ -353,10 +353,7 @@ class Capabilities:
             raise ValueError(f"{where} is a mapping with accepts and produces, not {type(entry).__name__}")
         for key in entry:
             if key not in _KEYS:
-                raise ValueError(
-                    f"{where} has key {key!r}; it takes accepts and produces "
-                    "(model parameters come with the .mas bundle)"
-                )
+                raise ValueError(f"{where} has key {key!r}; it takes accepts and produces")
         words: dict[str, tuple[str, ...]] = {}
         for key, (verb, allowed) in _KEYS.items():
             given = entry.get(key, [])

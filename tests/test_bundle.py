@@ -8,11 +8,14 @@ one is missing.
 from __future__ import annotations
 
 import copy
+import re
 import stat
+import warnings
 import zipfile
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from promptolution.llms.base_llm import BaseLLM
@@ -20,12 +23,14 @@ from promptolution.llms.base_llm import BaseLLM
 from xmas import MAS, Agent
 from xmas import bundle as mas_bundle
 from xmas.bundle import LOCK, Lock, compare, dump_prompt, lock_of, parse_prompt, read
-from xmas.config import Config, ModelNameWarning, ToolServer
+from xmas.config import Config, ModelEntry, ModelNameWarning, ToolServer, Unconfigured, read_catalogue
 from xmas.llms.api_llm import APILLM
-from xmas.mas import ModelEntry, model_entry
+from xmas.llms.meta import TokenPrice
+from xmas.media import Capabilities
 from xmas.nodes import Step
 from xmas.tools import Tool, ToolSource, tool
 from xmas.tools.mcp import MCPTools
+from xmas.verify import VerifyWarning
 
 from .conftest import DECK, PLAN, MockLLM, assemble_deck, deck, deck_llms, render_page
 from .test_spec import EXAMPLE, RemoteTools
@@ -649,12 +654,154 @@ def test_model_names_warn_and_refuse_runs(tmp_path: Path) -> None:
     assert rebound.agents["noter"].model == "judge-model"
     with pytest.raises(ValueError, match=r"The overlay names unknown agents \['ghost'\]"):
         MAS.load(path, llms=deck_llms(), config=near, overlay={"ghost": "judge-model"})
-    with pytest.raises(ValueError, match=r"No model object for \['judge-model'\]: pass llms="):
-        MAS.load(path, llms={"writer-model": MockLLM()}, config=near)
+    offline = MAS.load(path, llms={"writer-model": MockLLM()}, config=near)  # no endpoint: built, fails on a call
+    assert isinstance(offline.llms["judge-model"], Unconfigured)
     for bad in ("", "https://gateway.example/v1/kimi", 3):
         with pytest.raises(ValueError, match=r"model is a catalogue id such as 'kimi-k3'"):
-            model_entry({"model": bad}, "models entry 'x'")
+            ModelEntry.parse({"model": bad}, "models entry 'x'")
     wiring["models"] = {"judge-model": {"model": ["judge-models"]}}
     (path / "xmas.yaml").write_text(yaml.safe_dump(wiring, sort_keys=False), encoding="utf-8")
     with pytest.raises(ValueError, match=r"needs 'model' to be a catalogue id"):
         MAS.load(path, llms=deck_llms(), config=near)
+
+
+# ------------------------------------------------------------ configuration, model names, the command line
+
+CONFIG_FILE = """\
+[endpoint]
+base_url = "http://file.example/v1"
+api_key = "sk-file"
+catalogue = ["writer-model", "judge-model"]
+
+[models."judge-model"]
+price = {input_per_m = 1, output_per_m = 2}
+stream = true
+"""
+
+ENVIRONMENT = ("XMAS_BASE_URL", "XMAS_API_KEY", "XMAS_TOOLS_KEY", "XMAS_MODELS", "XMAS_CONFIG")
+
+
+@pytest.fixture
+def clean_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """No xmas variable set, no configuration file, and a cache of this test's own."""
+    for name in ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    return monkeypatch
+
+
+def test_configuration_order(tmp_path: Path, clean_env: pytest.MonkeyPatch) -> None:
+    path = deck().save(tmp_path / "deck.mas")
+    file = tmp_path / "config.toml"
+    file.write_text(CONFIG_FILE, encoding="utf-8")
+    file.chmod(0o600)
+    clean_env.setenv("XMAS_CONFIG", str(file))
+    tools = [render_page, assemble_deck]
+
+    from_file = MAS.load(path, tools=tools)
+    judge, writer = from_file.llms["judge-model"], from_file.llms["writer-model"]
+    assert isinstance(judge, APILLM) and isinstance(writer, APILLM)
+    assert (judge.api_url, judge.api_key, judge.stream, judge.price) == (
+        "http://file.example/v1",
+        "sk-file",
+        True,
+        TokenPrice(1.0, 2.0),
+    )
+    assert (writer.stream, writer.price) == (False, None)
+    clean_env.setenv("XMAS_BASE_URL", "http://env.example/v1")
+    assert MAS.load(path, tools=tools).llms["judge-model"].api_url == "http://env.example/v1"  # type: ignore[attr-defined]
+    given = Config.load(base_url="http://given.example/v1")
+    built = MAS.load(path, tools=tools, config=given).llms["judge-model"]
+    assert built.api_url == "http://given.example/v1"  # type: ignore[attr-defined]
+
+    assert "sk-file" not in repr(from_file) + repr(given) + repr(Config.load())
+    again = from_file.save(tmp_path / "again.mas")
+    assert not any(b"sk-file" in data or b"example" in data for data in read(again).values())
+    file.chmod(0o644)
+    with pytest.warns(UserWarning, match="holds a key and others can read it"):
+        MAS.load(path, tools=tools)
+
+
+def test_model_names_resolve_with_suggestions(tmp_path: Path, clean_env: pytest.MonkeyPatch) -> None:
+    path = deck().save(tmp_path / "deck.mas")
+    clean_env.setenv("XMAS_MODELS", "writer-model,judge-models")
+    with pytest.warns(ModelNameWarning, match=r"model 'judge-model' \(agents checker, figure_checker\).*judge-models"):
+        mas = MAS.load(path, llms=deck_llms())
+    with pytest.raises(ValueError, match="Set the name in models: or fix the catalogue"):
+        mas.run_state({"plan": PLAN, "house": "plain"})
+    assert all(not model.calls for model in mas.llms.values())  # type: ignore[attr-defined]
+    with pytest.warns(VerifyWarning, match="1 problem"):
+        report = mas.verify(1)
+    assert report.misses == {"judge-model": ("judge-models", "writer-model")}
+
+    clean_env.delenv("XMAS_MODELS")  # an endpoint that cannot be reached: names are not checked, runs go on
+    clean_env.setenv("XMAS_BASE_URL", "http://127.0.0.1:9/v1")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ModelNameWarning)
+        offline = MAS.load(path, llms=deck_llms())
+    assert offline.unresolved == {} and records(offline) == records(deck())
+
+    listed = httpx.MockTransport(lambda request: httpx.Response(200, json={"data": [{"id": "writer-model"}]}))
+    first = Config(base_url="http://127.0.0.1:9/v1", api_key="sk-first")
+    assert read_catalogue(first, transport=listed).source == "endpoint"  # kept for this endpoint and key
+    with pytest.warns(ModelNameWarning, match="'judge-model'"):
+        assert MAS.load(path, llms=deck_llms(), config=first).unresolved == {"judge-model": ("writer-model",)}
+    second = Config(base_url="http://127.0.0.1:9/v1", api_key="sk-second")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ModelNameWarning)
+        assert MAS.load(path, llms=deck_llms(), config=second).unresolved == {}
+    kept = [item.read_text(encoding="utf-8") for item in (tmp_path / "cache").rglob("*.json")]
+    assert len(kept) == 1 and "sk-first" not in kept[0]
+
+
+def test_models_entries_and_the_overlay(tmp_path: Path, clean_env: pytest.MonkeyPatch) -> None:
+    path = deck().save(tmp_path / "deck.mas")
+    wiring = yaml.safe_load((path / "xmas.yaml").read_text(encoding="utf-8"))
+    models = {
+        "judge-model": {"model": "judge-x", "max_tokens": 900, "timeout_s": 30, "temperature": 0.2, "seed": 7},
+        "writer-model": {"reasoning_effort": "low"},
+        "editor": {"model": "judge-x", "accepts": ["image"], "top_p": 0.9},
+    }
+
+    def write(entries: dict[str, Any]) -> None:
+        (path / "xmas.yaml").write_text(yaml.safe_dump({**wiring, "models": entries}, sort_keys=False), "utf-8")
+
+    write(models)
+    config = Config(base_url="http://gateway.example/v1", api_key="sk-test", catalogue=("judge-x", "writer-model"))
+    tools = [render_page, assemble_deck]
+    mas = MAS.load(path, tools=tools, config=config, overlay={"noter": "editor"})
+    judge, writer, editor = (mas.llms[name] for name in ("judge-model", "writer-model", "editor"))
+    assert isinstance(judge, APILLM) and isinstance(writer, APILLM) and isinstance(editor, APILLM)
+    assert (judge.model_id, judge.call_timeout_s, judge.call_params()) == (
+        "judge-x",
+        30,
+        {"max_tokens": 900, "temperature": 0.2, "seed": 7},
+    )
+    assert writer.call_params() == {"max_tokens": 4096, "reasoning_effort": "low"}
+    assert (mas.agents["noter"].model, editor.model_id, editor.accepts) == ("editor", "judge-x", ("image",))
+    assert mas.models["judge-model"] == ModelEntry(
+        model="judge-x", params=(("max_tokens", 900), ("timeout_s", 30), ("temperature", 0.2), ("seed", 7))
+    )
+    assert mas.to_dict()["models"] == models
+    assert ModelEntry.parse({"accepts": ["image"]}, "x") == Capabilities(accepts=("image",))
+
+    for entry, message in (
+        ({"colour": "red"}, "has key 'colour'; it takes model, accepts, produces and the parameters max_tokens"),
+        ({"temperature": "hot"}, "temperature is a number, not 'hot'"),
+        ({"max_tokens": 1.5}, "max_tokens is a whole number, not 1.5"),
+        ({"seed": True}, "seed is a whole number, not True"),
+        ({"reasoning_effort": 2}, "reasoning_effort is a text, not 2"),
+    ):
+        write({"judge-model": entry})
+        with pytest.raises(ValueError, match=re.escape(f"models entry 'judge-model' {message}"[:60])):
+            MAS.load(path, tools=tools, config=config)
+
+    write({"judge-model": {"model": "judge-x"}})
+    unconfigured = MAS.load(path, tools=tools, config=Config(catalogue=("judge-x", "writer-model")))
+    offline = unconfigured.llms["judge-model"]
+    assert isinstance(offline, Unconfigured) and offline.model == "judge-x"
+    with pytest.raises(ValueError, match=r"model 'judge-x' has no endpoint: set XMAS_BASE_URL, or base_url"):
+        offline.get_response("x")
+    trace = unconfigured.run_state({"plan": PLAN, "house": "plain"})
+    assert trace.failed and "has no endpoint" in str(trace.error)

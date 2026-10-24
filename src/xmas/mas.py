@@ -24,7 +24,7 @@ from xmas.agent import Agent
 from xmas.budget import Budget
 from xmas.chains import ChainShape, ForEach
 from xmas.check import MERGE_LAST, SystemInfo, check_system, step_maps
-from xmas.config import Config, config_path, resolve_names
+from xmas.config import Config, ModelEntry, build_llms, resolve_names, tool_sources
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
 from xmas.graph import (
     END,
@@ -53,36 +53,6 @@ if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
 
 _QUERY_ONLY = {"query": TEXT}
-
-
-@dataclasses.dataclass(frozen=True)
-class ModelEntry(Capabilities):
-    """A ``models:`` entry whose name stands for another catalogue id, such as ``editor: {model: kimi-k3}``.
-
-    Attributes:
-        model: The catalogue id the bound name stands for.
-    """
-
-    model: str | None = None
-
-    def to_spec(self) -> dict[str, Any]:
-        """Return the ``models:`` entry: the id, then the stated capabilities."""
-        return {"model": self.model, **super().to_spec()}
-
-
-def model_entry(entry: Any, where: str) -> Capabilities:
-    """Read a ``models:`` entry: a :class:`ModelEntry` when it names a ``model`` id, else :class:`Capabilities`.
-
-    Raises:
-        ValueError: As :meth:`Capabilities.parse`, or for a ``model`` that is not a catalogue id.
-    """
-    if not isinstance(entry, Mapping) or "model" not in entry:
-        return Capabilities.parse(entry, where)
-    model = entry["model"]
-    if not isinstance(model, str) or not model or "://" in model:
-        raise ValueError(f"{where} model is a catalogue id such as 'kimi-k3', not {model!r}")
-    stated = Capabilities.parse({key: value for key, value in entry.items() if key != "model"}, where)
-    return ModelEntry(stated.accepts, stated.produces, model)
 
 
 class MAS(BasePredictor):
@@ -125,9 +95,9 @@ class MAS(BasePredictor):
             runs again on each kind of :data:`~xmas.check.RETRYABLE`.
         prompt_names: ``{agent: prompt name}`` for agents that share one prompt.
         models: ``{model name: Capabilities}``: what each bound model takes and
-            gives besides text, as declared, a :class:`ModelEntry` where the
-            name stands for another catalogue id; empty when none is (and in
-            version 1).
+            gives besides text, as declared, a :class:`~xmas.config.ModelEntry`
+            where the name stands for another catalogue id or sets parameters;
+            empty when none is (and in version 1).
         version: 1 or 2.
         info: What the version 2 check learned (types, writers, joins); ``None``
             in version 1.
@@ -278,7 +248,7 @@ class MAS(BasePredictor):
         self.retry = {name: dict(rules) for name, rules in (retry or {}).items()}
         self.prompt_names = dict(prompt_names or {})
         self.models = {
-            name: entry if isinstance(entry, Capabilities) else model_entry(entry, f"models entry {name!r}")
+            name: entry if isinstance(entry, Capabilities) else ModelEntry.parse(entry, f"models entry {name!r}")
             for name, entry in (models or {}).items()
         }
         self.version = self._infer_version(version, agents, [*steps, *boxes, *humans], inputs, state)
@@ -1014,7 +984,9 @@ class MAS(BasePredictor):
         before anything is built. With ``resolve``, every bound model id is
         checked against the configured catalogue: a miss is a
         :class:`~xmas.config.ModelNameWarning` naming the closest ids, and the
-        system keeps it in :attr:`unresolved` and refuses to run.
+        system keeps it in :attr:`unresolved` and refuses to run. A bound
+        name no ``llm`` or ``llms`` argument gives gets a model on the
+        configured endpoint (:func:`~xmas.config.build_llms`).
 
         Args:
             path: The bundle.
@@ -1059,7 +1031,13 @@ class MAS(BasePredictor):
             bound.add(default_model)
         missing = sorted(bound - set(given))
         if missing:
-            given.update(_model_objects(missing))
+            models: dict[str, Capabilities] = {}
+            for system in reversed(systems):  # an outer entry wins over a box's
+                entries = system.get("models") or {}
+                models.update(
+                    {name: ModelEntry.parse(entry, f"models entry {name!r}") for name, entry in entries.items()}
+                )
+            given.update(build_llms(missing, models, configured()))
         default = given.get(default_model) if llm is None and default_model is not None else llm
         mas = cls.from_dict(spec, llm=default, llms=given, tools=sources)
         mas.bundle = Path(path)
@@ -1312,11 +1290,6 @@ def _built_systems(mas: MAS) -> Iterator[MAS]:
         yield from _built_systems(box.system)
 
 
-def _model_objects(names: Sequence[str]) -> dict[str, BaseLLM]:
-    """Return a model object for each bound name no ``llm`` or ``llms`` argument gave."""
-    raise ValueError(f"No model object for {list(names)}: pass llms={{name: model}}, or llm= for the default model.")
-
-
 def _callable_sources(
     systems: Sequence[Mapping[str, Any]], supplied: Sequence[ToolSource | Tool], configured: Callable[[], Config]
 ) -> list[ToolSource | Tool]:
@@ -1343,19 +1316,7 @@ def _callable_sources(
                         "its server and configure [tools.<name>] url."
                     )
                 servers.setdefault(server, {})[name] = entry.get("writes") or {name: "text"}
-    sources: list[ToolSource | Tool] = list(built.values())
-    if servers:
-        from xmas.tools.mcp import MCPTools  # here, not at the top: MCP is an extra
-
-        for server, writes in servers.items():
-            found = configured().tools.get(server)
-            if found is None:
-                raise ValueError(
-                    f"Callables {sorted(writes)} name the server {server!r}, which the configuration does not list: "
-                    f"add [tools.{server}] url to {config_path()}, or pass tools=[...] offering them."
-                )
-            sources.append(MCPTools(found.url, found.key, writes=writes, name=server))
-    return sources
+    return [*built.values(), *(tool_sources(servers, configured()) if servers else ())]
 
 
 def _imported(name: str, entry: Mapping[str, Any]) -> Tool:

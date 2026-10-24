@@ -1098,12 +1098,12 @@ def shout(text: str) -> str:
             id="models naming an unbound model",
         ),
         pytest.param(
-            lambda: load_media({**MEDIA_DATA, "models": {"vision-model": {"accepts": ["image"], "temperature": 0.2}}}),
+            lambda: load_media({**MEDIA_DATA, "models": {"vision-model": {"accepts": ["image"], "colour": "red"}}}),
             [
-                "models entry 'vision-model' has key 'temperature'; it takes accepts and produces (model parameters "
-                "come with the .mas bundle)"
+                "models entry 'vision-model' has key 'colour'; it takes model, accepts, produces and the parameters "
+                "max_tokens, timeout_s, temperature, top_p, seed, reasoning_effort"
             ],
-            id="a parameter in models",
+            id="an unknown key in models",
         ),
     ],
 )

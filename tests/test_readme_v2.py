@@ -1054,8 +1054,12 @@ def test_media_claims_without_a_block(slides: Path) -> None:
     assert painted.outputs["picture"].location.startswith(str(slides / "store"))
     with pytest.raises(ValueError, match="accepts only text"):
         MAS.from_dict({**spec, "models": {"painter-model": {"produces": ["image"]}}}, llms=llms)
-    with pytest.raises(ValueError, match="has key 'temperature'"):
-        MAS.from_dict({**spec, "models": {"vision-model": {"accepts": ["image"], "temperature": 0}}}, llms=llms)
+    tuned = MAS.from_dict(
+        {**spec, "models": {**models["models"], "vision-model": {"accepts": ["image"], "temperature": 0}}}, llms=llms
+    )
+    assert tuned.to_dict()["models"]["vision-model"] == {"accepts": ["image"], "temperature": 0}
+    with pytest.raises(ValueError, match="has key 'colour'; it takes model, accepts, produces and the parameters"):
+        MAS.from_dict({**spec, "models": {"vision-model": {"accepts": ["image"], "colour": "red"}}}, llms=llms)
     with pytest.raises(ValueError, match="models names 'other', which no agent binds"):
         MAS.from_dict({**spec, "models": {**models["models"], "other": {"accepts": ["image"]}}}, llms=llms)
     reviewer = Agent("reviewer", prompt="Review {pages}", inputs=["pages"], output="review", model="vision-model")

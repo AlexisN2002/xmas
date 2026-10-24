@@ -289,7 +289,7 @@ def _capabilities(tmp_path: Path) -> None:
         {},
     )
     for entry, words in (
-        ({"temperature": 0.2}, r"models entry 'x' has key 'temperature'; it takes accepts and produces \(model"),
+        ({"temperature": 0.2}, r"models entry 'x' has key 'temperature'; it takes accepts and produces$"),
         ({"accepts": ["video"]}, r"models entry 'x' accepts 'video'; a model may accept image, audio$"),
         ({"produces": ["audio"]}, r"models entry 'x' produces 'audio'; a model may produce image$"),
         ({"accepts": "image"}, r"models entry 'x' accepts is a list of words"),

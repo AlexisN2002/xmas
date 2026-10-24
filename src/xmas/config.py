@@ -53,12 +53,16 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from promptolution.llms.base_llm import BaseLLM
 
+from xmas.llms import APILLM
 from xmas.llms.meta import TokenPrice
+from xmas.media import TEXT_ONLY, Capabilities
+from xmas.tools import ToolSource
 
 CONFIG_ENV = "XMAS_CONFIG"
 """The environment variable naming the configuration file."""
@@ -428,3 +432,148 @@ def resolve_names(
         tail = f"closest: {', '.join(near)}" if near else "nothing close"
         issued.append(ModelNameWarning(f"model {name!r}{who} is not in {where}; {tail}", name, near))
     return Resolution(catalogue, found, tuple(issued))
+
+
+PARAMS: dict[str, tuple[type, ...]] = {
+    "max_tokens": (int,),
+    "timeout_s": (int, float),
+    "temperature": (int, float),
+    "top_p": (int, float),
+    "seed": (int,),
+    "reasoning_effort": (str,),
+}
+"""The model parameters a ``models:`` entry may set, with the types each takes."""
+
+_LLM_PARAMS = {"max_tokens": "max_tokens", "timeout_s": "call_timeout_s"}  # the others go out with each request
+
+
+@dataclass(frozen=True)
+class ModelEntry(Capabilities):
+    """A ``models:`` entry that names a catalogue id or sets parameters: ``editor: {model: kimi-k3, temperature: 0.2}``.
+
+    One id may stand under two names with different parameters. The
+    parameters apply to the model objects :meth:`~xmas.MAS.load` builds; a
+    model object passed in keeps its own.
+
+    Attributes:
+        model: The catalogue id the bound name stands for, or ``None`` for the name itself.
+        params: Parameters from :data:`PARAMS`, in the order the entry states them.
+    """
+
+    model: str | None = None
+    params: tuple[tuple[str, Any], ...] = ()
+
+    @classmethod
+    def parse(cls, entry: Any, where: str) -> Capabilities:
+        """Read a ``models:`` entry: a :class:`ModelEntry` when it names a model or a parameter, else capabilities.
+
+        Raises:
+            ValueError: As :meth:`Capabilities.parse`, for another key, for a ``model`` that is not a catalogue id,
+                or for a parameter of the wrong type.
+        """
+        if not isinstance(entry, Mapping):
+            return Capabilities.parse(entry, where)
+        for key in entry:
+            if key not in ("accepts", "produces", "model", *PARAMS):
+                raise ValueError(
+                    f"{where} has key {key!r}; it takes model, accepts, produces and the parameters {', '.join(PARAMS)}"
+                )
+        stated = Capabilities.parse({key: entry[key] for key in ("accepts", "produces") if key in entry}, where)
+        model = entry.get("model")
+        if "model" in entry and (not isinstance(model, str) or not model or "://" in model):
+            raise ValueError(f"{where} model is a catalogue id such as 'kimi-k3', not {model!r}")
+        params = []
+        for key, value in entry.items():
+            if key in PARAMS:
+                if isinstance(value, bool) or not isinstance(value, PARAMS[key]):
+                    want = (
+                        "a text" if PARAMS[key] == (str,) else "a whole number" if PARAMS[key] == (int,) else "a number"
+                    )
+                    raise ValueError(f"{where} {key} is {want}, not {value!r}")
+                params.append((key, value))
+        if model is None and not params:
+            return stated
+        return cls(stated.accepts, stated.produces, model, tuple(params))
+
+    def to_spec(self) -> dict[str, Any]:
+        """Return the ``models:`` entry: the id, the stated capabilities, then the parameters."""
+        return {**({"model": self.model} if self.model else {}), **super().to_spec(), **dict(self.params)}
+
+    def llm_kwargs(self) -> dict[str, Any]:
+        """Return the parameters as :class:`~xmas.llms.APILLM` takes them; ``timeout_s`` is ``call_timeout_s``."""
+        kwargs: dict[str, Any] = {_LLM_PARAMS[key]: value for key, value in self.params if key in _LLM_PARAMS}
+        sent = {key: value for key, value in self.params if key not in _LLM_PARAMS}
+        return {**kwargs, "call_kwargs": sent} if sent else kwargs
+
+
+class Unconfigured(BaseLLM):
+    """A bound model name with no endpoint configured: the system builds and checks, and its first call fails."""
+
+    full_response = True
+
+    def __init__(self, model: str, capabilities: Capabilities = TEXT_ONLY) -> None:
+        """Keep the model id and what the ``models:`` entry says it accepts and produces."""
+        super().__init__()
+        self.model = model
+        self.accepts, self.produces = capabilities.accepts, capabilities.produces
+
+    def _fail(self, *_: Any, **__: Any) -> NoReturn:
+        """Fail: there is no endpoint to ask."""
+        raise ValueError(
+            f"model {self.model!r} has no endpoint: set XMAS_BASE_URL, or base_url under [endpoint] in {config_path()}"
+        )
+
+    _get_response = generate_with_meta = get_tool_response_meta = _fail
+    generate_parts_with_meta = generate_image_with_meta = _fail
+
+
+def build_llms(names: Iterable[str], models: Mapping[str, Capabilities], config: Config) -> dict[str, BaseLLM]:
+    """Return a model object for each bound name, on the configured endpoint.
+
+    Each is an :class:`~xmas.llms.APILLM` for the name's catalogue id (its
+    ``models:`` entry's ``model``, else the name) with the entry's
+    capabilities and parameters and the configuration's key, price and
+    streaming; without an endpoint, an :class:`Unconfigured` model.
+    """
+    built: dict[str, BaseLLM] = {}
+    for name in names:
+        entry = models.get(name, TEXT_ONLY)
+        ident = entry.model if isinstance(entry, ModelEntry) and entry.model else name
+        if not config.base_url:
+            built[name] = Unconfigured(ident, entry)
+            continue
+        built[name] = APILLM(
+            model=ident,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            price=config.prices.get(ident),
+            stream=config.stream_of(ident),
+            accepts=entry.accepts or ("text",),
+            produces=entry.produces or ("text",),
+            **(entry.llm_kwargs() if isinstance(entry, ModelEntry) else {}),
+        )
+    return built
+
+
+def tool_sources(servers: Mapping[str, Mapping[str, Mapping[str, str]]], config: Config) -> list[ToolSource]:
+    """Return one MCP tool source per named server, at its configured address.
+
+    Args:
+        servers: Per server name, the callables it serves with what each writes.
+        config: Where the servers' addresses and keys come from.
+
+    Raises:
+        ValueError: For a server the configuration does not list; the message names both remedies.
+    """
+    from xmas.tools.mcp import MCPTools  # here, not at the top: MCP is an extra
+
+    sources: list[ToolSource] = []
+    for server, writes in servers.items():
+        found = config.tools.get(server)
+        if found is None:
+            raise ValueError(
+                f"Callables {sorted(writes)} name the server {server!r}, which the configuration does not list: "
+                f"add [tools.{server}] url to {config_path()}, or pass tools=[...] offering them."
+            )
+        sources.append(MCPTools(found.url, found.key, writes=dict(writes), name=server))
+    return sources
