@@ -1,5 +1,8 @@
 """Spec version 2: the worked examples round-trip, the check names every problem, describe is plain data.
 
+The media example's models section round-trips too, and the check refuses every agent whose model cannot read or
+write the kinds it does.
+
 These run on construction, serialization and ``describe()`` alone; running a
 version 2 system is tested in ``test_steps.py``, ``test_operators.py`` and
 ``test_chains.py``.
@@ -19,13 +22,30 @@ import yaml
 from xmas import END, MAS, START, Agent
 from xmas.chains import ForEach
 from xmas.check import check_system
+from xmas.convert import document_text
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
 from xmas.health import HealthSettings
+from xmas.media import TEXT_ONLY, Capabilities, File
 from xmas.nodes import Box, Step
+from xmas.optimization.graph_updater import GraphUpdater
+from xmas.optimization.synthesis import MechanicalSynthesizer
+from xmas.optimization.topology import TopologyBudget
 from xmas.routes import Join
 from xmas.tools import Tool, ToolSource, tool
 
-from .conftest import DECK, MockLLM, apology_text, assemble_deck, count_words, publish_text, render_page
+from .conftest import (
+    DECK,
+    MEDIA,
+    MockLLM,
+    SeeingLLM,
+    add,
+    apology_text,
+    assemble_deck,
+    count_words,
+    publish_text,
+    render_page,
+    render_pages,
+)
 
 
 @tool
@@ -902,3 +922,251 @@ def test_agent_read_maps_and_dicts() -> None:
     llm = MockLLM(lambda prompt: prompt.upper())
     trace = MAS([reader], llm=llm).run("cats")
     assert trace["reader"][0].inputs == {"text": "cats"} and llm.calls == ["Read cats"]  # keyed by placeholder
+
+
+# ------------------------------------------------------------------- media
+
+MEDIA_DATA: dict[str, Any] = yaml.safe_load(MEDIA)
+BARE_MEDIA = {key: value for key, value in MEDIA_DATA.items() if key != "models"}
+PLAN = {"slides": [{"id": "intro"}, {"id": "method"}, {"id": "result"}]}
+
+
+def load_media(data: dict[str, Any] | None = None, llm: Any = None) -> MAS:
+    """The media example, its vision model a :class:`SeeingLLM` unless given."""
+    return MAS.from_dict(
+        copy.deepcopy(MEDIA_DATA if data is None else data),
+        llms={"vision-model": SeeingLLM() if llm is None else llm},
+        tools=[document_text, render_pages],
+    )
+
+
+def test_the_media_example_round_trips(png: Path) -> None:
+    mas = load_media()
+    assert {name: str(vtype) for name, vtype in mas._checked().types.items()} == {
+        "plan": "json",
+        "house": "document",
+        "review": "text",
+        "house_rules": "text",
+        "slide_png": "list of image",
+    }
+    assert mas.models == {"vision-model": Capabilities(accepts=("image",))}
+    spec = mas.to_dict()
+    assert spec == MEDIA_DATA
+    assert list(spec) == ["version", "inputs", "outputs", "agents", "steps", "edges", "models", "callables", "prompts"]
+    again = load_media(json.loads(json.dumps(spec)))
+    assert again.to_dict() == spec and again.structure == mas.structure  # idempotent
+
+    described = mas.describe()
+    assert json.loads(json.dumps(described)) == described
+    assert described["models"] == {"vision-model": {"accepts": ["image"]}}
+    assert described["nodes"][-1]["reads"] == {"slide_png": "list of image", "house_rules": "text", "plan": "json"}
+    bare = load_media(BARE_MEDIA)  # its model states accepts itself
+    assert (bare.models, bare.to_dict(), bare.structure) == ({}, BARE_MEDIA, mas.structure)
+    assert "models" not in bare.describe() and bare.describe()["id"] == described["id"]  # no compiled graph changes
+    with pytest.raises(ValueError, match="'models' entry 'vision-model' must map accepts and produces to lists"):
+        load_media({**MEDIA_DATA, "models": {"vision-model": {"accepts": "image"}}})
+
+    # the house rules reach the reviewer as text, the three rendered pages as pictures
+    seer = SeeingLLM("The deck keeps its plan.")
+    house = png.with_name("house.md")
+    house.write_text("# House\nOne claim per page.", encoding="utf-8")
+    trace = load_media(llm=seer).run_state({"plan": PLAN, "house": house})
+    assert trace.error is None and trace.outputs == {"review": "The deck keeps its plan."}
+    (parts,) = seer.parts
+    assert [type(part).__name__ for part in parts] == ["str", "Ref", "str", "Ref", "str", "Ref"]
+    assert parts[0].endswith("Rules: # House\nOne claim per page.\nPages: \n[pages 0] ")
+    assert parts[2:5:2] == ["\n[pages 1] ", "\n[pages 2] "]
+    assert [part.read_bytes() for part in parts[1::2]] == [b"page intro", b"page method", b"page result"]
+
+
+def media_system(*agents: Agent, **settings: Any) -> MAS:
+    """``agents`` on a text model, ``text-model``, or on the unnamed default; both are scripted."""
+    return MAS(list(agents), llms={"text-model": MockLLM(turns=[])}, llm=MockLLM(turns=[]), **settings)
+
+
+@tool
+def shout(text: str) -> str:
+    """Shout a text."""
+    return text.upper()
+
+
+@pytest.mark.parametrize(
+    ("build", "phrases"),
+    [
+        pytest.param(
+            lambda: media_system(
+                Agent("judge", "Look: {png}", "verdict", ["png"], model="text-model"),
+                Agent("glance", "Glance at {png}", "note", ["png"]),
+                inputs={"png": "image"},
+                outputs={"verdict": "text", "note": "text"},
+            ),
+            [
+                "agent 'judge' reads image 'png', but model 'text-model' accepts only text; bind a model that accepts "
+                "image (models: {text-model: {accepts: [image]}}) or convert it first with a step",
+                "agent 'glance' reads image 'png', but the default model accepts only text; give it accepts = "
+                '("text", "image") or convert it first with a step',
+            ],
+            id="image read on a text model",
+        ),
+        pytest.param(
+            lambda: load_media(BARE_MEDIA, llm=MockLLM()),
+            ["agent 'reviewer' reads image 'slide_png', but model 'vision-model' accepts only text"],
+            id="list of image",
+        ),
+        pytest.param(
+            lambda: media_system(
+                Agent("writer", "Write in the style of {house}", "draft", ["house"]),
+                steps=[Step("loud", "shout", {"text": "house"})],
+                tools=[shout],
+                inputs={"house": "document"},
+                outputs={"draft": "text"},
+            ),
+            [
+                "agent 'writer' reads document 'house'; a model reads a document through a conversion step, such as "
+                "one using xmas.convert.document_text",
+                "step 'loud' passes document 'house' to parameter 'text' (string); text goes into a string parameter "
+                "only, document into a document parameter (xmas.media.Document) or a file, json into any other",
+            ],
+            id="document read",
+        ),
+        pytest.param(
+            lambda: media_system(Agent("reader", "Sum up {sheet}", "summary", ["sheet"]), inputs={"sheet": "table"}),
+            [
+                "agent 'reader' reads table 'sheet'; a model reads a table through a conversion step, such as one "
+                "using xmas.convert.table_rows"
+            ],
+            id="table read",
+        ),
+        pytest.param(
+            lambda: media_system(
+                Agent("painter", "Paint {query}", "picture", model="text-model", output_type="image"),
+                Agent("singer", "Sing {query}", "sound", output_type="audio"),
+                outputs={"picture": "image", "sound": "audio"},
+            ),
+            [
+                "agent 'painter' writes image 'picture', but model 'text-model' produces only text; bind a model "
+                "that produces image (models: {text-model: {produces: [image]}})",
+                "agent 'singer' writes audio 'sound'; a model answers with text, json or image",
+            ],
+            id="image write on a text model",
+        ),
+        pytest.param(
+            lambda: media_system(
+                Agent("painter", "Paint {query}", "picture", tools=["add"], output_type="image"),
+                tools=[add],
+                models={"text-model": {"produces": ["image"]}},
+            ),
+            ["agent 'painter' writes image and has tools; an image answer takes none"],
+            id="image write with tools",
+        ),
+        pytest.param(
+            lambda: media_system(
+                Agent("judge", "Look: {png}", "verdict", ["png"], model="text-model"),
+                Agent(
+                    "painter",
+                    "Paint {verdict}",
+                    "picture",
+                    ["verdict"],
+                    model="text-model",
+                    output_type="list of image",
+                ),
+                steps=[Step("post", "web_fetch", {"url": "png"})],
+                tools=[RemoteTools()],
+                inputs={"png": "image"},
+                outputs={"picture": "list of image"},
+                models={"text-model": {"accepts": ["image"], "produces": ["image"]}},
+            ),
+            [
+                "model 'text-model' accepts image but cannot send content parts; use APILLM, or give it "
+                "generate_parts_with_meta and full_response = True",
+                "model 'text-model' produces image but cannot answer with images; use APILLM, or give it "
+                "generate_image_with_meta and full_response = True",
+                "step 'post' passes image 'png' to remote tool 'web_fetch'; remote tools read no media",
+            ],
+            id="a media model without parts",
+        ),
+        pytest.param(
+            lambda: media_system(Agent("a", "Do {query}", "x"), models={"ghost": {"accepts": ["image"]}}),
+            ["models names 'ghost', which no agent binds"],
+            id="models naming an unbound model",
+        ),
+        pytest.param(
+            lambda: load_media({**MEDIA_DATA, "models": {"vision-model": {"accepts": ["image"], "temperature": 0.2}}}),
+            [
+                "models entry 'vision-model' has key 'temperature'; it takes accepts and produces (model parameters "
+                "come with the .mas bundle)"
+            ],
+            id="a parameter in models",
+        ),
+    ],
+)
+def test_check_names_every_capability_problem(build: Any, phrases: list[str]) -> None:
+    with pytest.raises(ValueError) as info:
+        build()
+    for phrase in phrases:
+        assert phrase in str(info.value), (phrase, str(info.value))
+
+
+class Squinting(MockLLM):
+    """A model whose ``accepts`` is no list of words, so it reads text only."""
+
+    accepts = "image"
+
+
+@tool(writes={"size": "json"})
+def weigh(upload: File) -> int:
+    """Weigh any file."""
+    return upload.size or 0
+
+
+def test_capabilities_resolve_in_order(png: Path) -> None:
+    judge = Agent("judge", "Look: {png}", "verdict", ["png"], model="seer")
+    seer = SeeingLLM()
+
+    def judged(**settings: Any) -> MAS:
+        return MAS([judge], llms={"seer": seer}, inputs={"png": "image"}, **settings)
+
+    # the models entry over the model's own attributes over text only
+    assert judged().capabilities(judge) == Capabilities(("text", "image"))
+    declared = judged(models={"seer": {"accepts": ["image", "audio"]}})
+    assert declared.capabilities(judge) == Capabilities(("image", "audio")) and declared.version == 2
+    with pytest.raises(ValueError, match="model 'seer' accepts only text; bind a model that accepts image"):
+        judged(models={"seer": {}})
+    plain = Agent("plain", "Read {query}", "note")
+    assert MAS([plain], llm=Squinting(), version=2).capabilities(plain) == TEXT_ONLY
+    assert MAS([plain], llm=MockLLM()).models == {}  # version 1
+
+    # default_model names the default model
+    looker = Agent("looker", "Look: {png}", "verdict", ["png"])
+    named = MAS(
+        [looker], llm=seer, default_model="eye", inputs={"png": "image"}, models={"eye": {"accepts": ["image"]}}
+    )
+    assert named.capabilities(looker) == Capabilities(("image",))
+    with pytest.raises(
+        ValueError, match=re.escape("model 'eye' accepts only text; bind a model that accepts image (models: {eye:")
+    ):
+        MAS([looker], llm=seer, default_model="eye", inputs={"png": "image"}, models={"eye": {"accepts": []}})
+
+    # copy, rebuild and a chain's system keep the models
+    assert declared.copy().models == declared.models and declared.copy().to_dict()["models"] == {
+        "seer": {"accepts": ["image", "audio"]}
+    }
+    updater = GraphUpdater(MechanicalSynthesizer(), TopologyBudget(max_agents=2, max_edges=2), seed=0)
+    assert updater.rebuild(declared, updater.names_of(declared), updater.edges_of(declared)).models == declared.models
+    each: dict[str, Any] = {
+        "inputs": {"pngs": "list of image"},
+        "each": {"judge": "png in pngs"},
+        "outputs": {"verdict": "list of text"},
+    }
+    chained = MAS([judge], llms={"seer": seer}, models={"seer": {"accepts": ["image"]}}, **each)
+    assert chained._checked().chains["judge"].system.models == chained.models
+    with pytest.raises(
+        ValueError, match="chain 'judge': agent 'judge' reads image 'png', but model 'seer' accepts only"
+    ):
+        MAS([judge], llms={"seer": seer}, models={"seer": {}}, **each)
+
+    # a step reading a file takes an image
+    weighed = MAS([], steps=[Step("weigh", "weigh", {"upload": "png"})], inputs={"png": "image"}, tools=[weigh])
+    assert weighed.describe()["nodes"][0]["reads"] == {"png": "image"}
+    trace = weighed.run_state({"png": png})
+    assert trace.error is None and trace.output == "6"

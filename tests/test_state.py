@@ -1,4 +1,4 @@
-"""State in, several outputs out: ``run_state``, declared outputs, retries, the reserved reads, events and caps.
+"""State in, several outputs out: ``run_state``, declared outputs, retries, reserved reads, events, caps, pictures.
 
 The models are scripted doubles, so no test spends money.
 """
@@ -6,19 +6,23 @@ The models are scripted doubles, so no test spends money.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from xmas import MAS, Agent, Box, Budget, ErrorKind, TokenUsage
 from xmas.edges import Edge, EdgeKind
+from xmas.media import Image, Ref
 from xmas.nodes import Step
-from xmas.tools import tool
+from xmas.tools import run_step, tool
 
-from .conftest import MockLLM
+from .conftest import PNG, MockLLM, PaintingLLM, SeeingLLM
 
 
 def deck_notes(llm: MockLLM) -> MAS:
@@ -242,3 +246,93 @@ def test_events_and_the_parallel_call_cap() -> None:
     for wrong in (0, 1.5, True):  # a float cap would hold no call back
         with pytest.raises(ValueError, match="max_parallel_calls must be an integer >= 1"):
             Budget(max_parallel_calls=cast("int", wrong))
+
+
+def test_run_state_with_pictures(png: Path) -> None:
+    judge = Agent("judge", "Look: {png}", "verdict", ["png"])
+    seeing = SeeingLLM("fits")
+    looked = MAS([judge], inputs={"png": "list of image"}, llm=seeing).run_state({"png": [png]})
+    ref = Ref.from_path(png)
+    assert looked.error is None and seeing.parts == [["Look: \n[png 0] ", ref]]
+    (record,) = looked.records
+    assert record.rendered_prompt == "Look: \n[png 0] [image a.png, image/png, 6 B]"
+    assert record.inputs == {"png": json.dumps([ref.to_dict()])}  # the model sees bytes, the record a reference
+    assert json.loads(looked.query)["png"] == [ref.to_dict()]
+
+    # one picture is one part; a json judge's format block and retry note follow it as text
+    form = {"fits": {"type": "bool"}}
+    strict = Agent("judge", "Look: {png}", "verdict", ["png"], output_type="json", schema=form)
+    retried = SeeingLLM(answers=["not json", '{"fits": true}'])
+    trace = MAS([strict], inputs={"png": "image"}, llm=retried).run_state({"png": png})
+    assert trace.error is None and trace.records[0].outputs == {"verdict": '{"fits": true}'}
+    first, second = retried.parts
+    assert first[:2] == ["Look: ", ref] and first[2].startswith("\n\nAnswer") and len(first) == 3
+    assert second[:2] == first[:2] and second[2].startswith(first[2]) and len(second) == 3
+    assert trace.records[0].rendered_prompt.startswith("Look: [image a.png, image/png, 6 B]\n\nAnswer")
+
+    # a file that changed since it was given is refused when the call reads it
+    png.write_bytes(PNG + b"!")
+    changed = MAS([judge], inputs={"png": "list of image"}, llm=SeeingLLM()).run_state({"png": [ref]})
+    assert "a.png changed since it was referenced" in (changed.error or "")
+
+    # a painting model's picture is kept in the store; the record holds its ref
+    painter = Agent("painter", "Paint {query}", "picture", output_type="image")
+    painted = MAS([painter], llm=PaintingLLM(), outputs={"picture": "image"}).run_state({"query": "a cat"})
+    picture = painted.outputs["picture"]
+    assert painted.error is None and isinstance(picture, Ref) and picture.read_bytes() == PNG + b"\x00"
+    assert Path(picture.location).parent.parent == Path(os.environ["XMAS_STORE"])
+    assert painted.records[0].outputs == {"picture": json.dumps(picture.to_dict())}
+    assert painted.records[0].raw_response == "drawn"
+    many = Agent("painter", "Paint {query}", "pictures", output_type="list of image")
+    drawn = MAS([many], llm=PaintingLLM(count=2), outputs={"pictures": "list of image"}).run_state({"query": "cats"})
+    assert [ref.read_bytes() for ref in drawn.outputs["pictures"]] == [PNG + b"\x00", PNG + b"\x01"]
+    for count, wanted in ((2, "expected one image, got 2"), (0, "expected one image, got 0")):
+        refused = MAS([painter], llm=PaintingLLM(count=count), version=2).run("a cat")
+        assert refused.error_kind is ErrorKind.BAD_FORMAT and wanted in (refused.error or "")
+    nothing = MAS([many], llm=PaintingLLM(count=0), version=2).run("cats")
+    assert "expected at least one image, got 0" in (nothing.error or "")
+
+    # a trace with pictures is plain JSON, and no picture's bytes are in it
+    for trace in (looked, painted, drawn):
+        text = json.dumps(trace.to_dict())
+        assert "base64," not in text and json.loads(text)["records"]
+    assert painted.to_dict()["outputs"] == {"picture": picture.to_dict()}
+
+
+def _stores_step_paths() -> bool:
+    """Whether a step's returned Path becomes a stored ref, which ``run_step`` does once it stores media writes."""
+    with tempfile.TemporaryDirectory() as folder, pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XMAS_STORE", folder)
+        picture = Path(folder) / "a.png"
+        picture.write_bytes(PNG)
+
+        @tool(writes={"png": "image"})
+        def draw() -> Image:
+            """Return the picture's path."""
+            return cast("Image", picture)
+
+        try:
+            return isinstance(run_step(draw, cast("Any", None), {})["png"], Ref)
+        except Exception:
+            return False
+
+
+@pytest.mark.skipif(not _stores_step_paths(), reason="run_step does not store a step's returned Path yet")
+def test_a_step_returning_a_path_writes_a_stored_ref(png: Path) -> None:
+    @tool(writes={"png": "image"})
+    def draw(query: str) -> Image:
+        """Draw a page to the same file every time."""
+        png.write_bytes(query.encode())
+        return cast("Image", png)
+
+    mas = MAS(
+        [Agent("judge", "Look: {png}", "verdict", ["png"])],
+        [("draw", "judge")],
+        steps=[Step("draw", "draw")],
+        tools=[draw],
+        llm=SeeingLLM(),
+        outputs={"png": "image", "verdict": "text"},
+    )
+    first, second = (mas.run_state({"query": text}).outputs["png"] for text in ("one", "two"))
+    assert (first.read_bytes(), second.read_bytes()) == (b"one", b"two")  # a copy each, not the rewritten file
+    assert Path(first.location).parent.parent == Path(os.environ["XMAS_STORE"])

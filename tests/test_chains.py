@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -17,6 +18,7 @@ from langgraph.errors import GraphBubbleUp
 from xmas import MAS, Agent, Box, Budget, ErrorKind, RunStatus
 from xmas.budget import RunMeter
 from xmas.edges import Edge, EdgeKind
+from xmas.media import Image, Ref
 from xmas.nodes import Step
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
@@ -29,6 +31,7 @@ from .conftest import (
     LONG_PAGE,
     PLAN,
     MockLLM,
+    SeeingLLM,
     assemble_deck,
     deck,
     deck_llms,
@@ -409,3 +412,72 @@ def test_langgraph_signals_pass_the_wrapper() -> None:
     with pytest.raises(GraphBubbleUp):
         mas.compiled.invoke(_initial_state({"pages": ["a", "b"]}, mas.prompts()), config=_run_config(mas, meter))
     assert [(r.agent, r.error) for r in meter.records] == [("writer", None), ("writer", None)]  # no failed record
+
+
+@tool(writes={"png": "image"})
+def render_slide(page: dict[str, Any]) -> Image:
+    """Draw one slide as a picture in the store; a broken one cannot be drawn."""
+    if page.get("broken"):
+        raise ValueError("cannot draw a broken slide")
+    return Ref.from_bytes(f"slide {page['id']}".encode(), "image/png", f"{page['id']}.png")
+
+
+@tool(writes={"deck": "json"})
+def assemble_pictures(png: list[Image]) -> dict[str, Any]:
+    """Put the drawn slides together."""
+    return {"pages": [picture.size for picture in png]}
+
+
+def slides(*, assemble: bool) -> tuple[MAS, SeeingLLM, SeeingLLM]:
+    """Each slide is rendered and judged on its own picture; ``reviewer``, then ``assemble``, take all of them."""
+    eye = SeeingLLM(lambda parts: f"fits {parts[1].read_bytes().decode()}")
+    desk = SeeingLLM("the deck holds")
+    steps, edges = [Step("render", "render_slide")], [("render", "judge"), ("judge", "reviewer")]
+    outputs = {"review": "text", "verdict": "list of text"}
+    if assemble:
+        steps.append(Step("assemble", "assemble_pictures"))
+        edges.append(("reviewer", "assemble"))
+        outputs["deck"] = "json"
+    mas = MAS(
+        [
+            Agent("judge", "Judge this slide: {png}", "verdict", ["png"], model="eye"),
+            Agent("reviewer", "Review the deck: {png}", "review", ["png"], model="desk"),
+        ],
+        edges,
+        llms={"eye": eye, "desk": desk},
+        steps=steps,
+        tools=[render_slide, assemble_pictures],
+        inputs={"plan": "json"},
+        each={"render": {"item": "page", "in": "plan.slides", "key": "id"}, "judge": "page in plan.slides"},
+        outputs=outputs,
+    )
+    return mas, eye, desk
+
+
+def test_the_judge_sees_each_slide(png: Path) -> None:  # the fixture keeps the store apart
+    mas, eye, desk = slides(assemble=True)
+    assert str(mas._checked().types["png"]) == "list of image"
+    trace = mas.run_state(plan_of("intro", "method", "result"))
+    assert trace.error is None
+    assert trace.outputs["verdict"] == ["fits slide intro", "fits slide method", "fits slide result"]
+    assert sorted(parts[1].read_bytes() for parts in eye.parts) == [b"slide intro", b"slide method", b"slide result"]
+    assert all(parts[0] == "Judge this slide: " and len(parts) == 2 for parts in eye.parts)
+    pictures = [record.outputs["png"] for record in trace["render"]]
+    assert [json.loads(line)["media_type"] for line in pictures] == ["image/png"] * 3
+    assert trace.outputs["deck"] == {"pages": [11, 12, 12]}
+    assert json.loads(trace["assemble"][0].inputs["png"]) == [json.loads(line) for line in pictures]
+    (parts,) = desk.parts
+    assert parts[0::2] == ["Review the deck: \n[png 0] ", "\n[png 1] ", "\n[png 2] "]
+    assert [part.read_bytes() for part in parts[1::2]] == [b"slide intro", b"slide method", b"slide result"]
+
+    # a slide that cannot be drawn is no picture: the reviewer sees (none) in its place
+    broken, eye, desk = slides(assemble=False)
+    plan = {"plan": {"slides": [{"id": "intro"}, {"id": "method", "broken": True}, {"id": "result"}]}}
+    failed = broken.run_state(plan)
+    assert failed.error is None and failed.outputs["verdict"] == ["fits slide intro", None, "fits slide result"]
+    assert len(eye.parts) == 2
+    (parts,) = desk.parts
+    assert [type(part).__name__ for part in parts] == ["str", "Ref", "str", "Ref"]
+    assert parts[2] == "\n[png 1] (none)\n[png 2] "
+    assert "[png 1] (none)\n[png 2] [image " in failed["reviewer"][0].rendered_prompt
+    assert json.loads(failed["reviewer"][0].inputs["png"])[1] is None

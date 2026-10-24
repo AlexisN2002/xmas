@@ -1,4 +1,4 @@
-"""Shared test doubles: the scripted model, a recording tool source, a patched APILLM, the worked example and the deck.
+"""Shared test doubles: scripted models, a recording tool source, a patched APILLM, and the worked examples.
 
 The mock model is the reason CI can run the whole framework end to end without a
 key: it satisfies promptolution's LLM contract exactly, so nothing under test has
@@ -8,10 +8,15 @@ to know it is not talking to a real endpoint.
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
+import re
+import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+import types
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import httpx2
@@ -25,7 +30,9 @@ from xmas import MAS, Agent, TokenUsage
 from xmas.edges import Edge, EdgeKind
 from xmas.llms.api_llm import APILLM
 from xmas.llms.meta import CallMeta
+from xmas.media import Image, Ref
 from xmas.nodes import Step
+from xmas.prompts import safe_format
 from xmas.tools import Tool, ToolCallRequest, ToolSource, tool
 
 Turn = tuple[str, list[ToolCallRequest]]
@@ -382,6 +389,135 @@ def deck_llms() -> dict[str, MockLLM]:
 def deck() -> MAS:
     """The deck of :data:`DECK` on :func:`deck_llms`."""
     return MAS.from_dict(yaml.safe_load(DECK), llms=dict(deck_llms()), tools=[render_page, assemble_deck])
+
+
+# ------------------------------------------------------------ media: pictures
+
+PNG = b"\x89PNG-a"
+"""The bytes of a tiny picture: six of them, enough for a ref."""
+
+
+@pytest.fixture
+def png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A tiny picture file, ``a.png``; the store (``XMAS_STORE``) lives beside it for the test."""
+    monkeypatch.setenv("XMAS_STORE", str(tmp_path / "store"))
+    path = tmp_path / "a.png"
+    path.write_bytes(PNG)
+    return path
+
+
+class SeeingLLM(MockLLM):
+    """A model that accepts images: it records every list of content parts it is sent in ``parts``.
+
+    It reads each picture's bytes, as a request would, and answers parts with
+    ``answer`` (a text, or a function of the parts), or with the next of
+    ``answers``, as :class:`MockLLM` answers text.
+    """
+
+    accepts = ("text", "image")
+
+    def __init__(self, answer: str | Callable[[list[Any]], str] = "ok", *, answers: list[str] | None = None) -> None:
+        """Answer every call with ``answer``, or with the next of ``answers``."""
+        super().__init__(answers=list(answers) if answers is not None else None, meta=True)
+        self.answer = answer
+        self.parts: list[list[Any]] = []
+
+    def generate_parts_with_meta(self, parts: Sequence[Any], system_prompt: str = "") -> tuple[str, CallMeta]:
+        """Record the parts, read their bytes and answer them."""
+        self.parts.append(list(parts))
+        for part in parts:
+            if isinstance(part, Ref):
+                part.read_bytes()
+        if self.answers:
+            return self._next_answer(""), META
+        return (self.answer if isinstance(self.answer, str) else self.answer(list(parts))), META
+
+
+class PaintingLLM(MockLLM):
+    """A model that produces images: each image call answers ``text`` and ``count`` pictures of :data:`PNG`."""
+
+    produces = ("image",)
+
+    def __init__(self, text: str = "drawn", count: int = 1) -> None:
+        """Answer every image call with ``text`` and ``count`` pictures."""
+        super().__init__(meta=True)
+        self.text, self.count = text, count
+        self.asked: list[Any] = []
+
+    def generate_image_with_meta(
+        self, prompt: str | Sequence[Any], system_prompt: str = ""
+    ) -> tuple[str, list[tuple[bytes, str]], CallMeta]:
+        """Record the prompt and paint."""
+        self.asked.append(prompt)
+        return self.text, [(PNG + bytes([index]), "image/png") for index in range(self.count)], META
+
+
+@tool(writes={"slide_png": "list of image"})
+def render_pages(plan: dict[str, Any]) -> list[Image]:
+    """Draw each slide of a plan as a picture in the store."""
+    return [
+        Ref.from_bytes(f"page {slide['id']}".encode(), "image/png", f"{slide['id']}.png") for slide in plan["slides"]
+    ]
+
+
+MEDIA = """\
+version: 2
+inputs: {plan: json, house: document}
+outputs: {review: text}
+agents:
+- {name: reviewer, model: vision-model, reads: {pages: slide_png, rules: house_rules, plan: plan}, writes: {review: text}}
+steps:
+- {name: house_text, uses: document_text, reads: {source: house}, writes: {content: house_rules}}
+- {name: render, uses: render_pages}
+edges:
+- house_text -> render -> reviewer
+models:
+  vision-model: {accepts: [image]}
+callables:
+  document_text: {kind: python, import: 'xmas.convert:document_text', reads: {source: document}, writes: {content: text}}
+  render_pages: {kind: python, import: 'tests.conftest:render_pages', reads: {plan: json}, writes: {slide_png: list of image}}
+prompts:
+  reviewer: "Review the drawn deck against its plan and the house rules.\\nPlan: {plan}\\nRules: {rules}\\nPages: {pages}"
+"""  # noqa: E501
+"""A reviewer that reads the drawn pages as pictures, on a model that accepts images, and the house rules as text."""
+
+
+def _stand_in_parts() -> types.ModuleType:
+    """The content-parts contract of ``xmas.llms.parts`` for a tree without it: ``render_parts`` and ``marker``."""
+
+    def marker(ref: Ref) -> str:
+        size = "" if ref.size is None else f", {ref.size} B" if ref.size < 1024 else f", {round(ref.size / 1024)} KB"
+        return f"[{ref.kind} {ref.name}, {ref.media_type}{size}]"
+
+    def render_parts(template: str, text: Mapping[str, str], media: Mapping[str, Any]) -> tuple[list[str | Ref], str]:
+        pieces: list[list[str | Ref]] = []
+        values = dict(text)
+        for index, (placeholder, value) in enumerate(media.items()):
+            values[placeholder] = f"\x00{index}\x00"
+            if isinstance(value, Ref):
+                pieces.append([value])
+            elif value is None:
+                pieces.append([])
+            else:
+                pieces.append(
+                    [p for i, item in enumerate(value) for p in (f"\n[{placeholder} {i}] ", item or "(none)")]
+                )
+        parts: list[str | Ref] = []
+        for index, chunk in enumerate(re.split("\x00([0-9]+)\x00", safe_format(template, values))):
+            for part in pieces[int(chunk)] if index % 2 else [chunk]:
+                if isinstance(part, str) and parts and isinstance(parts[-1], str):
+                    parts[-1] += part
+                elif part != "":
+                    parts.append(part)
+        return parts, "".join(marker(part) if isinstance(part, Ref) else part for part in parts)
+
+    module = types.ModuleType("xmas.llms.parts")
+    module.marker, module.render_parts = marker, render_parts  # type: ignore[attr-defined]
+    return module
+
+
+if importlib.util.find_spec("xmas.llms.parts") is None:
+    sys.modules["xmas.llms.parts"] = _stand_in_parts()
 
 
 # ------------------------------------------------------------- live gateway
