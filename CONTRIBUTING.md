@@ -51,6 +51,8 @@ docs: document the XMAS_BASE_URL convention
 |---|---|---|
 | Lint | ruff | `uv run ruff check .` |
 | Format | ruff | `uv run ruff format .` |
+| Dead code | vulture | `uv run vulture xmas tests --min-confidence 80` |
+| Dependencies | deptry | `uv run deptry .` |
 | Types | mypy (strict) | `uv run mypy` |
 | Tests | pytest | `uv run pytest` |
 
