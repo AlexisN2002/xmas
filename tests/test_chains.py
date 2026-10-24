@@ -6,17 +6,22 @@ The models are scripted doubles, so no test spends money.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import Any, cast
 
 import pytest
 import yaml
+from langgraph.errors import GraphBubbleUp
 
 from xmas import MAS, Agent, Box, Budget, ErrorKind, RunStatus
+from xmas.budget import RunMeter
 from xmas.edges import Edge, EdgeKind
 from xmas.nodes import Step
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
 from xmas.optimization.topology import TopologyBudget
+from xmas.runtime import _initial_state, _run_config
 from xmas.tools import tool
 
 from .conftest import (
@@ -223,15 +228,18 @@ def test_zero_items_outer_loop_and_key_problems(case: str) -> None:
         assert trace.outputs["words"] == [4, 4]  # no stale third page
         assert len(llm.calls) == 5
     else:
-        bad = {
+        cases: dict[str, list[tuple[dict[str, Any], str]]] = {
             "bad keys": [
                 (plan_of("a", "a"), "plan.slides repeats the key 'id': ['a']"),
                 ({"plan": {"slides": [{"id": "a"}, {"name": "b"}]}}, "item 1 of plan.slides has no key 'id'"),
                 ({"plan": {"slides": [{"id": "a"}, {"id": True}]}}, "item 1 of plan.slides has no key 'id'"),
             ],
-            "a dict at the path": [({"plan": {"slides": {"id": "a"}}}, "plan.slides holds dict, not a list")],
-        }[case]
-        for values, problem in bad:
+            "a dict at the path": [
+                ({"plan": {"slides": {"id": "a"}}}, "plan.slides holds dict, not a list"),
+                ({"plan": [{"slides": []}]}, "plan holds list, not a mapping with 'slides'"),
+            ],
+        }
+        for values, problem in cases[case]:
             mas, llm = pages()
             trace = mas.run_state(values)
             assert trace.error is not None and trace.error.startswith("ValueError: for each page in plan.slides: ")
@@ -327,3 +335,77 @@ def test_topology_search_never_breaks_a_chain() -> None:
         assert candidate.each == mas.each and candidate.agents["writer"].reads == {"slide": "page"}
         assert {(e.source, e.target) for e in candidate.edges} >= {("writer", "count"), ("count", "summarizer")}
         assert candidate.run_state(plan_of("a", "b")).error is None
+
+
+def test_boxes_in_items_keep_apart() -> None:
+    def cut(prompt: str) -> str:
+        if "bad" in prompt:
+            time.sleep(0.1)  # the siblings' inner records land on the same list meanwhile
+            raise RuntimeError("boom")
+        return prompt.upper()
+
+    def counted(prompt: str) -> str:
+        tag = prompt.split()[0]
+        with lock:
+            now[tag] += 1
+            most[tag] = max(most[tag], now[tag])
+        time.sleep(0.03)
+        with lock:
+            now[tag] -= 1
+        return "ok"
+
+    inner = MAS(
+        [Agent("first", "First: {page}", "mid", ["page"]), Agent("cutter", "Cut: {mid}", "short", ["mid"])],
+        [("first", "cutter")],
+        inputs={"page": "text"},
+        llm=MockLLM(cut),
+    )
+    box = Box("shorten", inner, reads={"page": "page"}, writes={"short": "short"})
+    pages = {"pages": "list of text"}
+    mas = MAS([], boxes=[box], each={"shorten": "page in pages"}, outputs={"short": "list of text"}, inputs=pages)
+    trace = mas.run_state({"pages": ["a", "bad", "c", "d"]})
+    (failed,) = [r for r in trace.records if r.error is not None]
+    assert failed.item == 1 and failed.inner is not None
+    assert [(r.agent, r.item) for r in failed.inner.records] == [("first", 1)]  # no sibling's records
+
+    # two chains with the same head name keep their own at once
+    lock, now, most = threading.Lock(), {"Narrow": 0, "Wide": 0}, {"Narrow": 0, "Wide": 0}
+
+    def system(tag: str, at_once: int) -> MAS:
+        each = {"w": {"item": "page", "in": "pages", "at once": at_once}}
+        writer = Agent("w", tag + " {page}", "d", ["page"])
+        return MAS([writer], each=each, outputs={"d": "list of text"}, llm=MockLLM(counted), inputs=pages)
+
+    both = MAS(
+        [],
+        boxes=[
+            Box("narrow", system("Narrow", 1), reads={"pages": "pages"}, writes={"d": "narrow"}),
+            Box("wide", system("Wide", 4), reads={"pages": "pages"}, writes={"d": "wide"}),
+        ],
+        outputs={"narrow": "list of text", "wide": "list of text"},
+        inputs=pages,
+    )
+    assert both.run_state({"pages": list("abcdefgh")}).error is None
+    assert most == {"Narrow": 1, "Wide": 4}
+
+
+def test_langgraph_signals_pass_the_wrapper() -> None:
+    @tool(writes={"done": "text"})
+    def pause(draft: str) -> str:
+        """Pause the run, as an interrupt does."""
+        raise GraphBubbleUp
+
+    mas = MAS(
+        [Agent("writer", "Write {page}", "draft", ["page"])],
+        [("writer", "halt")],
+        steps=[Step("halt", "pause")],
+        each={"writer": "page in pages", "halt": "page in pages"},
+        inputs={"pages": "list of text"},
+        outputs={"done": "list of text"},
+        llm=MockLLM(lambda prompt: "a draft"),
+        tools=[pause],
+    )
+    meter = RunMeter(owner=mas)
+    with pytest.raises(GraphBubbleUp):
+        mas.compiled.invoke(_initial_state({"pages": ["a", "b"]}, mas.prompts()), config=_run_config(mas, meter))
+    assert [(r.agent, r.error) for r in meter.records] == [("writer", None), ("writer", None)]  # no failed record

@@ -9,7 +9,7 @@ import json
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -239,5 +239,6 @@ def test_events_and_the_parallel_call_cap() -> None:
         wide = MAS(agents, [(name, "sum") for name in names], llm=MockLLM(slow), budget=Budget(max_parallel_calls=cap))
         assert wide.run("cats").error is None
         assert now["most"] > 2 if cap is None else now["most"] == cap
-    with pytest.raises(ValueError, match="max_parallel_calls must be >= 1"):
-        Budget(max_parallel_calls=0)
+    for wrong in (0, 1.5, True):  # a float cap would hold no call back
+        with pytest.raises(ValueError, match="max_parallel_calls must be an integer >= 1"):
+            Budget(max_parallel_calls=cast("int", wrong))

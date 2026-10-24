@@ -394,6 +394,20 @@ class MAS(BasePredictor):
         """Return the current prompt of every agent, keyed by name."""
         return {name: agent.prompt for name, agent in self.agents.items()}
 
+    def _spread(self, prompts: Mapping[str, str]) -> dict[str, str]:
+        """Return ``prompts``, keyed by agent, with each text also set on the agents sharing its prompt.
+
+        An agent named in ``prompts`` keeps its own text, so a whole prompt set
+        passes unchanged.
+        """
+        spread = dict(prompts)
+        for name, text in prompts.items():
+            shared = self.prompt_names.get(name)
+            spread.update(
+                {other: text for other, key in self.prompt_names.items() if key == shared and other not in prompts}
+            )
+        return spread
+
     def predict(
         self,
         prompts: str | list[str],
@@ -465,11 +479,7 @@ class MAS(BasePredictor):
         unknown = (set(prompts) | set(models)) - set(self.agents)
         if unknown:
             raise ValueError(f"copy() names unknown agents: {sorted(unknown)}.")
-        for name, text in list(prompts.items()):
-            shared = self.prompt_names.get(name)
-            prompts.update(
-                {other: text for other, key in self.prompt_names.items() if key == shared and other not in prompts}
-            )
+        prompts = self._spread(prompts)
         new_agents = [
             agent.copy(prompt=prompts.get(name, agent.prompt), model=models.get(name, agent.model))
             for name, agent in self.agents.items()

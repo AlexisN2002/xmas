@@ -15,8 +15,18 @@ from xmas.tasks.base import MASTask
 
 
 def movable_agents(mas: MAS) -> list[str]:
-    """Return the agents not frozen, in the system's order; ``ValueError`` when every agent is frozen."""
-    names = [name for name in mas.agents if name not in mas.frozen]
+    """Return the agents not frozen, in the system's order; ``ValueError`` when every agent is frozen.
+
+    Agents sharing a prompt are one prompt to optimize: the first of them
+    stands for all, and none moves when one of them is frozen.
+    """
+    seen = {mas.prompt_names.get(name, name) for name in mas.frozen}
+    names = []
+    for name in mas.agents:
+        key = mas.prompt_names.get(name, name)
+        if key not in seen:
+            names.append(name)
+        seen.add(key)
     if not names:
         raise ValueError(f"Every agent is frozen ({sorted(mas.frozen)}); there is no prompt to optimize.")
     return names
@@ -112,7 +122,7 @@ class AgentPromptView(BasePredictor):
         """Run the system on ``xs`` with each prompt in this view's agent; ``BasePredictor``'s pair."""
         candidates = [prompts] * len(xs) if isinstance(prompts, str) else list(prompts)
         base = self.mas.prompts()
-        encoded = [encode_prompts({**base, self.agent: prompt}) for prompt in candidates]
+        encoded = [encode_prompts({**base, **self.mas._spread({self.agent: prompt})}) for prompt in candidates]
         return self.mas.predict(encoded, xs, system_prompts=system_prompts)
 
     # promptolution's BasePredictor calls _extract_preds on every prediction batch.

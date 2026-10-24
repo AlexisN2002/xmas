@@ -34,7 +34,7 @@ class Budget:
     no cost and the model has no price, refuses the next call instead of silently
     not binding. A negative or NaN limit is refused. ``max_parallel_calls`` caps
     the model calls in flight at once, across every branch, box and item of the
-    run; a call waits for a free slot. It is at least ``1``.
+    run; a call waits for a free slot. It is an integer of at least ``1``.
     """
 
     max_cost_usd: float | None = None
@@ -43,13 +43,14 @@ class Budget:
     max_parallel_calls: int | None = None
 
     def __post_init__(self) -> None:
-        """Refuse negative and NaN limits, and a parallel cap below 1."""
+        """Refuse negative and NaN limits, and a parallel cap that is not an integer of at least 1."""
         for name in ("max_cost_usd", "max_wall_s", "max_calls"):
             value = getattr(self, name)
             if value is not None and not value >= 0:
                 raise ValueError(f"Budget.{name} must be >= 0, got {value!r}")
-        if self.max_parallel_calls is not None and not self.max_parallel_calls >= 1:
-            raise ValueError(f"Budget.max_parallel_calls must be >= 1, got {self.max_parallel_calls!r}")
+        cap: object = self.max_parallel_calls
+        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
+            raise ValueError(f"Budget.max_parallel_calls must be an integer >= 1, got {cap!r}")
 
 
 class _Counts(Protocol):
@@ -213,7 +214,10 @@ class RunMeter(_Metering):
         return nullcontext() if self._slots is None else self._slots
 
     def gate(self, key: str, limit: int | None) -> AbstractContextManager[Any]:
-        """Hold one of ``limit`` places under ``key``, such as a chain's items at once; ``None`` holds nothing."""
+        """Hold one of ``limit`` places under ``key``, such as a chain's items at once; ``None`` holds nothing.
+
+        The first ``limit`` given for a key holds for the run.
+        """
         if limit is None:
             return nullcontext()
         with self._lock:

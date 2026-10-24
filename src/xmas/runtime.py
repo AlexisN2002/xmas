@@ -34,7 +34,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
 from langgraph.config import get_config
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphBubbleUp, GraphRecursionError
 from langgraph.graph import StateGraph
 from langgraph.types import Send
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
@@ -177,8 +177,8 @@ def _call(llm: BaseLLM, rendered: str, meter: VisitMeter, *, batch_error: bool =
     try:
         return meter.metered(lambda: _generate(llm, rendered))
     except Exception as error:
-        if not batch_error or not supports_meta(llm) or isinstance(error, BudgetExceeded):
-            raise  # promptolution's get_response wrapped it already, or the meter refused the call
+        if not batch_error or not supports_meta(llm) or isinstance(error, BudgetExceeded | GraphBubbleUp):
+            raise  # promptolution's get_response wrapped it already, the meter refused the call, or LangGraph signals
         raise RuntimeError(f"LLM batch failed: {error}") from error
 
 
@@ -222,6 +222,8 @@ def _wrap(
                 try:
                     record, update["values"] = body(state, visit)
                     break
+                except GraphBubbleUp:
+                    raise
                 except Exception as error:
                     again = _kind_of(error).value
                     if used[again] >= retry.get(again, 0):
@@ -236,6 +238,8 @@ def _wrap(
                 route, capped = decision.route(_context(mas, name, state, update["values"], meter))
                 record = dataclasses.replace(record, route=tuple(route), capped=capped)
                 update["routes"] = {name: route}
+        except GraphBubbleUp:  # LangGraph's own signals, such as an interrupt, pass untouched
+            raise
         except Exception as error:
             kind = _kind_of(error)
             if mas.version != 2 or kind in RUN_ENDS:
@@ -452,8 +456,11 @@ def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
         try:
             config = _run_config(inner, run, item=_item())
             result = inner.compiled.invoke(_initial_state(given, inner.prompts()), config=config)
+        except GraphBubbleUp:
+            raise
         except Exception as error:
-            visit.inner = _failed_trace(inner, query, error, run, kept)
+            item = _item()  # a box in a chain: its siblings' inner records sit on the same list
+            visit.inner = _failed_trace(inner, query, error, run, kept, None if item is None else item[0])
             raise
         trace, produced = trace_from_state(inner, query, result, run), result["values"]
         writes = {outside: produced.get(inside) for inside, outside in box.writes.items()}
@@ -757,12 +764,17 @@ def _items(chain: Chain, values: Mapping[str, Any]) -> list[tuple[Any, str | Non
 
     A missing path or ``None`` is no item. Anything else that is not a list,
     and with ``key`` an item without a scalar key or a key given twice, raises
-    ``ValueError`` naming the path, before any item runs.
+    ``ValueError`` naming the path, before any item runs; so does a step of the
+    path through a value that is no mapping.
     """
     each = chain.each
-    found = values.get(each.root)
+    found, path = values.get(each.root), each.root
     for field in each.fields:
-        found = found.get(field) if isinstance(found, dict) else None
+        if found is None:
+            break
+        if not isinstance(found, dict):
+            raise ValueError(f"for each {each}: {path} holds {type(found).__name__}, not a mapping with {field!r}")
+        found, path = found.get(field), f"{path}.{field}"
     if found is None:
         return []
     if not isinstance(found, list):
@@ -819,12 +831,14 @@ def _add_chain(builder: StateGraph[MASState, Any, MASState, MASState], mas: MAS,
         run.adopt(system, into=mas)
         index, key = task["index"], task["key"]
         where = {"item": index, "item_key": key}
-        with run.gate(f"each:{head}", each.at_once):
+        with run.gate(f"each:{id(system)}", each.at_once):  # per chain, whatever its head is called
             run.emit("item_start", head, **where)
             kept = len(run.records_of(system))
             state = _initial_state({each.item: task["item"], **task["values"]}, task["prompts"])
             try:
                 result = system.compiled.invoke(state, config=_run_config(system, run, item=(index, key)))
+            except GraphBubbleUp:
+                raise
             except Exception as error:
                 kind = _kind_of(error)
                 mine = [
@@ -966,16 +980,19 @@ def trace_from_state(mas: MAS, query: str, result: Any, meter: RunMeter) -> Trac
     return _trace(mas, query, result["records"], meter, output=output, outputs={n: values.get(n) for n in outputs})
 
 
-def _failed_trace(mas: MAS, query: str, error: BaseException, meter: RunMeter, start: int = 0) -> Trace:
+def _failed_trace(
+    mas: MAS, query: str, error: BaseException, meter: RunMeter, start: int = 0, item: int | None = None
+) -> Trace:
     """Assemble a failed run's trace from the records its meter kept for ``mas``.
 
     ``start`` skips the records of earlier runs on the meter (an adopted box
-    system's earlier visits).
+    system's earlier visits); ``item`` keeps only one chain item's records.
     """
+    records = meter.records_of(mas)[start:]
     return _trace(
         mas,
         query,
-        meter.records_of(mas)[start:],
+        records if item is None else [record for record in records if record.item == item],
         meter,
         output="",
         error=f"{type(error).__name__}: {error}",

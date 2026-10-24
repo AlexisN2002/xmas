@@ -167,7 +167,7 @@ class CantanteOptimizer(MASOptimizer):
 
         width = max(len(prompts) for prompts in varying.values())
         return [
-            {**current, **{agent: prompts[k % len(prompts)] for agent, prompts in varying.items()}}
+            {**current, **self.mas._spread({agent: prompts[k % len(prompts)] for agent, prompts in varying.items()})}
             for k in range(width)
         ]
 
