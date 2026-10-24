@@ -83,6 +83,8 @@ class Tool:
             type}``. It may be given as type words; ``None`` is one write named
             like the tool: text when ``fn``'s return hint is ``str`` or the tool
             is remote, json otherwise.
+        params: Arguments bound by :meth:`bind`, passed on every call and left
+            out of ``parameters``.
     """
 
     name: str
@@ -91,6 +93,7 @@ class Tool:
     fn: Callable[..., Any] | None
     arguments_model: type[BaseModel] | None = field(compare=False, repr=False)
     writes: dict[str, ValueType]
+    params: dict[str, Any]
 
     def __init__(
         self,
@@ -100,6 +103,7 @@ class Tool:
         fn: Callable[..., Any] | None = None,
         arguments_model: type[BaseModel] | None = None,
         writes: Mapping[str, ValueType | str] | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> None:
         """Reject names the OpenAI ``tools`` payload would refuse, and read the write types."""
         if not valid_tool_name(name):
@@ -117,6 +121,7 @@ class Tool:
             "fn": fn,
             "arguments_model": arguments_model,
             "writes": typed,
+            "params": dict(params or {}),
         }
         for key, value in values.items():
             object.__setattr__(self, key, value)  # frozen
@@ -131,14 +136,42 @@ class Tool:
         """Call ``fn`` directly, so a decorated function stays a function; a remote tool raises ``TypeError``."""
         if self.fn is None:
             raise TypeError(f"Tool {self.name!r} is remote; call it through its source.")
-        return self.fn(*args, **kwargs)
+        return self.fn(*args, **{**self.params, **kwargs})
+
+    def bind(self, **params: Any) -> Tool:
+        """Return this tool with ``params`` fixed: every call passes them, and the model and the graph never see them.
+
+        Raises:
+            ValueError: For a name that is not one of the tool's parameters.
+        """
+        properties = self.parameters.get("properties") or {}
+        unknown = sorted(set(params) - set(properties))
+        if unknown:
+            raise ValueError(f"Tool {self.name!r} has no parameters {unknown}; it takes {sorted(properties)}.")
+        schema = dict(self.parameters)
+        schema["properties"] = {key: value for key, value in properties.items() if key not in params}
+        if "required" in schema:
+            schema["required"] = [key for key in schema["required"] if key not in params]
+        return Tool(
+            self.name,
+            self.description,
+            schema,
+            self.fn,
+            self.arguments_model,
+            self.writes,
+            {**self.params, **params},
+        )
+
+    def renamed(self, name: str) -> Tool:
+        """Return this tool under another name."""
+        return Tool(name, self.description, self.parameters, self.fn, self.arguments_model, self.writes, self.params)
 
     def validate(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Return model-supplied arguments as keyword arguments for ``fn``, or raise ``XmasError``.
 
         A tool built by :func:`tool` validates (and coerces) with its pydantic
         model. A tool built from a foreign schema only checks required and
-        unknown keys.
+        unknown keys. Bound :attr:`params` are added and win.
         """
         if not isinstance(arguments, dict):
             raise XmasError(f"arguments must be an object, got {type(arguments).__name__}")
@@ -151,9 +184,9 @@ class Tool:
                 unexpected = [key for key in arguments if key not in props]
                 if unexpected:
                     raise XmasError(f"unexpected argument(s): {', '.join(unexpected)}")
-            return dict(arguments)
+            return {**arguments, **self.params}
         try:
-            instance = self.arguments_model.model_validate(arguments)
+            instance = self.arguments_model.model_validate({**arguments, **self.params})
         except ValidationError as exc:
             raise XmasError(f"invalid arguments for {self.name}: {describe_validation_error(exc)}") from None
         return arguments_from(instance)
