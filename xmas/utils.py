@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    import httpx
 
 __all__ = [
     "approximate_tokens",

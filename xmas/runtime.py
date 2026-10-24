@@ -90,6 +90,7 @@ from xmas.nodes import Box, Step
 from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
+from xmas.spec import VERSION_2
 from xmas.store import RunLog, Store
 from xmas.tools import run_step, run_tool_loop
 from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
@@ -143,9 +144,6 @@ Smaller than the branch pool because one query already fans out inside: 64
 queries at once, each with its branches, could overload a model gateway. 16 is
 near the old width on a desktop (cores plus four) and the same on every host.
 """
-
-TYPED_VERSION = 2
-"""The version of systems with typed values, steps, edges, chains and boxes; version 1 passes text between agents."""
 
 RUN_KEY = "xmas_run"
 """Key of the run's :class:`~xmas.budget.RunMeter` in ``config["configurable"]``."""
@@ -504,7 +502,7 @@ class Visit:
 
     def end(self, record: AgentRecord, status: str, **update: Any) -> dict[str, Any]:
         """Stamp the visit's record, keep it on the meter, and emit the visit's end."""
-        stamps = {**self.here, "retries": self.used.total()} if self.mas.version == TYPED_VERSION else {}
+        stamps = {**self.here, "retries": self.used.total()} if self.mas.version == VERSION_2 else {}
         record = dataclasses.replace(record, latency_s=time.perf_counter() - self.started, **stamps)
         self.meter.keep(record, self.mas)
         self.meter.emit("end", self.name, status=status, cost_usd=record.cost_usd, **self.here)
@@ -521,7 +519,7 @@ class Visit:
         kind = kind_of(error)
         stopped = kind is ErrorKind.STOPPED
         cut = stopped and bool(self.visit.metas or self.visit.inner)
-        if self.mas.version != TYPED_VERSION or (kind in RUN_ENDS and not cut) or isinstance(error, Unanswered):
+        if self.mas.version != VERSION_2 or (kind in RUN_ENDS and not cut) or isinstance(error, Unanswered):
             self.meter.emit("end", self.name, status="stopped" if stopped else "failed", **self.here)
             return None
         target = None if self.role.decision is None or cut else self.role.decision.on_error(kind)
@@ -699,8 +697,8 @@ def agent_body(
     form = compile_form(agent.schema) if written == JSON else None
     paints = media_kind(written) == "image"
     tools = mas.resolve_tools(agent) if agent.tools else None
-    batch_error = mas.version != TYPED_VERSION
-    reads_run = mas.version == TYPED_VERSION and "run" in agent.reads.values()
+    batch_error = mas.version != VERSION_2
+    reads_run = mas.version == VERSION_2 and "run" in agent.reads.values()
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         template = state["prompts"].get(agent.name, agent.prompt)
@@ -1538,7 +1536,7 @@ def compile_mas(mas: MAS) -> Any:
     nodes: dict[str, Agent | Step | Box] = {**mas.agents, **mas.steps, **mas.boxes}
     bodies = {name: node_body(mas, node, types) for name, node in nodes.items() if name not in members}
 
-    out = out_edges(mas) if mas.version == TYPED_VERSION else {}
+    out = out_edges(mas) if mas.version == VERSION_2 else {}
     races = mas.info.races if mas.info is not None else {}
     racing = {name: (source, len(names)) for source, names in races.items() for name in names}
     decisions = {  # a contestant decides too: only the winner goes on
@@ -1546,8 +1544,8 @@ def compile_mas(mas: MAS) -> Any:
         for source, edges in out.items()
         if source in racing or any(e.kind not in (EdgeKind.PLAIN, EdgeKind.FIRST) for e in edges)
     }
-    deferred = join_nodes(mas.graph) if mas.version != TYPED_VERSION else set()
-    writes_error = mas.version == TYPED_VERSION and reads(mas, "error")
+    deferred = join_nodes(mas.graph) if mas.version != VERSION_2 else set()
+    writes_error = mas.version == VERSION_2 and reads(mas, "error")
     for name, body in bodies.items():
         role = NodeRole(decisions.get(name), writes_error=writes_error, race=racing.get(name))
         node = wrap(mas, name, body, role)
@@ -1566,7 +1564,7 @@ def compile_mas(mas: MAS) -> Any:
     waits = {name: f"{name}.wait" for name in [*humans, *holding]}
     for name, wait_node in waits.items():
         builder.add_edge(name, wait_node)
-    if mas.version == TYPED_VERSION:
+    if mas.version == VERSION_2:
         wire_v2(builder, mas, out, set(decisions), waits)
     else:
         wire_v1(builder, mas)
@@ -1617,7 +1615,7 @@ def build_trace(mas: MAS, query: str, records: list[AgentRecord], meter: RunMete
         values=values,
         chains=chains,
     )
-    if mas.version == TYPED_VERSION and mas is meter.owner:
+    if mas.version == VERSION_2 and mas is meter.owner:
         ending.update(run_id=meter.run_id, graph_id=meter.graph_id)
     return Trace(query=query, records=numbered, health=health, **ending)
 
@@ -1725,7 +1723,7 @@ def run_state(
             holds a ``/`` (the threads of a run's items and boxes) or the
             store holds a run with it.
     """
-    if mas.version == TYPED_VERSION:
+    if mas.version == VERSION_2:
         values = {
             name: coerce_media(value, mas.inputs[name]) if name in mas.inputs else value
             for name, value in values.items()
@@ -1927,7 +1925,7 @@ def query_text(values: Mapping[str, Any]) -> str:
 
 def check_inputs(mas: MAS, values: Mapping[str, Any]) -> None:
     """Refuse values that are not the system's inputs, listing every problem."""
-    if mas.version != TYPED_VERSION:
+    if mas.version != VERSION_2:
         problems = [] if "query" in values else ["input 'query' is missing"]
         problems += [f"{name!r} is not text" for name, value in values.items() if not isinstance(value, str)]
     else:
@@ -1966,8 +1964,8 @@ def run_all(
         return []
     queries = [start if isinstance(start, str) else query_text(start) for start in starts]
     store = mas.runs()
-    system_id = mas.describe()["id"] if mas.version == TYPED_VERSION or store.path is not None else None
-    graph_id = system_id if mas.version == TYPED_VERSION else None
+    system_id = mas.describe()["id"] if mas.version == VERSION_2 or store.path is not None else None
+    graph_id = system_id if mas.version == VERSION_2 else None
     meters = [RunMeter(mas.budget, owner=mas, listener=on_event, graph_id=graph_id, run_id=run_id) for _ in starts]
     states = [initial_state(start, prompt_set) for start, prompt_set in zip(starts, prompts, strict=True)]
     graph, configs, durable = mas.compiled, [run_config(mas, meter) for meter in meters], {}

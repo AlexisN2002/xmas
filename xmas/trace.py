@@ -13,7 +13,6 @@ strings, and a media value (a :class:`~xmas.media.Ref`) as its dict, so both
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -21,6 +20,8 @@ from xmas.errors import ErrorKind, RunStatus, status_for
 from xmas.values import plain
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Iterator
+
     from xmas.health import Health
     from xmas.human import Pause
 

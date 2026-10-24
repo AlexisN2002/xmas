@@ -36,6 +36,7 @@ from xmas.human import Human
 from xmas.media import Ref
 from xmas.runtime import node_owner, node_types, render_prompt, run_node
 from xmas.schemas import compile_form
+from xmas.spec import VERSION_2
 from xmas.values import JSON, TEXT, ValueType, check_value, media_kind, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -71,8 +72,6 @@ LEVELS = (0, DRY_LEVEL, WARM_UP_LEVEL)
 SHORTEST_SHOWN_S = 0.1
 # an example faster than this shows as "<0.1 s"
 
-GRAPH_VERSION = 2
-# the system version whose graph check_system reads
 
 PLACEHOLDER_TYPES = {"image": "image/png", "audio": "audio/wav", "document": "application/pdf", "table": "text/csv"}
 
@@ -360,7 +359,7 @@ def level1(
     """Check the system, read the examples, render every prompt and look up every model name; no model call."""
     problems: list[str] = []
     for _, system in systems(mas):
-        if system.version == GRAPH_VERSION:
+        if system.version == VERSION_2:
             try:
                 check_system(system)
             except ValueError as error:

@@ -21,12 +21,11 @@ def rec(
     *,
     prompt: str = "",
     inputs: dict[str, str] | None = None,
-    error_kind: ErrorKind | None = None,
     **later: Any,
 ) -> AgentRecord:
-    """Build a record; ``later`` sets the other fields (rejected, error, route, capped, item, ...)."""
+    """Build a record; ``later`` sets the other fields (error_kind, rejected, error, route, capped, item, ...)."""
     outputs = {} if output is None else {"out": output}
-    return AgentRecord(agent, step, prompt, prompt, inputs or {}, outputs, error_kind=error_kind, **later)
+    return AgentRecord(agent, step, prompt, prompt, inputs or {}, outputs, **later)
 
 
 RECORDS = (
@@ -181,8 +180,12 @@ def test_list_values_check_and_fit() -> None:
     assert check_value([[1], [{"n": {2}}]], nested) == "not JSON at 1.0.n: set"
     assert check_value(3, TEXT) == "expected text, got int"
 
-    assert fits(texts, JSON) and fits(nested, JSON) and fits(texts, texts)
-    assert not fits(JSON, texts) and not fits(TEXT, JSON) and not fits(texts, nested)
+    assert fits(texts, JSON)
+    assert fits(nested, JSON)
+    assert fits(texts, texts)
+    assert not fits(JSON, texts)
+    assert not fits(TEXT, JSON)
+    assert not fits(texts, nested)
 
     assert render_value(["a", None], texts) == '["a", null]'
     assert render_value([["é"]], nested) == '[["é"]]'

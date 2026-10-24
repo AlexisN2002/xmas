@@ -12,6 +12,7 @@ from xmas.mas import MAS
 from xmas.optimization.synthesis import LLMPromptSynthesizer, MechanicalSynthesizer, Rewrite
 from xmas.optimization.topology import Edges, Fixed, TopologyBudget, crossover, mas_edges, mutate, terminals
 from xmas.optimization.updaters import weakest
+from xmas.spec import VERSION_2
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -20,10 +21,6 @@ __all__ = [
     "NEW_AGENT_PROMPT",
     "GraphUpdater",
 ]
-
-
-TYPED_VERSION = 2
-"""The MAS version with typed graphs: conditional edges, steps, boxes and human nodes."""
 
 
 NEW_AGENT_PROMPT = "You are {name}. Do your part of the task and pass on your result."
@@ -134,7 +131,7 @@ class GraphUpdater:
             try:
                 built.append(self.rebuild(mas, names, edges))
             except ValueError:
-                if mas.version != TYPED_VERSION:
+                if mas.version != VERSION_2:
                     raise
         return built
 
@@ -147,7 +144,7 @@ class GraphUpdater:
         in the parent's order.
         """
         wiring: Sequence[tuple[str, str] | Edge]
-        if mas.version == TYPED_VERSION:
+        if mas.version == VERSION_2:
             kept = self.wiring_of(mas, names, edges)
             inputs, wiring = self.reads_for(mas, names, edges, kept), kept
         else:
@@ -277,7 +274,7 @@ class GraphUpdater:
         member of a ``for each`` chain are held, so no mutation breaks a chain
         or moves a person.
         """
-        if mas.version != TYPED_VERSION:
+        if mas.version != VERSION_2:
             return None
         conditional = [edge for edge in mas.edges if edge.kind is not EdgeKind.PLAIN]
         held = set(mas.frozen).union(mas.each, mas.humans, *({edge.source, edge.target} for edge in conditional))

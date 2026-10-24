@@ -9,9 +9,12 @@ graph-rewriting component and needs nothing from xmas to work.
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from typing import TYPE_CHECKING
 
 import networkx as nx
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
 
 __all__ = [
     "END",

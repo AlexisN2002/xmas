@@ -181,11 +181,13 @@ def test_the_configuration_names_real_variables() -> None:
 
 def test_the_citation_matches_the_readme() -> None:
     cff = yaml.safe_load((ROOT / "CITATION.cff").read_text(encoding="utf-8"))
-    assert cff["cff-version"] == "1.2.0" and cff["type"] == "software"
+    assert cff["cff-version"] == "1.2.0"
+    assert cff["type"] == "software"
     assert cff["authors"] == [{"family-names": "Zehle", "given-names": "Tom"}]
     bibtex = block("bibtex", "@software{")
     assert f"title={{{cff['title']}}}" in bibtex
-    assert "author={Zehle, Tom}" in bibtex and "year={2026}" in bibtex
+    assert "author={Zehle, Tom}" in bibtex
+    assert "year={2026}" in bibtex
     assert f"url={{{cff['repository-code']}}}" in bibtex
 
 
@@ -196,7 +198,8 @@ def test_the_readme_keeps_the_rulings() -> None:
     assert "> **Status: beta.** Everything in this README is built." in README
     assert "Learning from human picks is\n> planned and not in the code yet" in README
     for code in README.split("```yaml")[1:]:
-        assert "http" not in code.split("```", 1)[0] and "key" not in code.split("```", 1)[0]
+        assert "http" not in code.split("```", 1)[0]
+        assert "key" not in code.split("```", 1)[0]
     publications = section("📚 Scientific Publications")
     assert "**CANTANTE: Optimizing Agentic Systems via Contrastive Credit Attribution** — Zehle, 2026." in publications
     assert publications.count("\n- **") == 3

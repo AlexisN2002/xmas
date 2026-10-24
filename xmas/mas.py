@@ -40,7 +40,7 @@ from xmas.media import TEXT_ONLY, Capabilities
 from xmas.nodes import Box, Step
 from xmas.predicates import parse_predicate
 from xmas.prompts import decode_prompts, encode_prompts
-from xmas.spec import validate_spec, validate_spec_v2
+from xmas.spec import VERSION_2, validate_spec, validate_spec_v2
 from xmas.store import Store, open_store
 from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools, tool
 from xmas.values import TEXT, ValueType, parse_type
@@ -61,9 +61,6 @@ __all__ = [
 
 
 QUERY_ONLY = {"query": TEXT}
-
-VERSION_2 = 2
-"""The spec version with steps, boxes, human nodes, typed values and conditional edges."""
 
 
 class MAS(BasePredictor):
