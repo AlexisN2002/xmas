@@ -1510,11 +1510,6 @@ def _run_config(
     return {"recursion_limit": mas.max_steps, "configurable": configurable}
 
 
-def run_one(mas: MAS, query: str, prompts: dict[str, str]) -> Trace:
-    """Run a MAS on one input with a given prompt set; a failure is recorded in the trace, not raised."""
-    return run_many(mas, [query], [prompts])[0]
-
-
 def run_many(mas: MAS, queries: list[str], prompts: list[dict[str, str]]) -> list[Trace]:
     """Run a MAS over parallel lists of inputs and prompt sets.
 

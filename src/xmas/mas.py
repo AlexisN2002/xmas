@@ -454,7 +454,7 @@ class MAS(BasePredictor):
         """
         self._check_resolved()
         self._check_runs_on_query()
-        return runtime.run_one(self, query, self.prompts())
+        return runtime.run_many(self, [query], [self.prompts()])[0]
 
     def run_state(
         self,
@@ -813,18 +813,9 @@ class MAS(BasePredictor):
         agents = []
         for item in spec.get("agents", []):
             ((output, output_type),) = item["writes"].items()
-            agents.append(
-                Agent(
-                    item["name"],
-                    prompts[item.get("prompt", item["name"])],
-                    output,
-                    item.get("reads"),
-                    item.get("tools"),
-                    item.get("model"),
-                    output_type,
-                    item.get("schema"),
-                )
-            )
+            settings = {key: item.get(key) for key in ("tools", "model", "schema")}
+            text = prompts[item.get("prompt", item["name"])]
+            agents.append(Agent(item["name"], text, output, item.get("reads"), output_type=output_type, **settings))
         mas = cls(
             agents=agents,
             edges=parse_edges(spec.get("edges", [])),
