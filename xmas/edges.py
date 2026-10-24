@@ -21,11 +21,13 @@ and error kinds make sense, and whether a pair of nodes is listed twice, is
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
 
 __all__ = [
     "ANY_ERROR",
@@ -39,6 +41,9 @@ __all__ = [
 
 ARROW = "->"
 """What separates the names of a chain."""
+
+EDGE_ENDS = 2
+"""The nodes one edge joins: a chain names at least two, a conditional edge exactly two."""
 
 ANY_ERROR = "any"
 """The ``on error`` spec that routes every error kind."""
@@ -137,7 +142,7 @@ class Edge:
 def split_names(text: str) -> list[str]:
     """Split ``"a -> b -> c"`` into its names."""
     names = [part.strip() for part in text.split(ARROW)]
-    if len(names) < 2 or not all(names):
+    if len(names) < EDGE_ENDS or not all(names):
         raise ValueError(f"Edge {text!r} must name two or more nodes joined by '{ARROW}'.")
     return names
 
@@ -197,7 +202,7 @@ def parse_edges(items: Iterable[Any]) -> list[Edge]:
         elif isinstance(item, dict) and len(item) == 1:
             ((key, spec),) = item.items()
             names = split_names(key) if isinstance(key, str) else []
-            if len(names) != 2:
+            if len(names) != EDGE_ENDS:
                 raise ValueError(f"A conditional edge names one source and one target, not {key!r}.")
             edges.append(conditional(names[0], names[1], spec))
         else:

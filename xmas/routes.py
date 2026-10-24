@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import networkx as nx
 
 from xmas.edges import Edge, EdgeKind
 from xmas.graph import END, START
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "ROUTE_CAP",
@@ -25,6 +27,9 @@ Point = str | tuple[str, str, str]
 """A node of the route graph: a node name, or a route ``(node, decision, label)``."""
 
 FAIL, CHOOSE, OK = "fail", "choose", ""
+
+MULTI_INPUT = 2
+"""The fewest incoming points that make a node a merge or a join."""
 
 
 @dataclass(frozen=True)
@@ -62,42 +67,46 @@ class RouteGraph:
     def __init__(self, nodes: Sequence[str], edges: Sequence[Edge]) -> None:
         """Build the route graph and every node's choice sets."""
         self.nodes = list(nodes)
-        graph: nx.DiGraph[Any] = nx.DiGraph()
-        graph.add_nodes_from([START, *self.nodes, END])
+        self.graph: nx.DiGraph[Any] = nx.DiGraph()
+        self.graph.add_nodes_from([START, *self.nodes, END])
         failing = {edge.source for edge in edges if edge.kind is EdgeKind.ERROR}
-        self.loops: list[tuple[str, str]] = []
+        self.loops = [(edge.source, edge.target) for edge in edges if edge.kind is EdgeKind.WHILE]
         for edge in edges:
-            if edge.kind is EdgeKind.WHILE:
-                self.loops.append((edge.source, edge.target))
-                continue
-            head: Point = edge.source
-            if edge.source in failing and edge.kind is not EdgeKind.ERROR:
-                head = (edge.source, FAIL, OK)
-                graph.add_edge(edge.source, head, kind="route")
-            if edge.kind is EdgeKind.PLAIN:
-                graph.add_edge(head, edge.target, kind="plain")
-                continue
-            route = (edge.source, FAIL if edge.kind is EdgeKind.ERROR else CHOOSE, edge.target)
-            graph.add_edge(head, route, kind="route")
-            graph.add_edge(route, edge.target, kind="plain")
-        sources = {edge.source for edge in edges if edge.kind is not EdgeKind.ERROR}
+            if edge.kind is not EdgeKind.WHILE:
+                self.add_routes(edge, failing)
+        self.add_ends({edge.source for edge in edges if edge.kind is not EdgeKind.ERROR}, failing)
+        self.choices: dict[Point, set[frozenset[Point]] | None] = {START: {frozenset()}}
+        for point in nx.topological_sort(self.graph):
+            if point != START:
+                self.choices[point] = self.choice_sets(point)
+        self.reach: dict[tuple[Point, tuple[Point, ...]], bool] = {}
+
+    def add_routes(self, edge: Edge, failing: set[str]) -> None:
+        """Add one edge, through a route unless plain, under its source's ``ok`` route when it has error edges."""
+        head: Point = edge.source
+        if edge.source in failing and edge.kind is not EdgeKind.ERROR:
+            head = (edge.source, FAIL, OK)
+            self.graph.add_edge(edge.source, head, kind="route")
+        if edge.kind is EdgeKind.PLAIN:
+            self.graph.add_edge(head, edge.target, kind="plain")
+            return
+        route = (edge.source, FAIL if edge.kind is EdgeKind.ERROR else CHOOSE, edge.target)
+        self.graph.add_edge(head, route, kind="route")
+        self.graph.add_edge(route, edge.target, kind="plain")
+
+    def add_ends(self, sources: set[str], failing: set[str]) -> None:
+        """Start each node nothing enters from START, and end each node that is no source (``sources``) at END."""
         for name in self.nodes:
-            if graph.in_degree(name) == 0:
-                graph.add_edge(START, name, kind="plain")
+            if self.graph.in_degree(name) == 0:
+                self.graph.add_edge(START, name, kind="plain")
             if name in sources:
                 continue
             if name in failing:  # only error edges: a visit that succeeds ends the run
                 ok = (name, FAIL, OK)
-                graph.add_edge(name, ok, kind="route")
-                graph.add_edge(ok, END, kind="plain")
+                self.graph.add_edge(name, ok, kind="route")
+                self.graph.add_edge(ok, END, kind="plain")
             else:
-                graph.add_edge(name, END, kind="plain")
-        self.graph = graph
-        self.choices: dict[Point, set[frozenset[Point]] | None] = {START: {frozenset()}}
-        for point in nx.topological_sort(graph):
-            if point != START:
-                self.choices[point] = self.choice_sets(point)
-        self.reach: dict[tuple[Point, tuple[Point, ...]], bool] = {}
+                self.graph.add_edge(name, END, kind="plain")
 
     def choice_sets(self, point: Point) -> set[frozenset[Point]] | None:
         """Return the minimal route sets under which ``point`` runs, ``None`` past :data:`ROUTE_CAP`."""
@@ -158,7 +167,7 @@ class RouteGraph:
         idom: dict[Any, Any] | None = None
         for name in [*self.nodes, END]:
             points: list[Point] = list(self.graph.predecessors(name))
-            if len(points) < 2:
+            if len(points) < MULTI_INPUT:
                 continue
             if any(self.choices.get(point) is None for point in points):
                 refusals[name] = (

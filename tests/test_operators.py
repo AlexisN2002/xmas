@@ -33,7 +33,8 @@ def test_a_while_edge_loops_back_until_the_switch_routes_on() -> None:
     assert trace["writer"][1].inputs["verdict"] == NO
     assert trace["writer"][0].inputs["verdict"] == ""  # a first-visit gap renders empty, so nothing is unfilled
     assert trace.output == "Published: A short draft about cats."
-    assert trace.health is not None and trace.health.loops == {"judge -> writer": {"taken": 2, "cap_hit": False}}
+    assert trace.health is not None
+    assert trace.health.loops == {"judge -> writer": {"taken": 2, "cap_hit": False}}
     assert trace.to_dict()["records"][2]["route"] == ["writer"]
     assert "capped" not in trace.to_dict()["records"][2]
 
@@ -75,7 +76,8 @@ def test_the_first_when_edge_that_holds_wins_in_declared_order() -> None:
         llm=llm,
     )
     trace = mas.run("x")
-    assert [r.agent for r in trace.records] == ["scorer", "high"] and trace.output == "done: High 12"
+    assert [r.agent for r in trace.records] == ["scorer", "high"]
+    assert trace.output == "done: High 12"
 
 
 def test_a_merge_inside_a_loop_joins_a_parallel_chain_that_runs_once() -> None:
@@ -83,7 +85,7 @@ def test_a_merge_inside_a_loop_joins_a_parallel_chain_that_runs_once() -> None:
     drafts = iter(["A rather long first draft.", "Short.", "Short."])
 
     def answer(prompt: str) -> str:
-        return next(drafts) if prompt.startswith("Draft") else prompt.split(":")[0]
+        return next(drafts) if prompt.startswith("Draft") else prompt.split(":", maxsplit=1)[0]
 
     @tool(writes={"verdict": "json"})
     def check(draft: str) -> dict[str, bool]:
@@ -119,8 +121,11 @@ def test_a_merge_inside_a_loop_joins_a_parallel_chain_that_runs_once() -> None:
     trace = mas.run("cats")
     assert trace.error is None
     names = [r.agent for r in trace.records]
-    assert names.count("fin") == 1 and names[-1] == "fin"
-    assert names.count("m") == 3 and names.count("w") == 3 and names.count("a") == 1
+    assert names.count("fin") == 1
+    assert names[-1] == "fin"
+    assert names.count("m") == 3
+    assert names.count("w") == 3
+    assert names.count("a") == 1
     assert names.index("s3") < names.index("fin")
     assert [r.route for r in trace["c"]] == [("a",), ("m",), ("m",)]
     assert [(r.route, r.capped) for r in trace["m"]] == [(("w",), False)] * 2 + [(("fin",), True)]
@@ -169,7 +174,8 @@ def fetch_and_join() -> MAS:
 
 def test_a_node_that_succeeds_takes_its_plain_route() -> None:
     ok = fetch_and_join().run("cats")
-    assert ok.error is None and ok.output == "JOIN PAGE ON CATS AND NOTE ON CATS"
+    assert ok.error is None
+    assert ok.output == "JOIN PAGE ON CATS AND NOTE ON CATS"
     assert sorted(r.agent for r in ok.records) == ["fetch", "j", "side"]
     assert ok["fetch"][0].route == ("j",)
 
@@ -177,13 +183,17 @@ def test_a_node_that_succeeds_takes_its_plain_route() -> None:
 def test_a_failure_of_a_routed_kind_takes_its_error_route() -> None:
     """A failed record without writes, and the join still runs once."""
     routed = fetch_and_join().run("slow")
-    assert routed.error is None and routed.error_kind is None
+    assert routed.error is None
+    assert routed.error_kind is None
     assert routed.output == "JOIN CACHED PAGE ON SLOW AND NOTE ON SLOW"
     assert [r.agent for r in routed.records].count("j") == 1
     (failed,) = routed["fetch"]
     assert failed.error == "TimeoutError: the server took too long"
-    assert failed.error_kind == ErrorKind.TIMEOUT and failed.outputs == {} and failed.route == ("fb",)
-    assert failed.kind == "step" and failed.latency_s is not None
+    assert failed.error_kind == ErrorKind.TIMEOUT
+    assert failed.outputs == {}
+    assert failed.route == ("fb",)
+    assert failed.kind == "step"
+    assert failed.latency_s is not None
     assert failed.to_dict()["error"] == "TimeoutError: the server took too long"
     assert routed.health is not None
     assert [(f.signal, f.node) for f in routed.health.flags] == [("error_routed", "fetch")]
@@ -191,7 +201,8 @@ def test_a_failure_of_a_routed_kind_takes_its_error_route() -> None:
 
 def test_a_failure_without_a_route_fails_the_run_and_keeps_the_failed_record() -> None:
     unrouted = fetch_and_join().run("down")
-    assert unrouted.error_kind == ErrorKind.OUTAGE and unrouted.output == ""
+    assert unrouted.error_kind == ErrorKind.OUTAGE
+    assert unrouted.output == ""
     assert [(r.agent, r.error_kind) for r in unrouted.records if r.error] == [("fetch", ErrorKind.OUTAGE)]
     assert unrouted["fetch"][0].route is None
 
@@ -204,10 +215,13 @@ def test_a_bad_format_is_routed_with_the_cost_of_both_paid_attempts() -> None:
     llm = MockLLM(answers=["not json", "still not json", "We are sorry."], meta=True)
     mas = MAS([JUDGE, SORRY], [Edge("judge", "sorry", EdgeKind.ERROR, errors=("bad_format",))], llm=llm)
     trace = mas.run("cats")
-    assert trace.error is None and trace.output == "We are sorry."
+    assert trace.error is None
+    assert trace.output == "We are sorry."
     (failed,) = trace["judge"]
-    assert failed.error_kind == ErrorKind.BAD_FORMAT and failed.cost_usd is not None
-    assert abs(failed.cost_usd - 0.02) < 1e-9 and failed.route == ("sorry",)
+    assert failed.error_kind == ErrorKind.BAD_FORMAT
+    assert failed.cost_usd is not None
+    assert abs(failed.cost_usd - 0.02) < 1e-9
+    assert failed.route == ("sorry",)
     assert trace.health is not None
     assert [f.signal for f in trace.health.flags] == ["bad_format", "error_routed"]
 
@@ -218,8 +232,10 @@ def test_a_node_whose_only_out_edge_is_an_error_edge_ends_the_run_when_it_succee
     assert sorted(good.graph.predecessors(END)) == ["judge", "sorry"]
     assert good.to_dict()["edges"] == [{"judge -> sorry": {"on error": ["bad_format"]}}]  # the END wiring is implicit
     trace = good.run("cats")
-    assert trace.error is None and [r.agent for r in trace.records] == ["judge"]
-    assert trace.output == OK and trace["judge"][0].route == (END,)
+    assert trace.error is None
+    assert [r.agent for r in trace.records] == ["judge"]
+    assert trace.output == OK
+    assert trace["judge"][0].route == (END,)
 
 
 def test_a_budget_refusal_is_never_routed() -> None:
@@ -235,8 +251,10 @@ def test_a_budget_refusal_is_never_routed() -> None:
         budget=Budget(max_calls=0),
     )
     trace = mas.run("cats")
-    assert trace.error_kind == ErrorKind.BUDGET and trace.records == ()
-    assert trace.error is not None and trace.error.startswith(BudgetExceeded.__name__)
+    assert trace.error_kind == ErrorKind.BUDGET
+    assert trace.records == ()
+    assert trace.error is not None
+    assert trace.error.startswith(BudgetExceeded.__name__)
 
 
 def test_a_failing_decision_is_a_failed_visit() -> None:
@@ -267,10 +285,14 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
         )
 
     unrouted = build().run("cats")
-    assert unrouted.error is not None and "returned str, not bool" in unrouted.error
+    assert unrouted.error is not None
+    assert "returned str, not bool" in unrouted.error
     (failed,) = unrouted.records
-    assert failed.agent == "writer" and failed.route is None and failed.error is not None
-    assert failed.cost_usd == pytest.approx(0.01) and unrouted.cost_usd == pytest.approx(0.01)
+    assert failed.agent == "writer"
+    assert failed.route is None
+    assert failed.error is not None
+    assert failed.cost_usd == pytest.approx(0.01)
+    assert unrouted.cost_usd == pytest.approx(0.01)
 
     sorry = Agent("sorry", "Sorry {query}", output="final", inputs=["query"])
     mas = MAS(
@@ -285,7 +307,8 @@ def test_a_failing_decision_is_a_failed_visit() -> None:
         llm=MockLLM(answers=["a draft", "We are sorry."], meta=True),
     )
     routed = mas.run("cats")
-    assert routed.error is None and routed.output == "We are sorry."
+    assert routed.error is None
+    assert routed.output == "We are sorry."
     assert [(r.agent, r.route, r.outputs) for r in routed.records] == [
         ("writer", ("sorry",), {}),
         ("sorry", None, {"final": "We are sorry."}),

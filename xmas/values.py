@@ -260,20 +260,23 @@ def json_problem(value: Any, path: str) -> str | None:
     if isinstance(value, float):
         return None if math.isfinite(value) else f"not JSON{where}: {value!r}"
     if isinstance(value, list):
-        for index, item in enumerate(value):
-            problem = json_problem(item, join(path, index))
-            if problem is not None:
-                return problem
-        return None
+        problems = (json_problem(item, join(path, index)) for index, item in enumerate(value))
+        return next((problem for problem in problems if problem is not None), None)
     if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                return f"not JSON{where}: key {key!r} is not a string"
-            problem = json_problem(item, join(path, key))
-            if problem is not None:
-                return problem
-        return None
+        return mapping_problem(value, path)
     return f"not JSON{where}: {type(value).__name__}"
+
+
+def mapping_problem(value: dict[Any, Any], path: str) -> str | None:
+    """Return the first key of ``value`` that is not a string, or the first problem of its items, or ``None``."""
+    for key, item in value.items():
+        if not isinstance(key, str):
+            where = f" at {path}" if path else ""
+            return f"not JSON{where}: key {key!r} is not a string"
+        problem = json_problem(item, join(path, key))
+        if problem is not None:
+            return problem
+    return None
 
 
 def join(path: str, step: int | str) -> str:

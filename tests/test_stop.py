@@ -30,6 +30,7 @@ from xmas.human import Human, Question
 from xmas.llms.api_llm import APILLM, assemble
 from xmas.llms.meta import CallMeta, TokenPrice
 from xmas.nodes import Box, Step
+from xmas.runtime import BATCH_QUERIES
 from xmas.tools import ToolCallRequest, tool
 from xmas.trace import Event
 
@@ -282,7 +283,8 @@ def test_apillm_cancels_in_flight(server: SlowServer) -> None:
             assert meter.uncosted_calls == 1
             continue
         words = cut.text.split()
-        assert 2 <= len(words) <= 8 and words == [f"w{index}" for index in range(len(words))]
+        assert 2 <= len(words) <= 8
+        assert words == [f"w{index}" for index in range(len(words))]
         assert cut.meta.tokens == TokenUsage(5 + 1, len(words))  # "You are a helpful assistant." and "hi"
         assert cut.meta.served_model == "m"
         if price is None:
@@ -443,7 +445,8 @@ def test_streaming_is_opt_in_and_equivalent() -> None:
 
     # call_kwargs that name the stream keys give way to them, as call_params records it
     on, sent = wired([streamed({"content": "ok"})], stream=True, call_kwargs={"stream_options": {"x": 1}})
-    assert on.generate_with_meta("hi")[0] == "ok" and sent == [STREAMED_BYTES]
+    assert on.generate_with_meta("hi")[0] == "ok"
+    assert sent == [STREAMED_BYTES]
 
 
 # ------------------------------------------------------------ runs that are not running
@@ -496,7 +499,8 @@ def test_stop_a_paused_run() -> None:
     assert mas.stop("turn-2", "Tom pressed Stop") is True
     assert asker.withdrawn == [("turn-2/approve/1", "Tom pressed Stop")]
     row = mas.runs().run("turn-2")
-    assert row is not None and row.status == "stopped"
+    assert row is not None
+    assert row.status == "stopped"
     approved = {"turn-2/approve/1": {"approved": True, "who": "tom"}}
     with pytest.raises(ValueError, match="is stopped, not paused"):
         mas.resume("turn-2", approved)
@@ -546,9 +550,11 @@ def test_a_stop_while_running_ends_the_run_even_at_a_pause() -> None:
     threading.Timer(0.1, mas.stop, args=("turn-3", "Tom pressed Stop")).start()
     trace = mas.run_state({"query": "q"}, run_id="turn-3", on_event=events.append)
     assert (trace.status, trace.error) == ("stopped", "Stopped: Tom pressed Stop")
-    assert asker.asked == [] and "pause" not in [event.kind for event in events]
+    assert asker.asked == []
+    assert "pause" not in [event.kind for event in events]
     row = mas.runs().run("turn-3")
-    assert row is not None and (row.status, row.paused) == ("stopped", ())
+    assert row is not None
+    assert (row.status, row.paused) == ("stopped", ())
     with pytest.raises(ValueError, match="is stopped, not paused"):
         mas.resume("turn-3", {"turn-3/approve/1": {"approved": True, "who": "tom"}})
 
@@ -558,7 +564,8 @@ def test_a_stop_while_running_ends_the_run_even_at_a_pause() -> None:
     mas = gated(model, asker)
     threading.Timer(0.3, mas.stop, args=("turn-4", "Tom pressed Stop")).start()
     trace = mas.run_state({"query": "q"}, run_id="turn-4")
-    assert trace.status == "stopped" and asker.asked == ["turn-4/approve/1"]
+    assert trace.status == "stopped"
+    assert asker.asked == ["turn-4/approve/1"]
     assert asker.withdrawn == [("turn-4/approve/1", "Tom pressed Stop")]
 
     # a stop during a step that runs after the question was put: the pause it reaches ends stopped
@@ -571,7 +578,8 @@ def test_a_stop_while_running_ends_the_run_even_at_a_pause() -> None:
     assert asker.withdrawn == [("turn-5/approve/1", "Tom pressed Stop")]
     assert [record.agent for record in trace.records] == ["pre", "writer", "think"]
     row = mas.runs().run("turn-5")
-    assert row is not None and (row.status, row.paused) == ("stopped", ())
+    assert row is not None
+    assert (row.status, row.paused) == ("stopped", ())
 
 
 # ------------------------------------------------------------ first of
@@ -580,8 +588,10 @@ def test_a_stop_while_running_ends_the_run_even_at_a_pause() -> None:
 def test_first_of_races(server: SlowServer) -> None:
     meter = RunMeter()
     race = meter.race("outline:0:1")
-    assert meter.race("outline:0:1") is race and not race.is_set()
+    assert meter.race("outline:0:1") is race
+    assert not race.is_set()
     outcome: dict[str, tuple[str, float]] = {}
+    losses: dict[str, tuple[str, CallMeta | None, ErrorKind]] = {}
     started = time.monotonic()
 
     def contest(name: str, seconds: float) -> None:
@@ -590,7 +600,7 @@ def test_first_of_races(server: SlowServer) -> None:
             try:
                 meter.metered(lambda: model.generate_with_meta(name))
             except RaceLost as error:
-                assert (error.text, error.meta, error.kind) == ("half", CUT, ErrorKind.STOPPED)
+                losses[name] = (error.text, error.meta, error.kind)
                 outcome[name] = ("lost", time.monotonic() - started)
                 return
         outcome[name] = ("won" if meter.win("outline:0:1", name) else "dropped", time.monotonic() - started)
@@ -601,6 +611,7 @@ def test_first_of_races(server: SlowServer) -> None:
     for racer in racers:
         racer.join()
     assert {name: result for name, (result, _) in outcome.items()} == {"fast": "won", "mid": "lost", "slow": "lost"}
+    assert losses == {"mid": ("half", CUT, ErrorKind.STOPPED), "slow": ("half", CUT, ErrorKind.STOPPED)}
     assert max(at for _, at in outcome.values()) < 0.3 + 0.2, "the wall is the fastest contestant's"
     assert meter.calls == 3
     assert meter.cost_usd == pytest.approx(META_USD + 2 * CUT_USD)  # the losers paid for what they used
@@ -622,7 +633,8 @@ def test_first_of_races(server: SlowServer) -> None:
     # stopping the run sets every race; a contestant then stops rather than loses
     third = meter.race("outline:0:3")
     meter.stop()
-    assert third.is_set() and meter.race("outline:0:4").is_set()
+    assert third.is_set()
+    assert meter.race("outline:0:4").is_set()
     with contestant(third), pytest.raises(Stopped) as stopped:
         meter.before_call()
     assert type(stopped.value) is Stopped
@@ -669,7 +681,8 @@ def test_the_first_of_a_race_writes() -> None:
     started = time.monotonic()
     trace = mas.run_state({"query": "q"}, on_event=events.append)
     assert time.monotonic() - started < 1.0, "the wall is the fastest contestant's"
-    assert trace.status == "ok" and trace.outputs == {"final": "done"}
+    assert trace.status == "ok"
+    assert trace.outputs == {"final": "done"}
     by = {record.agent: record for record in trace.records}
     assert [record.agent for record in trace.records].count("polish") == 1
     assert (by["quick"].lost, by["quick"].outputs) == (False, {"notes": "done"})
@@ -690,7 +703,8 @@ def test_the_first_of_a_race_writes() -> None:
     )
     assert merged.checked().joins["polish"].kind == "merge"
     trace = merged.run_state({"query": "q"})
-    assert trace.outputs == {"final": "done"} and [r.agent for r in trace.records].count("polish") == 1
+    assert trace.outputs == {"final": "done"}
+    assert [r.agent for r in trace.records].count("polish") == 1
 
     # a step contestant cannot be cut: it is waited for, and its writes are dropped
     stepped = racing(
@@ -698,18 +712,21 @@ def test_the_first_of_a_race_writes() -> None:
     )
     trace = stepped.run_state({"query": "q"})
     by = {record.agent: record for record in trace.records}
-    assert trace.outputs == {"final": "done"} and by["careful"].lost and by["careful"].cost_usd == 0.0
+    assert trace.outputs == {"final": "done"}
+    assert by["careful"].lost
+    assert by["careful"].cost_usd == 0.0
     assert [record.agent for record in trace.records].count("polish") == 1
 
 
 def test_a_race_fails_when_every_contestant_fails() -> None:
     def answer(prompt: str) -> str:
         if prompt.startswith(("Quick", "Careful")):
-            raise ValueError(f"no notes from {prompt.split()[0]}")
+            raise ValueError(f"no notes from {prompt.split(maxsplit=1)[0]}")
         return "done"
 
     trace = racing(MockLLM(answer)).run_state({"query": "q"})
-    assert trace.status == "failed" and "no notes from" in str(trace.error)
+    assert trace.status == "failed"
+    assert "no notes from" in str(trace.error)
     assert sorted(record.agent for record in trace.records if record.error) == ["careful", "quick"]
     assert "polish" not in {record.agent for record in trace.records}
 
@@ -719,7 +736,8 @@ def test_a_race_fails_when_every_contestant_fails() -> None:
         return "done"
 
     trace = racing(MockLLM(one)).run_state({"query": "q"})  # the other contestant wins
-    assert trace.status == "ok" and trace.outputs == {"final": "done"}
+    assert trace.status == "ok"
+    assert trace.outputs == {"final": "done"}
 
 
 def test_a_race_inside_a_chain_item() -> None:
@@ -739,7 +757,8 @@ def test_a_race_inside_a_chain_item() -> None:
     started = time.monotonic()
     trace = mas.run_state({"pages": ["a", "b"]})
     assert time.monotonic() - started < 1.0
-    assert trace.status == "ok" and trace.outputs == {"notes": ["done", "done"]}
+    assert trace.status == "ok"
+    assert trace.outputs == {"notes": ["done", "done"]}
     lost = sorted((record.agent, record.item) for record in trace.records if record.lost)
     assert lost == [("careful", 0), ("careful", 1)]
 
@@ -770,7 +789,8 @@ def test_each_inner_run_races_on_its_own() -> None:
         llm=MockLLM(lambda prompt: "joined"),
     )
     trace = boxes.run_state({"query": "q"})
-    assert trace.status == "ok" and trace.outputs == {"a": "done", "b": "done"}
+    assert trace.status == "ok"
+    assert trace.outputs == {"a": "done", "b": "done"}
     for name in ("one", "two"):
         (record,) = trace[name]
         inner_records = record.inner.records  # type: ignore[union-attr]
@@ -801,7 +821,8 @@ def test_each_inner_run_races_on_its_own() -> None:
         llm=PollingLLM(lambda prompt: SECONDS[prompt.split()[0]]),
     )
     trace = looped.run_state({"pages": ["a"]})
-    assert trace.status == "ok" and trace.outputs == {"notes": ["done"]}
+    assert trace.status == "ok"
+    assert trace.outputs == {"notes": ["done"]}
     assert [r.agent for r in trace.records if r.lost] == ["careful", "careful"]
 
 
@@ -899,3 +920,21 @@ def test_stop_with_budgets_and_gates() -> None:
     time.sleep(0.02)
     with pytest.raises(BudgetExceeded, match=r"^wall_s"):
         resumed.check_boundary()
+
+
+def test_a_batch_runs_at_most_batch_queries_at_once() -> None:
+    lock, running, most = threading.Lock(), [0], [0]
+
+    def counting(prompt: str) -> str:
+        with lock:
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+        time.sleep(0.05)
+        with lock:
+            running[0] -= 1
+        return "ok"
+
+    mas = MAS([Agent("solver", "Solve {query}", output="answer")], llm=MockLLM(counting))
+    traces = mas.run_batch([str(item) for item in range(3 * BATCH_QUERIES)])
+    assert [trace.error for trace in traces] == [None] * (3 * BATCH_QUERIES)
+    assert most[0] == BATCH_QUERIES

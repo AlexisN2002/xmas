@@ -18,6 +18,7 @@ import enum
 import json
 import re
 from collections import deque
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
@@ -229,11 +230,11 @@ class BadFormat(XmasError):
 MONEY_WORDS = re.compile(
     r"key limit exceeded|requires more credits|insufficient credits|insufficient_quota"
     r"|exceeded your current quota|payment required|in_flight_budget_exhausted|insufficient_budget",
-    re.I,
+    re.IGNORECASE,
 )
 """Provider texts that mean the key or account is out of money."""
 
-MODERATION_WORDS = re.compile(r"flagged|moderation", re.I)
+MODERATION_WORDS = re.compile(r"flagged|moderation", re.IGNORECASE)
 """Provider texts that mean a moderation filter refused the request."""
 
 MAX_DEPTH = 8
@@ -278,9 +279,15 @@ def classify(error: BaseException) -> ErrorKind:
 
 def own_kind(exc: BaseException) -> ErrorKind | None:
     """Return the kind of one exception by rules 0 to 5, or ``None`` if none matches."""
+    kind = reported_kind(exc)
+    return kind if kind is not None else kind_of_type(exc)
+
+
+def reported_kind(exc: BaseException) -> ErrorKind | None:
+    """Return the kind an exception reports by rules 0 to 2, its status or its ``kind``, or ``None``."""
     if isinstance(exc, XmasError) and exc.status is not None:
         status_kind = kind_of_status(exc.status, str(exc))
-        if status_kind == ErrorKind.UNKNOWN and exc.status in (401, 403):
+        if status_kind == ErrorKind.UNKNOWN and exc.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
             return ErrorKind.REFUSAL
         return status_kind
     kind = getattr(exc, "kind", None)
@@ -289,6 +296,11 @@ def own_kind(exc: BaseException) -> ErrorKind | None:
     if isinstance(exc, openai.APIStatusError):
         text = str(exc) if exc.body is None else f"{exc} {exc.body}"
         return kind_of_status(exc.status_code, text)
+    return None
+
+
+def kind_of_type(exc: BaseException) -> ErrorKind | None:
+    """Return the kind of an exception by its type, rules 3 to 5, or ``None``."""
     if isinstance(exc, (openai.APITimeoutError, TimeoutError, httpx.TimeoutException, *HTTPX2_TIMEOUTS)):
         return ErrorKind.TIMEOUT
     if isinstance(exc, (openai.APIConnectionError, ConnectionError, httpx.TransportError, *HTTPX2_OUTAGES)):
@@ -307,20 +319,24 @@ def kind_of_status(status: int, text: str = "") -> ErrorKind:
     ``REFUSAL``; anything else (401, 404, 422) is ``UNKNOWN``. ``text`` is the
     error's message and body, searched for provider words.
     """
-    if status == 402 or (400 <= status < 500 and MONEY_WORDS.search(text)):
+    client_error = HTTPStatus.BAD_REQUEST <= status < HTTPStatus.INTERNAL_SERVER_ERROR
+    if status == HTTPStatus.PAYMENT_REQUIRED or (client_error and MONEY_WORDS.search(text)):
         return ErrorKind.MONEY
-    if status == 429:
+    if status == HTTPStatus.TOO_MANY_REQUESTS:
         return ErrorKind.RATE_LIMITED
-    if status == 408:
+    if status == HTTPStatus.REQUEST_TIMEOUT:
         return ErrorKind.TIMEOUT
-    if status >= 500:
+    if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
         return ErrorKind.OUTAGE
-    if status in (400, 403) and MODERATION_WORDS.search(text):
+    if status in (HTTPStatus.BAD_REQUEST, HTTPStatus.FORBIDDEN) and MODERATION_WORDS.search(text):
         return ErrorKind.REFUSAL
     return ErrorKind.UNKNOWN
 
 
-def kind_of_finish(finish_reason: str | None, refused: bool = False) -> ErrorKind | None:
+def kind_of_finish(
+    finish_reason: str | None,
+    refused: bool = False,  # noqa: FBT001, FBT002  the public signature; CallMeta passes it positionally
+) -> ErrorKind | None:
     """Return the kind of an answer that ended badly but still arrived, or ``None`` if it ended well.
 
     ``LENGTH_CUT`` for the finish reason ``"length"``; ``REFUSAL`` for

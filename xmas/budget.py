@@ -20,7 +20,6 @@ import time
 import uuid
 import warnings
 import weakref
-from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -31,6 +30,8 @@ from xmas.trace import AgentRecord, Event, Trace
 from xmas.utils import timestamp
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Mapping
+
     from xmas.llms.meta import CallMeta
     from xmas.store import RunLog
 
@@ -461,7 +462,7 @@ class RunMeter:
             return
         try:
             listener(event)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  a host's listener may raise anything; it is warned about once and dropped
             with self.lock:
                 first = self.listener is listener
                 self.listener = None
