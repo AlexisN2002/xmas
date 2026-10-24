@@ -31,6 +31,7 @@ from xmas.utils import timestamp
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
+
     from xmas.llms.meta import CallMeta
     from xmas.store import RunLog
 

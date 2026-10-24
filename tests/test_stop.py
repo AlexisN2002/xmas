@@ -30,6 +30,7 @@ from xmas.human import Human, Question
 from xmas.llms.api_llm import APILLM, assemble
 from xmas.llms.meta import CallMeta, TokenPrice
 from xmas.nodes import Box, Step
+from xmas.runtime import BATCH_QUERIES
 from xmas.tools import ToolCallRequest, tool
 from xmas.trace import Event
 
@@ -917,3 +918,21 @@ def test_stop_with_budgets_and_gates() -> None:
     time.sleep(0.02)
     with pytest.raises(BudgetExceeded, match=r"^wall_s"):
         resumed.check_boundary()
+
+
+def test_a_batch_runs_at_most_batch_queries_at_once() -> None:
+    lock, running, most = threading.Lock(), [0], [0]
+
+    def counting(prompt: str) -> str:
+        with lock:
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+        time.sleep(0.05)
+        with lock:
+            running[0] -= 1
+        return "ok"
+
+    mas = MAS([Agent("solver", "Solve {query}", output="answer")], llm=MockLLM(counting))
+    traces = mas.run_batch([str(item) for item in range(3 * BATCH_QUERIES)])
+    assert [trace.error for trace in traces] == [None] * (3 * BATCH_QUERIES)
+    assert most[0] == BATCH_QUERIES

@@ -56,7 +56,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict, cast
 
-from langchain_core.runnables.config import var_child_runnable_config
+from langchain_core.runnables.config import get_executor_for_config, var_child_runnable_config
 from langgraph.config import get_config
 from langgraph.errors import GraphBubbleUp, GraphRecursionError
 from langgraph.graph import StateGraph
@@ -95,13 +95,13 @@ from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType, check_value, coerce_media, media_kind, parse_type, plain, render_value
 
 if TYPE_CHECKING:  # pragma: no cover
-    from xmas.routes import Join
     from promptolution.llms.base_llm import BaseLLM
 
     from xmas.budget import Budget
     from xmas.chains import Chain
     from xmas.llms.meta import CallMeta
     from xmas.mas import MAS
+    from xmas.routes import Join
 
 __all__ = [
     "CONTINUE_MARKER",
@@ -133,6 +133,14 @@ Model calls wait on the network, not the CPU, and a chain item waiting for its
 ``at once`` place holds a thread too, so the pool is sized for waiting branches
 rather than LangGraph's default of the host's cores plus four; threads start
 only when a branch needs one.
+"""
+
+BATCH_QUERIES = 16
+"""Queries a batch (:func:`run_many`) runs at once, each on its own pool of :data:`BRANCH_THREADS`.
+
+Smaller than the branch pool because one query already fans out inside: 64
+queries at once, each with its branches, could overload a model gateway. 16 is
+near the old width on a desktop (cores plus four) and the same on every host.
 """
 
 RUN_KEY = "xmas_run"
@@ -1834,7 +1842,7 @@ def run_all(
             for meter, query in zip(meters, queries, strict=True):
                 store.begin(meter.run_id, cast("str", system_id), query)
                 log(meter, store)
-        results: list[Any] = graph.batch(states, config=configs, return_exceptions=True, **durable)
+        results = invoke_batch(graph, states, configs, durable)
     finally:
         for meter in meters:
             meter.close()
@@ -1846,6 +1854,28 @@ def run_all(
         if meter.log is not None:
             meter.log.end(trace, meter.totals())
     return traces
+
+
+def invoke_batch(
+    graph: Any, states: Sequence[MASState], configs: Sequence[dict[str, Any]], durable: Mapping[str, Any]
+) -> list[Any]:
+    """Invoke the graph on each state with its config, :data:`BATCH_QUERIES` at a time, as ``graph.batch`` would.
+
+    ``graph.batch`` takes its width from the first run's ``max_concurrency``,
+    which here sizes each run's own branch pool, so the batch runs on a pool of
+    its own. A query that fails returns its error, which becomes its failed trace.
+    """
+
+    def invoke(state: MASState, config: dict[str, Any]) -> Any:
+        try:
+            return graph.invoke(state, config, **durable)
+        except Exception as error:  # noqa: BLE001  any failure of one query is that query's failed trace, as with batch(return_exceptions=True)
+            return error
+
+    if len(states) == 1:
+        return [invoke(states[0], configs[0])]
+    with get_executor_for_config({"max_concurrency": BATCH_QUERIES}) as executor:
+        return list(executor.map(invoke, states, configs))
 
 
 def node_owner(mas: MAS, node: str) -> MAS:
