@@ -426,13 +426,10 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
                 result = json.loads(text)
             except json.JSONDecodeError as exc:
                 raise BadFormat(spec.name, (f"the result is not JSON: {exc}",)) from exc
-    if len(writes) == 1:
-        produced = {next(iter(writes)): result}
-    elif isinstance(result, Mapping) and set(result) == set(writes):
-        produced = dict(result)
-    else:
+    if len(writes) > 1 and not (isinstance(result, Mapping) and set(result) == set(writes)):
         got = sorted(result) if isinstance(result, Mapping) else type(result).__name__
         raise BadFormat(spec.name, (f"expected a mapping with keys {sorted(writes)}, got {got}",))
+    produced = {next(iter(writes)): result} if len(writes) == 1 else dict(result)
     media, problems = store(), []
     for name, value in produced.items():
         try:

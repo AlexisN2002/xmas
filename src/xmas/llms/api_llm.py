@@ -34,8 +34,9 @@ from xmas.utils import approximate_tokens, error_message, retry_after_seconds, t
 
 # promptolution's _ainvoke_with_retries returns only the text, so the provider's
 # completion id travels to CallRecord.response_id(s) in this per-request slot (each
-# prompt of a batch runs as its own task).
-_completion_id: ContextVar[list[str | None] | None] = ContextVar("xmas_completion_id", default=None)
+# prompt of a batch runs as its own task); a request outside that loop writes to the
+# default slot, which no one reads.
+_completion_id: ContextVar[list[str | None]] = ContextVar("xmas_completion_id", default=[None])  # noqa: B039
 
 _STREAM = {"stream": True, "stream_options": {"include_usage": True}}
 """What a streamed request adds to the request, after its other keys."""
@@ -213,9 +214,7 @@ class APILLM(promptolution.APILLM):
     async def _ainvoke_once(self, prompt: str, system_prompt: str) -> ChatCompletion:
         """Make promptolution's request, noting the provider's completion id for the caller."""
         completion = await self._once(self._request(prompt_messages(prompt, system_prompt)))
-        slot = _completion_id.get()
-        if slot is not None:
-            slot[0] = completion.id
+        _completion_id.get()[0] = completion.id
         return completion
 
     async def _ainvoke_with_retries(self, prompt: str, system_prompt: str) -> str:

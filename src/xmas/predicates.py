@@ -370,14 +370,10 @@ def _compare(op: str, left: Any, right: Any) -> bool:
     if op == "!=":
         return not _equal(left, right)
     if op in ("in", "not in"):
-        if isinstance(right, str):
-            found = isinstance(left, str) and left in right
-        elif isinstance(right, list | tuple):
+        if isinstance(right, list | tuple):
             found = any(_equal(left, item) for item in right)
-        elif isinstance(right, Mapping):
-            found = isinstance(left, str) and left in right
-        else:
-            found = False
+        else:  # a substring of a text, a key of an object
+            found = isinstance(right, str | Mapping) and isinstance(left, str) and left in right
         return found if op == "in" else not found
     numbers = all(isinstance(side, int | float) and not isinstance(side, bool) for side in (left, right))
     if not numbers and not (isinstance(left, str) and isinstance(right, str)):

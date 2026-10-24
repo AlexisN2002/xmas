@@ -400,11 +400,12 @@ def _read_problems(
     for name, needed in reads.items():
         failed = routes.failed_before(name)
         for value, parameter in needed.items():
-            if value in RESERVED_READS and name in mas.boxes:
-                yield f"box {name!r} reads {value!r}; a box reads neither 'error' nor 'run', the system inside it does"
-                continue
-            if value == "error" and name not in erred:
-                yield f"{name!r} reads 'error', {_ERRED_ONLY}"
+            if (box := name in mas.boxes and value in RESERVED_READS) or (value == "error" and name not in erred):
+                yield (
+                    f"box {name!r} reads {value!r}; a box reads neither 'error' nor 'run', the system inside it does"
+                    if box
+                    else f"{name!r} reads 'error', {_ERRED_ONLY}"
+                )
                 continue
             if value not in RESERVED_READS and value not in mas.inputs:
                 if value not in writers:
