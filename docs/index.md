@@ -12,8 +12,8 @@ the exact degenerate case, so promptolution's optimizers plug in unchanged.
     Inference, the optimization loop, CANTANTE, topology search, code steps, JSON
     answers, conditions, loops, per-item chains, media values, budgets, health,
     people in the graph, Stop, `first of` races, the `.mas` bundle, `verify()`
-    and the `xmas` command are in place. Learning from human picks and the
-    experiment layer are still to come.
+    and the `xmas` command are in place. Learning from human picks is still
+    to come.
 
 ## Where to start
 

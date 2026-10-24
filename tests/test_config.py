@@ -354,5 +354,5 @@ def test_the_documented_file_loads(tmp_path: Path) -> None:
     block = (xmas.config.__doc__ or "").split(".. code-block:: toml", 1)[1].split("The environment variables", 1)[0]
     path = write(tmp_path, "\n".join(line[4:] for line in block.splitlines()))
     config = Config.load(path, environ={"GATEWAY_KEY": "k", "WEB_TOOLS_KEY": "w"})
-    assert (config.base_url, config.api_key, config.catalogue) == ("http://127.0.0.1:8000/v1", "k", ("kimi-k3",))
-    assert (config.stream_of("kimi-k3"), config.tools["web"].key) == (True, "w")
+    assert (config.base_url, config.api_key, config.catalogue) == ("http://localhost:8000/v1", "k", ("llama-3.1-8b",))
+    assert (config.stream_of("llama-3.1-8b"), config.tools["web"].key) == (True, "w")

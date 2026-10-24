@@ -8,12 +8,12 @@ environment, then from a TOML file, ``$XMAS_CONFIG`` or else
 .. code-block:: toml
 
     [endpoint]
-    base_url = "http://127.0.0.1:8000/v1"
+    base_url = "http://localhost:8000/v1"
     api_key_env = "GATEWAY_KEY"        # or api_key = "..."
-    catalogue = ["kimi-k3"]            # optional; else GET {base_url}/models
+    catalogue = ["llama-3.1-8b"]       # optional; else GET {base_url}/models
     stream = false
 
-    [models."kimi-k3"]
+    [models."llama-3.1-8b"]
     price = {input_per_m = 0.6, output_per_m = 2.5}
     stream = true
 

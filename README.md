@@ -38,7 +38,7 @@ design.
 > **Status: beta.** Inference, the optimization loop, CANTANTE, topology search, code steps,
 > JSON answers, conditions, loops, per-item chains, media values, budgets, health, people in
 > the graph, Stop, `first of` races, the `.mas` bundle, `verify()` and the `xmas` command are
-> in place. Learning from human picks and the experiment layer are still to come.
+> in place. Learning from human picks is still to come.
 
 | What | Today |
 |---|---|
@@ -64,7 +64,6 @@ design.
 | Configuration: endpoint, key, catalogue and tool servers, outside the bundle | built |
 | The `xmas` command: `init`, `check`, `show`, `run`, `diff`, `verify` | built |
 | Learning from human picks | planned |
-| The experiment layer: one config for a reproducible run, like promptolution's `ExperimentConfig` | planned |
 
 ## 🔧 Installation
 
