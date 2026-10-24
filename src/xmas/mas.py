@@ -5,8 +5,11 @@ from __future__ import annotations
 import copy as _copy
 import dataclasses
 import hashlib
+import importlib
 import json
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import os
+import warnings
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,11 +17,12 @@ import yaml
 from promptolution.llms.base_llm import BaseLLM
 from promptolution.predictors.base_predictor import BasePredictor
 
-from xmas import runtime
+from xmas import bundle, runtime
 from xmas.agent import Agent
 from xmas.budget import Budget
 from xmas.chains import ChainShape, ForEach
 from xmas.check import MERGE_LAST, SystemInfo, check_system, step_maps
+from xmas.config import Config, config_path, resolve_names
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
 from xmas.graph import (
     END,
@@ -39,7 +43,7 @@ from xmas.nodes import Box, Step
 from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import validate_spec, validate_spec_v2
 from xmas.store import Store, open_store
-from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools
+from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools, tool
 from xmas.trace import Event, Trace
 from xmas.values import TEXT, ValueType, parse_type
 
@@ -142,6 +146,11 @@ class MAS(BasePredictor):
             call, assigned once at the end of the batch; this is the seam an
             attributor reads after a task evaluation. One MAS instance serves one
             batch at a time; :meth:`run` shares no state at all.
+        bundle: The ``.mas`` bundle this system was loaded from or last saved
+            to, or ``None``; never part of the spec, never copied.
+        unresolved: The model ids :meth:`load` found missing from the
+            catalogue, each with the closest ids; while any is, every run
+            refuses. Never part of the spec, never copied.
     """
 
     agents: dict[str, Agent]
@@ -164,6 +173,8 @@ class MAS(BasePredictor):
     budget: Budget | None
     asker: Asker | None
     store: Store | None
+    bundle: Path | None
+    unresolved: dict[str, tuple[str, ...]]
 
     def __init__(
         self,
@@ -303,6 +314,8 @@ class MAS(BasePredictor):
         self.compilation: tuple[str, Any] | None = None
         self.last_trace: Trace | None = None
         self.last_traces: tuple[Trace, ...] = ()
+        self.bundle = None
+        self.unresolved = {}
         if self.version == 2:
             self._build_v2(inputs, state)
         else:
@@ -443,6 +456,17 @@ class MAS(BasePredictor):
             raise RuntimeError(f"MAS run failed: {trace.error}")
         return trace.output
 
+    def _check_resolved(self) -> None:
+        """Refuse to run while a bound model name is not in the catalogue, before any call."""
+        if self.unresolved:
+            named = "; ".join(
+                f"{name!r} (closest: {', '.join(near) or 'none'})" for name, near in self.unresolved.items()
+            )
+            raise ValueError(
+                f"Model names not in the catalogue: {named}. Set the name in models: or fix the catalogue; "
+                "verify(1) rechecks."
+            )
+
     def _check_runs_on_query(self) -> None:
         """Refuse to run a system whose inputs are not the one ``query`` text."""
         if self.inputs != _QUERY_ONLY:
@@ -457,8 +481,10 @@ class MAS(BasePredictor):
 
         This is :meth:`__call__` without the shared state: the trace is returned
         rather than stashed, which is what concurrent callers want. A system
-        whose inputs are not ``{query: text}`` raises ``ValueError``.
+        whose inputs are not ``{query: text}`` raises ``ValueError``, and so
+        does a system with :attr:`unresolved` model names.
         """
+        self._check_resolved()
         self._check_runs_on_query()
         return runtime.run_one(self, query, self.prompts())
 
@@ -483,8 +509,10 @@ class MAS(BasePredictor):
 
         Raises:
             ValueError: Listing every missing, extra or mistyped input, before
-                any call; or when ``run_id`` names a run running or kept.
+                any call; when ``run_id`` names a run running or kept; or for
+                :attr:`unresolved` model names.
         """
+        self._check_resolved()
         return runtime.run_state(self, values, self.prompts(), on_event, run_id)
 
     def resume(
@@ -527,6 +555,7 @@ class MAS(BasePredictor):
 
     def run_batch(self, queries: list[str]) -> list[Trace]:
         """Run the MAS over several inputs, concurrently where the LLM allows; one trace per query, in order."""
+        self._check_resolved()
         self._check_runs_on_query()
         prompts = self.prompts()
         traces = runtime.run_many(self, queries, [prompts] * len(queries))
@@ -570,6 +599,7 @@ class MAS(BasePredictor):
         prompts carry their instructions. Returns ``(predictions, sequences)``,
         matching ``BasePredictor``; a failed rollout's sequence is empty.
         """
+        self._check_resolved()
         if not xs:
             return [], []
         self._check_runs_on_query()
@@ -881,13 +911,13 @@ class MAS(BasePredictor):
         """Write the spec to a YAML file.
 
         Raises:
-            ValueError: For a version 2 system: its file format comes with the
+            ValueError: For a version 2 system, which :meth:`save` writes as a
                 ``.mas`` bundle; :meth:`to_dict` gives its spec.
         """
         if self.version == 2:
             raise ValueError(
-                "A version 2 system is not saved as one YAML file: its format comes with the .mas bundle "
-                "(name.mas/); to_dict() gives its spec."
+                "A version 2 system is not saved as one YAML file: it is saved as the .mas bundle "
+                "(name.mas/): save(path) writes it; to_dict() gives its spec."
             )
         Path(path).write_text(
             yaml.safe_dump(self.to_dict(), sort_keys=False, allow_unicode=True),
@@ -905,6 +935,112 @@ class MAS(BasePredictor):
         """Read a MAS spec from a YAML file, as :meth:`from_dict` reads it."""
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(data, llm=llm, llms=llms, tools=tools)
+
+    def save(self, path: str | os.PathLike[str], *, zipped: bool = False) -> Path:
+        """Save the system as a ``.mas`` bundle, a folder or (``zipped``) one zip file, and return its path.
+
+        A version 1 system is saved as a bundle too; :meth:`to_yaml` keeps its
+        one file. Into an existing folder only the files whose parsed content
+        changed are written, files the system no longer has are deleted, and
+        ``examples/`` and ``optimize.yaml`` are never touched; the lock is
+        written last. Sets :attr:`bundle`. See :mod:`xmas.bundle`.
+
+        Raises:
+            ValueError: If the name does not end in ``.mas``, the folder is not
+                a bundle, or a prompt or box name cannot be a file name.
+        """
+        self.bundle = bundle.write(path, bundle.files_of(self), bundle.code_hashes(self), zipped=zipped)
+        return self.bundle
+
+    @classmethod
+    def load(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        llm: BaseLLM | None = None,
+        llms: Mapping[str, BaseLLM] | None = None,
+        tools: Sequence[ToolSource | Tool] = (),
+        config: Config | None = None,
+        overlay: Mapping[str, str] | None = None,
+        resolve: bool = True,
+    ) -> MAS:
+        """Load a ``.mas`` bundle, a folder or a zip, and build the system it holds.
+
+        A callable offered by ``tools`` is used as given; otherwise a python
+        callable is imported by its path and bound to its ``params``, and a
+        remote one reaches the tool server its ``server`` names in the
+        configuration. ``overlay`` (``{agent: model name}``) rebinds agents
+        before anything is built. With ``resolve``, every bound model id is
+        checked against the configured catalogue: a miss is a
+        :class:`~xmas.config.ModelNameWarning` naming the closest ids, and the
+        system keeps it in :attr:`unresolved` and refuses to run.
+
+        Args:
+            path: The bundle.
+            llm: The default model.
+            llms: Models by the names agents bind.
+            tools: Tools and tool sources, which win over the bundle's callables of their names.
+            config: Where tool servers and the catalogue come from; :meth:`Config.load` when ``None``.
+            overlay: Model names by agent, replacing the bundle's.
+            resolve: Whether model names are checked against the catalogue.
+
+        Raises:
+            ValueError: If the bundle is malformed or names what cannot be found,
+                or the system it holds is not runnable.
+        """
+        files = bundle.read(path)
+        spec = bundle.spec_of(files)
+        bundle.read_optimize(files)
+        settings = config
+
+        def configured() -> Config:
+            nonlocal settings
+            if settings is None:
+                settings = Config.load()
+            return settings
+
+        systems = list(_spec_systems(spec))
+        for system in systems:  # the shape first, so a malformed entry is named before any import
+            (validate_spec_v2 if system.get("version") == 2 else validate_spec)(dict(system))
+        if overlay:
+            agents = {item["name"]: item for item in spec["agents"]}
+            unknown = sorted(set(overlay) - set(agents))
+            if unknown:
+                raise ValueError(f"The overlay names unknown agents {unknown}; the agents are {sorted(agents)}.")
+            for name, model in overlay.items():
+                agents[name]["model"] = model
+        sources = [*tools, *_callable_sources(systems, tools, configured)]
+        given = dict(llms or {})
+        bound = {agent["model"] for system in systems for agent in system.get("agents", []) if agent.get("model")}
+        default_model = spec.get("default_model")
+        if llm is None and default_model is not None:
+            bound.add(default_model)
+        missing = sorted(bound - set(given))
+        if missing:
+            given.update(_model_objects(missing))
+        default = given.get(default_model) if llm is None and default_model is not None else llm
+        mas = cls.from_dict(spec, llm=default, llms=given, tools=sources)
+        mas.bundle = Path(path)
+        if resolve:
+            mas._resolve(configured())
+        return mas
+
+    def _resolve(self, config: Config) -> None:
+        """Check every bound model id against the catalogue, warn per miss, and keep the misses in ``unresolved``."""
+        bound: dict[str, list[str]] = {}
+        for system in _built_systems(self):
+            for agent in system.agents.values():
+                name = agent.model if agent.model is not None else system.default_model
+                if name is None:
+                    continue
+                entry = system.models.get(name)
+                ident = entry.model if isinstance(entry, ModelEntry) and entry.model else name
+                bound.setdefault(ident, []).append(agent.name)
+        labels = {ident: ("agent " if len(who) == 1 else "agents ") + ", ".join(who) for ident, who in bound.items()}
+        resolution = resolve_names(labels, config)
+        for warning in resolution.warnings:
+            warnings.warn(warning, stacklevel=3)
+        self.unresolved = dict(resolution.suggestions)
 
     def describe(self) -> dict[str, Any]:
         """Return the system as plain data, for drawing it and naming it.
@@ -1115,6 +1251,89 @@ def _agent_spec(agent: Agent, prompt: str | None) -> dict[str, Any]:
     if agent.schema is not None:
         data["schema"] = _copy.deepcopy(agent.schema)
     return data
+
+
+def _spec_systems(spec: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
+    """Yield a spec and each box's inner spec, at every depth."""
+    yield spec
+    for box in spec.get("boxes") or []:
+        if isinstance(box, dict) and isinstance(box.get("system"), dict):
+            yield from _spec_systems(box["system"])
+
+
+def _built_systems(mas: MAS) -> Iterator[MAS]:
+    """Yield a system and each box's system, at every depth."""
+    yield mas
+    for box in mas.boxes.values():
+        yield from _built_systems(box.system)
+
+
+def _model_objects(names: Sequence[str]) -> dict[str, BaseLLM]:
+    """Return a model object for each bound name no ``llm`` or ``llms`` argument gave."""
+    raise ValueError(f"No model object for {list(names)}: pass llms={{name: model}}, or llm= for the default model.")
+
+
+def _callable_sources(
+    systems: Sequence[Mapping[str, Any]], supplied: Sequence[ToolSource | Tool], configured: Callable[[], Config]
+) -> list[ToolSource | Tool]:
+    """Return the tools and tool sources a bundle's callables need, besides those ``supplied``.
+
+    A python callable is imported (a :class:`Tool` as it is, a function made
+    one) and bound to its ``params``; the remote ones of each named server
+    share one :class:`~xmas.tools.mcp.MCPTools` on the configured address.
+    """
+    offered = set(index_tools(supplied)) if supplied else set()
+    built: dict[str, Tool] = {}
+    servers: dict[str, dict[str, Mapping[str, str]]] = {}
+    for system in systems:
+        for name, entry in system.get("callables", {}).items():
+            if name in offered or name in built:
+                continue
+            if entry.get("kind") == "python":
+                built[name] = _imported(name, entry)
+            elif entry.get("kind") == "mcp":
+                server = entry.get("server")
+                if not isinstance(server, str):
+                    raise ValueError(
+                        f"Callable {name!r} is a remote tool with no server: pass tools=[...] offering it, or name "
+                        "its server and configure [tools.<name>] url."
+                    )
+                servers.setdefault(server, {})[name] = entry.get("writes") or {name: "text"}
+    sources: list[ToolSource | Tool] = list(built.values())
+    if servers:
+        from xmas.tools.mcp import MCPTools  # here, not at the top: MCP is an extra
+
+        for server, writes in servers.items():
+            found = configured().tools.get(server)
+            if found is None:
+                raise ValueError(
+                    f"Callables {sorted(writes)} name the server {server!r}, which the configuration does not list: "
+                    f"add [tools.{server}] url to {config_path()}, or pass tools=[...] offering them."
+                )
+            sources.append(MCPTools(found.url, found.key, writes=writes, name=server))
+    return sources
+
+
+def _imported(name: str, entry: Mapping[str, Any]) -> Tool:
+    """Import a python callable by its ``import`` path, as a tool named ``name`` bound to its ``params``."""
+    target = entry.get("import")
+    if not isinstance(target, str) or ":" not in target:
+        raise ValueError(f"Callable {name!r} needs import: 'package.module:function', not {target!r}.")
+    module, _, attribute = target.partition(":")
+    try:
+        found: Any = importlib.import_module(module)
+        for part in attribute.split("."):
+            found = getattr(found, part)
+    except (ImportError, AttributeError) as error:
+        raise ValueError(f"Callable {name!r}: {target!r} cannot be imported ({error}); pass tools=[...].") from None
+    if isinstance(found, Tool):
+        item = found if found.name == name else found.renamed(name)
+    elif callable(found):
+        item = tool(found, name=name, writes=entry.get("writes"))
+    else:
+        raise ValueError(f"Callable {name!r}: {target!r} is a {type(found).__name__}, not a function.")
+    params = entry.get("params")
+    return item.bind(**params) if params else item
 
 
 def _health_spec(settings: HealthSettings | None) -> dict[str, Any]:
