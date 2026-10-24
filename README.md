@@ -15,7 +15,8 @@ so you always know who was naughty and who was nice. A single agent is the small
 system, not a special case.
 
 Version 2 puts the whole workflow in one graph: agents, code steps, conditions and loops,
-and answers with a fixed JSON shape. Pictures, documents and people are planned next.
+chains that run once per item of a list, and answers with a fixed JSON shape. Pictures,
+documents and people are planned next.
 xmas checks the wiring before the first call and draws the picture from the graph that runs.
 A system made only of agents and plain edges is a version 1 system, and works as before.
 
@@ -31,24 +32,26 @@ See [docs/design-principles.md](docs/design-principles.md) for the principles be
 design.
 
 > **Status: beta.** Inference, the optimization loop, CANTANTE, topology search, code steps,
-> JSON answers, conditions, loops, budgets and health are in place. The `.mas` bundle,
-> values beyond text, people in the graph and the experiment layer are still to come.
+> JSON answers, conditions, loops, per-item chains, budgets and health are in place. The
+> `.mas` bundle, values beyond text and JSON, people in the graph and the experiment layer
+> are still to come.
 
 | What | Today |
 |---|---|
 | Agents, tools (local and MCP), a model per agent | built |
 | Code steps between agents | built |
-| Text and JSON values, JSON answers with a fixed shape | built |
+| Text and JSON values and lists of them, JSON answers with a fixed shape | built |
 | Wiring checked before the first call | built |
 | `when`, `else`, `while`, `switch` and `on error` edges, merges and joins | built |
 | A system inside a system (a box) | built |
-| Records with cost, time and tokens, budgets, health signals | built |
+| Records with cost, time and tokens, budgets, health signals, per item too | built |
 | `describe()`, the system as plain data for drawing | built |
 | YAML files for version 1 systems, plain-data specs for version 2 | built |
 | Optimizers: CANTANTE, topology search, `frozen` nodes | built |
-| `for each` chains and `first of` races | planned |
+| `for each` chains: some nodes once per item of a list | built |
+| `run_state`: start a run from several named values and read several outputs | built |
+| `first of` races | planned |
 | Images, audio, documents, tables and files as values | planned |
-| `run_state`: start a run from several named values and read several outputs | planned |
 | People in the graph, and Stop | planned |
 | The `.mas` bundle, its commands and `verify()` | planned |
 | Learning from human picks | planned |
@@ -315,7 +318,7 @@ colon:
 | `switch` | `Edge("a", "b", kind=EdgeKind.SWITCH, switch="verdict.action")` | `a -> b: {switch: verdict.action}` | built |
 | `on error` | `Edge("a", "b", kind=EdgeKind.ERROR, errors=("timeout",))` | `a -> b: {on error: [timeout]}` | built |
 | box | `Box(name, system, reads=..., writes=...)` | `boxes:` | built |
-| `for each` | | | planned |
+| `for each` | `MAS(..., each={"b": "page in plan.pages"})` | `for each: page in plan.pages` on each node | built |
 | `first of` | | | planned |
 
 A `switch` edge's case is its target's name unless `case="..."` says otherwise. An
@@ -377,7 +380,8 @@ print(sorted({(flag.signal, flag.node) for flag in trace.health.flags}))
 The signals are `retried`, `bad_format`, `error_routed`, `empty`, `stuck` (the same
 output as the node's last visit), `unfilled` (a prompt placeholder with no value), `leak`
 (chat-template tokens or reasoning tags in an output), and `long` and `short` (over
-three times, or under a third of, the node's median length).
+three times, or under a third of, the node's median length). A `for each` chain adds
+`item_failed` and `item_over_budget` (see Once per item).
 `trace.health.loops` counts each `while` edge, and `trace.health.budget` shows each limit
 next to what the run spent. `MAS(..., health=HealthSettings(length_factor=4))` tunes them.
 A healthy run's `trace.to_dict()` has no `health` key.
@@ -398,7 +402,8 @@ print(spent["intern"][0].outputs)  # the intern's draft is kept
 ```
 
 `Budget` also takes `max_cost_usd` and `max_wall_s`. A limit of 0 spends nothing. Calls
-already in flight may overshoot by one call per branch. A cost limit refuses the next
+already in flight may overshoot by one call per branch. `max_parallel_calls` caps how
+many model calls are in flight at once, across branches, boxes and chain items. A cost limit refuses the next
 call when the last one reported no cost and its model has no price, because an unknown
 cost cannot be checked.
 
@@ -452,6 +457,105 @@ inner trace, and `trace.walk()` yields every record with the path of boxes aroun
 The box's cost and tokens are its inner records' sums, unknown when any of them is, and
 a failed box keeps the inner records that finished.
 
+## Once per item: `for each`
+
+A `for each` chain runs some nodes once per item of a list. Here a planner lists the
+pages of an answer in JSON. Each page is written and counted on its own, and a step
+outside the chain adds up the counts:
+
+```python
+from xmas import ForEach
+
+
+@tool
+def total_words(count_words: list[int | None]) -> int:
+    """Add up the word counts of the pages that were written."""
+    return sum(count for count in count_words if count is not None)
+
+
+planner = Agent(
+    "planner",
+    prompt="Plan a short answer in three pages: {query}",
+    output="plan",
+    output_type="json",
+    schema={"pages": {"type": "list of object", "fields": {"id": {"type": "text"}, "topic": {"type": "text"}}}},
+)
+page_writer = Agent("page_writer", prompt="Write one page on: {page}", inputs=["page"], output="draft")
+deck = MAS(
+    [planner, page_writer],
+    steps=[Step("count", uses="count_words"), Step("total", uses="total_words")],
+    edges=[("planner", "page_writer"), ("page_writer", "count"), ("count", "total")],
+    each={"page_writer": ForEach("page", "plan.pages", at_once=2, key="id"), "count": "page in plan.pages"},
+    tools=[count_words, total_words],
+    llm=llm,
+)
+
+trace = deck.run("Why is the sky blue?")
+print([(record.agent, record.item_key) for record in trace.records])
+# [('planner', None), ('page_writer', 'light'), ('count', 'light'), ('page_writer', 'air'), ...]
+print(trace["total"][0].inputs)  # {'count_words': '[4, null, 4]'}: the page 'air' failed
+```
+
+Every node of the chain names the same item and list. The first one may add options:
+`at_once` caps how many items run at the same time, and `key` names the field that
+tells the items apart in the records.
+
+Inside the chain, `page` is one item and `count_words` one number. Outside, each value
+the chain writes is a list in item order, however the items finish. When one item
+fails, say its model call times out, its place in each list is `None` and the other
+items go on. The run still ends `ok`, and health counts the failed item:
+
+```python
+print(trace.health.items["page_writer"]["failed"])  # 1, of 3 items
+print([flag.signal for flag in trace.health.flags])  # ['item_failed']
+```
+
+A budget stop or an out-of-money error still ends the whole run. `item_budget={"cost_usd":
+0.05}` on the `ForEach` flags an item that costs more as `item_over_budget`, and never
+stops it. A `while` edge inside a chain repairs one item, and its `max_visits` counts per
+item. In a spec, each node of the chain carries `for each: page in plan.pages`; the
+first may write `{item, in, at once, key, item budget}` instead. Chains do not nest.
+
+## Several values in, several out: `run_state`
+
+`run(query)` takes one text. `run_state` starts a run from all of a system's inputs by
+name, and `outputs=` names the values the trace hands back. Here are the pages again,
+started from a plan you already have:
+
+```python
+pages = MAS(
+    [page_writer],
+    steps=[Step("count", uses="count_words"), Step("total", uses="total_words")],
+    edges=[("page_writer", "count"), ("count", "total")],
+    each={"page_writer": ForEach("page", "plan.pages", key="id"), "count": "page in plan.pages"},
+    inputs={"plan": "json"},
+    outputs={"total_words": "json", "count_words": "list of json"},
+    tools=[count_words, total_words],
+    llm=llm,
+)
+
+heard = []
+trace = pages.run_state({"plan": {"pages": [{"id": "light"}, {"id": "eye"}]}}, on_event=heard.append)
+print(trace.outputs)  # {'total_words': 8, 'count_words': [4, 4]}
+print(trace.output)  # 8: the first output, which a task scores
+print(sorted({event.kind for event in heard}))  # ['end', 'item_end', 'item_start', 'start']
+```
+
+A missing, extra or mistyped input raises one `ValueError` that lists them all, before
+any call. `on_event` hears each visit's start and end and each item's, with the node,
+the item and a status. It runs on the run's threads, so keep it quick.
+
+With `outputs=`, several branches may end the run, and the run ends once all of them
+have. Without it, `output` is the last terminal's write, as before. The trace of a
+version 2 run carries a `run_id`, and its `graph_id` is the system's `describe()["id"]`.
+
+Three more things a node can do. `MAS(..., retry={"count": {"outage": 1}})` runs a node
+again after an outage, a timeout or a rate limit. Its one record counts the `retries`
+and the cost of every attempt. A node may read two values that no node writes: `error`,
+the `{kind, message, node}` of the failure an `on error` edge routed to it, and `run`,
+what the run has spent so far. `Agent(..., inputs={"slide": "page"})` fills the
+placeholder `{slide}` from the value `page`.
+
 ## 💾 Save and share
 
 A version 1 system, such as the quickstart's, saves as one YAML file. One file holds
@@ -463,7 +567,7 @@ team.to_yaml("team.yaml")
 team = MAS.from_yaml("team.yaml", llm=llm)
 ```
 
-A system that uses steps, JSON answers, conditions or boxes is version 2. Its spec is
+A system that uses steps, JSON answers, conditions, boxes or chains is version 2. Its spec is
 plain data, and `MAS.from_dict` rebuilds it with the same models and functions:
 
 ```python
@@ -510,8 +614,8 @@ best.to_yaml("team-optimized.yaml")
 `MAS(..., frozen=("boss",))` keeps a node as it is. No optimizer changes its prompt,
 model, reads, writes or edges. A frozen node makes the system version 2, so keep its
 `to_dict()` instead of a YAML file. `EvolutionaryTopologyOptimizer` searches the wiring. It
-keeps steps, boxes, frozen nodes and conditional edges as they are, and drops any
-candidate the check refuses. Steps are never part of the prompts an optimizer sees.
+keeps steps, boxes, frozen nodes, conditional edges and every `for each` chain as they
+are, and drops any candidate the check refuses. Steps are never part of the prompts an optimizer sees.
 
 ## 🔗 xmas and promptolution
 
@@ -616,33 +720,14 @@ and before a release.
 
 ### Beyond text
 
-Values today are `text` and `json`, and the check refuses any other type word with a
-message. Planned next are `image`, `audio`, `document`, `table`, `file` and `list of`
-each. Large values travel by reference. Each model states what it
-accepts, and an agent that reads an image on a model that cannot see fails when the
-system is built. Conversions, such as a document to text, are visible steps.
+Values today are `text`, `json` and lists of them, such as `list of text`. The check
+refuses any other type word with a message. Planned next are `image`, `audio`,
+`document`, `table` and `file`. Large values travel by reference. Each model states what
+it accepts, and an agent that reads an image on a model that cannot see fails when the
+system is built. Conversions, such as a document to text, are visible steps. A per-item
+chain can then render each slide of a deck and let a judge on a vision model look at it.
 
-`for each` runs a chain once per item of a list. Take a deck: a writer drafts a slide, a
-step renders it, and a judge looks at the picture. The three share one `for each`, so
-the `while` edge repairs that one slide only. At the cap, the `else` edge runs and the
-trace marks it. A node outside the chain, such as one that assembles the deck, waits
-for every slide and reads the results as lists:
-
-```yaml
-agents:
-  - {name: writer, model: text-model, for each: slide in spec.slides, reads: [slide, verdict], writes: {slide_md: text}}
-  - {name: judge, model: vision-model, for each: slide in spec.slides, reads: [slide, slide_png], writes: {verdict: json}}
-steps:
-  - {name: render, uses: render_slide, for each: slide in spec.slides}
-  - {name: assemble, uses: assemble_deck}
-edges:
-  - writer -> render -> judge
-  - judge -> writer: {when: not verdict.fits, max_visits: 3}
-  - judge -> assemble: else
-```
-
-`first of` races branches, and the first good result wins. `mas.run_state({...})` starts
-a run from several named values and returns several outputs.
+`first of` races branches, and the first good result wins.
 
 ### People in the graph
 
@@ -675,7 +760,9 @@ xmas builds on:
 - **`Box`** – A whole system used as one node of another.
 - **`MAS`** – The system and the predictor: agents, steps, edges, models and tools; runs a query and keeps its trace.
 - **`Trace`** – The per-agent record of one run: rendered prompts, outputs, tokens, cost, time, tool calls, status.
-- **`Budget`** – Limits on calls, cost and wall time for each run.
+- **`ForEach`** – The `for each` form of a chain: the item, the list it comes from, and options such as `at_once` and `key`.
+- **`Event`** – One start or end of a visit or an item, passed to `run_state`'s `on_event` as the run goes.
+- **`Budget`** – Limits on calls, cost and wall time for each run, and on model calls in flight.
 - **`Health`** – Signals read from a finished run: stuck loops, empty answers, retries, caps hit.
 - **`MASTask`** – A dataset plus a reward over the system's answers, e.g. `GSM8KTask`.
 - **`APILLM`** – Any OpenAI-compatible endpoint, with scoring, tool turns and a per-call log.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import itertools
+import json
 import re
 import tomllib
 from collections.abc import Callable, Iterator
@@ -22,7 +23,21 @@ import pytest
 import yaml
 
 import xmas
-from xmas import MAS, Agent, Box, Budget, Edge, EdgeKind, ErrorKind, GSM8KTask, HealthSettings, Step, TokenUsage
+from xmas import (
+    MAS,
+    Agent,
+    Box,
+    Budget,
+    Edge,
+    EdgeKind,
+    ErrorKind,
+    Event,
+    ForEach,
+    GSM8KTask,
+    HealthSettings,
+    Step,
+    TokenUsage,
+)
 from xmas.predicates import Context, parse_predicate
 from xmas.tools import Tool, ToolSource, tool
 
@@ -573,6 +588,7 @@ def test_health_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> Non
 
 def test_health_signal_names_and_a_healthy_run() -> None:
     named = ["retried", "bad_format", "error_routed", "empty", "stuck", "unfilled", "leak", "long", "short"]
+    named += ["item_failed", "item_over_budget"]
     sentence = README.split("The signals are ", 1)[1].split("`trace.health.loops`", 1)[0]
     assert re.findall(r"`(\w+)`", sentence) == named
 
@@ -706,6 +722,220 @@ def test_a_box_spends_from_the_outer_budget() -> None:
     outer = MAS([writer], boxes=[shorten], edges=[("writer", "shorten")], llm=llm, budget=Budget(max_calls=1))
 
     assert outer.run(QUERY).status == "over_budget"
+
+
+# ---------------------------------------------------------- Once per item
+
+
+PLANNED_PAGES = [
+    {"id": "light", "topic": "sunlight"},
+    {"id": "air", "topic": "the air"},
+    {"id": "eye", "topic": "the eye"},
+]
+
+
+def pages_llm() -> MockLLM:
+    """Plan three pages and write them; the call for the page ``air`` times out."""
+
+    def respond(prompt: str) -> str:
+        if prompt.startswith("Plan"):
+            return json.dumps({"pages": PLANNED_PAGES})
+        if '"air"' in prompt:
+            raise TimeoutError("the model took too long")
+        return "Light scatters off air." if '"light"' in prompt else "Eyes see blue best."
+
+    return MockLLM(respond)
+
+
+@tool
+def total_words(count_words: list[int | None]) -> int:
+    """Add up the word counts of the pages that were written."""
+    return sum(count for count in count_words if count is not None)
+
+
+def test_for_each_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None:
+    llm = pages_llm()
+
+    planner = Agent(
+        "planner",
+        prompt="Plan a short answer in three pages: {query}",
+        output="plan",
+        output_type="json",
+        schema={"pages": {"type": "list of object", "fields": {"id": {"type": "text"}, "topic": {"type": "text"}}}},
+    )
+    page_writer = Agent("page_writer", prompt="Write one page on: {page}", inputs=["page"], output="draft")
+    deck = MAS(
+        [planner, page_writer],
+        steps=[Step("count", uses="count_words"), Step("total", uses="total_words")],
+        edges=[("planner", "page_writer"), ("page_writer", "count"), ("count", "total")],
+        each={"page_writer": ForEach("page", "plan.pages", at_once=2, key="id"), "count": "page in plan.pages"},
+        tools=[count_words, total_words],
+        llm=llm,
+    )
+
+    trace = deck.run("Why is the sky blue?")
+    print([(record.agent, record.item_key) for record in trace.records])
+    # [('planner', None), ('page_writer', 'light'), ('count', 'light'), ('page_writer', 'air'), ...]
+    print(trace["total"][0].inputs)  # {'count_words': '[4, null, 4]'}: the page 'air' failed
+
+    assert capsys.readouterr().out.splitlines() == [
+        "[('planner', None), ('page_writer', 'light'), ('count', 'light'), ('page_writer', 'air'), "
+        "('page_writer', 'eye'), ('count', 'eye'), ('total', None)]",
+        "{'count_words': '[4, null, 4]'}",
+    ]
+    assert trace.status == "ok" and trace.error is None and trace.output == "8"
+    assert trace["page_writer"][1].error_kind is ErrorKind.TIMEOUT and trace["page_writer"][1].item == 1
+    assert deck.describe()["groups"] == [
+        {
+            "name": "page_writer",
+            "for each": "page in plan.pages",
+            "nodes": ["page_writer", "count"],
+            "at once": 2,
+            "key": "id",
+        }
+    ]
+    assert trace.health is not None
+
+    print(trace.health.items["page_writer"]["failed"])  # 1, of 3 items
+    print([flag.signal for flag in trace.health.flags])  # ['item_failed']
+
+    assert capsys.readouterr().out.splitlines() == ["1", "['item_failed']"]
+    assert trace.health.items["page_writer"]["items"] == 3
+
+
+def test_for_each_claims_without_a_block() -> None:
+    page_writer = Agent("page_writer", prompt="Write one page on: {page}", inputs=["page"], output="draft")
+    llm = pages_llm()
+
+    def chain(form: ForEach, **kwargs: Any) -> MAS:
+        return MAS(
+            [page_writer],
+            steps=[Step("count", uses="count_words")],
+            edges=[("page_writer", "count")],
+            each={"page_writer": form, "count": "page in plan.pages"},
+            inputs={"plan": "json"},
+            outputs={"count_words": "list of json"},
+            tools=[count_words],
+            llm=llm,
+            **kwargs,
+        )
+
+    # an item over its budget is flagged, never stopped
+    costly = MAS(
+        [page_writer],
+        each={"page_writer": ForEach("page", "plan.pages", item_budget={"cost_usd": 0.005})},
+        inputs={"plan": "json"},
+        outputs={"draft": "list of text"},
+        llm=MockLLM(lambda prompt: "A page.", meta=True),
+    )
+    over = costly.run_state({"plan": {"pages": [{"id": "light"}]}})
+    assert over.error is None and over.health is not None
+    assert [flag.signal for flag in over.health.flags] == ["item_over_budget"]
+
+    # the spec form: each node carries the short form, the first may write the long one
+    spec = chain(ForEach("page", "plan.pages", key="id")).to_dict()
+    assert spec["agents"][0]["for each"] == {"item": "page", "in": "plan.pages", "key": "id"}
+    assert spec["steps"][0]["for each"] == "page in plan.pages"
+    assert ForEach.parse("page in plan.pages") == ForEach("page", "plan.pages")
+
+    # a budget stop ends the whole run
+    stopped = chain(ForEach("page", "plan.pages"), budget=Budget(max_calls=1))
+    assert stopped.run_state({"plan": {"pages": PLANNED_PAGES}}).status == "over_budget"
+
+    # chains do not nest
+    inner = chain(ForEach("page", "plan.pages"))
+    with pytest.raises(ValueError, match="chains do not nest"):
+        MAS(
+            [],
+            boxes=[Box("pages", inner, reads={"plan": "plan"}, writes={"draft": "drafts"})],
+            each={"pages": "deck in decks"},
+            inputs={"decks": "json"},
+        )
+
+
+# ----------------------------------------------- Several values in, several out
+
+
+def test_run_state_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None:
+    llm = pages_llm()
+    page_writer = Agent("page_writer", prompt="Write one page on: {page}", inputs=["page"], output="draft")
+
+    pages = MAS(
+        [page_writer],
+        steps=[Step("count", uses="count_words"), Step("total", uses="total_words")],
+        edges=[("page_writer", "count"), ("count", "total")],
+        each={"page_writer": ForEach("page", "plan.pages", key="id"), "count": "page in plan.pages"},
+        inputs={"plan": "json"},
+        outputs={"total_words": "json", "count_words": "list of json"},
+        tools=[count_words, total_words],
+        llm=llm,
+    )
+
+    heard: list[Event] = []
+    trace = pages.run_state({"plan": {"pages": [{"id": "light"}, {"id": "eye"}]}}, on_event=heard.append)
+    print(trace.outputs)  # {'total_words': 8, 'count_words': [4, 4]}
+    print(trace.output)  # 8: the first output, which a task scores
+    print(sorted({event.kind for event in heard}))  # ['end', 'item_end', 'item_start', 'start']
+
+    assert capsys.readouterr().out.splitlines() == [
+        "{'total_words': 8, 'count_words': [4, 4]}",
+        "8",
+        "['end', 'item_end', 'item_start', 'start']",
+    ]
+    assert {(event.node, event.item_key, event.status) for event in heard if event.kind == "item_end"} == {
+        ("page_writer", "light", "ok"),
+        ("page_writer", "eye", "ok"),
+    }
+    assert trace.run_id is not None and trace.graph_id == pages.describe()["id"]
+    with pytest.raises(ValueError) as caught:
+        pages.run_state({"plan": {1, 2}, "style": "short"})
+    assert len(str(caught.value).splitlines()) == 3 and len(llm.calls) == 2  # two problems, no call
+    with pytest.raises(ValueError, match="run_state"):
+        pages.run(QUERY)
+
+
+def test_run_state_claims_without_a_block() -> None:
+    # several branches end the run once all of them have
+    both = MAS(
+        [Agent("short", "Short: {query}", "brief"), Agent("long", "Long: {query}", "full")],
+        outputs={"brief": "text", "full": "text"},
+        llm=MockLLM(lambda prompt: prompt.split(":")[0]),
+    )
+    assert both.run_state({"query": QUERY}).outputs == {"brief": "Short", "full": "Long"}
+
+    # a retry: one record counts the retries
+    calls: list[str] = []
+
+    @tool
+    def flaky(draft: str) -> int:
+        """Count the words, after one outage."""
+        calls.append(draft)
+        if len(calls) == 1:
+            raise ConnectionError("down")
+        return len(draft.split())
+
+    writer = Agent("writer", prompt="Write a short answer to: {query}", output="draft")
+    retried = MAS(
+        [writer],
+        steps=[Step("count", uses="flaky")],
+        edges=[("writer", "count")],
+        tools=[flaky],
+        llm=scripted(),
+        retry={"count": {"outage": 1}},
+    ).run(QUERY)
+    assert [record.retries for record in retried["count"]] == [1]
+
+    # the reserved reads, and a read map
+    looking = Agent("looking", prompt="Spent so far: {run}", inputs=["run"], output="note")
+    spent = MAS([writer, looking], edges=[("writer", "looking")], llm=scripted(), version=2).run(QUERY)
+    assert set(json.loads(spent["looking"][0].rendered_prompt.removeprefix("Spent so far: "))) == {
+        "cost_usd",
+        "elapsed_s",
+        "calls",
+        "records",
+    }
+    slide = Agent("slide", prompt="Write a slide on {slide}", inputs={"slide": "page"}, output="draft")
+    assert slide.reads == {"slide": "page"} and slide.inputs == ["page"]
 
 
 # ---------------------------------------------------------------- Save and share
@@ -848,7 +1078,8 @@ def test_nothing_the_readme_calls_planned_exists_yet() -> None:
         assert not hasattr(MAS, name), name
     scripts = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"].get("scripts", {})
     assert "xmas" not in scripts
-    assert not {"for each", "first of", "for_each", "first_of"} & {kind.value for kind in EdgeKind}
+    assert not {"first of", "first_of"} & {kind.value for kind in EdgeKind}
+    assert not hasattr(xmas, "FirstOf")
     with pytest.raises(ValueError, match="image"):
         MAS([Agent("painter", prompt="Draw {query}", output="picture", output_type="image")], llm=scripted())
     assert "langgraph" not in " ".join(inspect.signature(MAS).parameters).lower()
@@ -870,6 +1101,6 @@ def test_every_component_the_readme_lists_exists() -> None:
 
     components = README.split("## 🏗 Components", 1)[1].split("\n## ", 1)[0]
     names = [line.split("`")[1] for line in components.splitlines() if line.startswith("- **`")]
-    assert len(names) == 11
+    assert len(names) == 13
     for name in names:
         assert hasattr(xmas, name) or hasattr(xmas.optimization, name), name
