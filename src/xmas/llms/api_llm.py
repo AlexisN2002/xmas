@@ -25,7 +25,7 @@ from xmas.budget import SLICE_S, CancelFlag, cancel_flag
 from xmas.errors import MONEY_WORDS, EmptyResponse, ErrorKind, XmasError
 from xmas.llms.call_log import CallLog, CallRecord
 from xmas.llms.meta import CallMeta, TokenPrice, cut_meta, meta_from_completion
-from xmas.llms.parts import Part, has_media, record_text, to_content
+from xmas.llms.parts import Part, prompt_messages, record_text
 from xmas.llms.scoring import ScoredSequence
 from xmas.media import Capabilities
 from xmas.tools import Tool, ToolCallRequest, _turn_usage
@@ -212,7 +212,7 @@ class APILLM(promptolution.APILLM):
 
     async def _ainvoke_once(self, prompt: str, system_prompt: str) -> ChatCompletion:
         """Make promptolution's request, noting the provider's completion id for the caller."""
-        completion = await self._once(self._request(_messages(prompt, system_prompt)))
+        completion = await self._once(self._request(prompt_messages(prompt, system_prompt)))
         slot = _completion_id.get()
         if slot is not None:
             slot[0] = completion.id
@@ -423,7 +423,7 @@ class APILLM(promptolution.APILLM):
         self, prompt: str | Sequence[Part], system_prompt: str, **extra: Any
     ) -> tuple[ChatCompletion, str, CallMeta]:
         """Send one generation with ``extra`` request keys, record it, and move the token counters by its text."""
-        request = self._request(_messages(prompt, system_prompt), **extra)
+        request = self._request(prompt_messages(prompt, system_prompt), **extra)
         shown = prompt if isinstance(prompt, str) else record_text(prompt)
         counted = prompt if isinstance(prompt, str) else "".join(part for part in prompt if isinstance(part, str))
         logged = {"params": self.call_params()}
@@ -667,12 +667,6 @@ def assemble(chunks: Sequence[ChatCompletionChunk]) -> ChatCompletion:
         message["images"] = images
     body["choices"] = [{"index": 0, "finish_reason": finish, "message": message}] if chose else []
     return ChatCompletion.construct(**body)
-
-
-def _messages(prompt: str | Sequence[Part], system_prompt: str) -> list[dict[str, Any]]:
-    """Return a request's messages: the system prompt, then the prompt as text, or as content parts with media."""
-    content = prompt if isinstance(prompt, str) else to_content(prompt) if has_media(prompt) else record_text(prompt)
-    return [{"role": "system", "content": str(system_prompt)}, {"role": "user", "content": content}]
 
 
 def _image_urls(message: ChatCompletionMessage) -> list[str]:

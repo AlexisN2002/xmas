@@ -150,6 +150,12 @@ def _encoded(ref: Ref) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def prompt_messages(prompt: str | Sequence[Part], system_prompt: str) -> list[dict[str, Any]]:
+    """Return a request's messages: the system prompt, then the prompt as text, or as content with media in it."""
+    content = prompt if isinstance(prompt, str) else to_content(prompt) if has_media(prompt) else record_text(prompt)
+    return [{"role": "system", "content": str(system_prompt)}, {"role": "user", "content": content}]
+
+
 def content_text(content: str | Sequence[Mapping[str, Any]]) -> str:
     """Return a message content's text: itself for a string, else its text parts joined."""
     if isinstance(content, str):
