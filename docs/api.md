@@ -516,13 +516,37 @@ called for each open question of a run that is stopped, paused or running. `run`
 default, else the run fails with `Unanswered: human node 'x' got no answer in an
 unattended run`, from a chain item or a box too. `ReplayAsker(traces)` answers from recorded human records.
 
-The **run store** (`MAS(..., store=RunStore(path))`, a path, or `XMAS_RUNS`;
-in memory by default) is a LangGraph checkpoint saver on one SQLite file, its
+The **run store** is a LangGraph checkpoint saver on one SQLite file, its
 tables laid out as `langgraph-checkpoint-sqlite` lays them out, plus a row per
 run (status, open questions, meter totals) and per question (payload, deadline,
-answer). `RunStore.due()` lists runs with a question past its deadline for a
-host's timer, and `prune_runs(days)` and `delete(run_id)` clean up. Only the
-classes in `XMAS_TYPES` are read back from a checkpoint.
+answer). By default it is `${XDG_DATA_HOME:-~/.local/share}/xmas/runs.sqlite`
+(`runs_path()`), made on first use; `XMAS_RUNS`, `[store] runs` in the
+configuration file, a path or `MAS(..., store=RunStore(path))` put it elsewhere,
+and `:memory:` keeps it in memory, which logs nothing. `RunStore.due()` lists
+runs with a question past its deadline for a host's timer, and
+`prune_runs(days)` and `delete(run_id)` clean up. Only the classes in
+`XMAS_TYPES` are read back from a checkpoint.
+
+The store is also the **run log**. Every `run`, `run_batch`, `run_state`,
+`resume` and `predict`, version 1 included, writes through it as it goes
+(`RunLog`, on the run's meter): its row in `xmas_runs` when it starts (`begin`:
+run id, `describe()` id, `running`, start time) and when it ends or pauses
+(status, totals, end time, query, output, error, the records' order); one row
+in `xmas_records` the moment each record is kept (position, node, kind, item,
+visit, model, cost, latency, tokens, finish reason, error, route, inputs and
+outputs as JSON, the raw answer, the rendered prompt, and the record itself;
+`boxed` marks a box's inner record); one in `xmas_events` per event; one in
+`xmas_calls` per model call (call id, node, start time, model, served model,
+tokens, cost, latency, finish reason, error kind, and the call's parameters
+without any key, token, password or header). Rows are only added, one insert
+each, so a run whose process dies keeps what it wrote; a write that fails warns
+once and the run goes on. `RunStore.trace(run_id)` rebuilds the trace (its
+health summarized again, with default settings), `RunStore.runs(status=None,
+system_id=None, limit=None)` lists runs, and `events(run_id)` and
+`calls(run_id)` read the rest. A run id given to `run_state` names one run in
+the file. From the shell, `xmas runs [--json] [--status s] [--system id]
+[--limit n]` lists runs, and `xmas trace <run id> [--json]` shows one run's
+records as a table, or its whole trace.
 
 **`MAS.stop(run_id, reason="stopped")`** stops a running run in this process
 (`RUNNING` holds each run's meter by id): no call, step or item starts after
@@ -567,6 +591,7 @@ further; the race fails with the last failure when every contestant failed.
     options:
       members:
         - Store
+        - RunLog
         - RunRow
         - QuestionRow
         - open_store
@@ -659,6 +684,7 @@ one node case per node from a trace into `examples/<file>.yaml`.
         - Config
         - ToolServer
         - config_path
+        - runs_path
         - Catalogue
         - read_catalogue
         - closest
