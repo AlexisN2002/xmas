@@ -34,16 +34,7 @@ class Attributor(Protocol):
         traces: list[Trace],
         rewards: list[float],
     ) -> dict[str, list[float]]:
-        """Assign credit per component per rollout.
-
-        Args:
-            traces: One trace per rollout.
-            rewards: The system-level score of each rollout, aligned to ``traces``.
-
-        Returns:
-            Credit per rollout, keyed by component name. Every value has the same
-            length as ``rewards``.
-        """
+        """Return credit per rollout, keyed by component name, for one score per trace; each list as long."""
         ...
 
 
@@ -51,24 +42,13 @@ class UniformAttributor:
     """Gives every agent that ran the system's whole score.
 
     The null hypothesis of credit assignment, and the baseline any real
-    attributor has to beat. Ported from the seed's identity attributer. An agent
-    that did not run in a rollout gets ``nan`` for it rather than zero,
-    because it earned neither credit nor blame.
+    attributor has to beat. An agent that did not run in a rollout gets
+    ``nan`` for it rather than zero, because it earned neither credit nor blame.
     """
 
     def attribute(self, traces: list[Trace], rewards: list[float]) -> dict[str, list[float]]:
-        """Assign each rollout's reward to every agent that ran in it.
-
-        Args:
-            traces: One trace per rollout.
-            rewards: The system-level score of each rollout.
-
-        Returns:
-            Credit per rollout, keyed by agent name.
-        """
-        if len(traces) != len(rewards):
-            raise ValueError(f"Got {len(traces)} traces and {len(rewards)} rewards; they must be parallel.")
-        names = agents_in(traces)
+        """Assign each rollout's reward to every agent that ran in it."""
+        names = agents_in(traces, rewards)
         return {
             name: [reward if name in trace.agents else math.nan for trace, reward in zip(traces, rewards, strict=True)]
             for name in names
@@ -180,8 +160,8 @@ Then return JSON inside <attribution>...</attribution>.
             max_chars_per_field: Per-value truncation, so one runaway agent output
                 cannot crowd the rest of the comparison out of the context.
             seed: Seed for the shuffle. Drawn from once per judging call and
-                carried forward, as the seed implementation does, so a whole run
-                reproduces from a freshly constructed attributor.
+                carried forward, so a whole run reproduces from a freshly
+                constructed attributor.
 
         Raises:
             ValueError: If ``group_size`` is below two.
@@ -195,24 +175,14 @@ Then return JSON inside <attribution>...</attribution>.
         self.failures = 0
 
     def attribute(self, traces: list[Trace], rewards: list[float]) -> dict[str, list[float]]:
-        """Compare executions of each query and assign per-agent credit.
-
-        Args:
-            traces: One trace per rollout.
-            rewards: The system-level score of each rollout.
-
-        Returns:
-            Credit per rollout, keyed by agent name, with ``nan`` wherever
-            the judge's answer could not be read.
+        """Compare executions of each query and assign per-agent credit, ``nan`` where the judge could not be read.
 
         Raises:
             ValueError: If the inputs are not parallel.
             RuntimeError: If no judgement at all could be parsed, which means the
                 meta-model or the prompt is broken rather than the run being noisy.
         """
-        if len(traces) != len(rewards):
-            raise ValueError(f"Got {len(traces)} traces and {len(rewards)} rewards; they must be parallel.")
-        names = agents_in(traces)
+        names = agents_in(traces, rewards)
         # nan, not zero: zero is a verdict, nan is an absence every consumer filters out
         credit: dict[str, list[float]] = {name: [math.nan] * len(traces) for name in names}
         if not names:
@@ -250,20 +220,11 @@ Then return JSON inside <attribution>...</attribution>.
         return credit
 
     def rollout(self, trace: Trace, reward: float) -> dict[str, Any]:
-        """Render one execution as the data the judge sees.
+        """Render one execution as the JSON-safe entry of the ``executions`` list the judge sees.
 
-        This is the seam the seed calls its attribution *context*. Overriding it
-        is how a method changes what the judge reasons over without touching the
-        grouping, the prompting or the parsing: the seed's env-ledger and
-        tool-call-protocol contexts are both this method, written differently.
-        The default is the text context, which is every agent's output.
-
-        Args:
-            trace: The rollout.
-            reward: Its system-level score.
-
-        Returns:
-            A JSON-safe mapping for one entry of the ``executions`` list.
+        Overriding it is how a method changes what the judge reasons over
+        without touching the grouping, the prompting or the parsing. The
+        default is every agent's output.
         """
         outputs: dict[str, dict[str, str]] = {}
         for record in trace.records:
@@ -276,16 +237,14 @@ Then return JSON inside <attribution>...</attribution>.
         return entry
 
 
-def agents_in(traces: list[Trace]) -> list[str]:
-    """Return every agent that ran in any of the traces, in a stable order.
+def agents_in(traces: list[Trace], rewards: list[float]) -> list[str]:
+    """Return every agent that ran in any of the traces, sorted, since rollouts of a branching topology differ in order.
 
-    Args:
-        traces: The rollouts.
-
-    Returns:
-        Agent names, sorted. Sorted rather than in execution order because
-        different rollouts may order them differently once a topology branches.
+    Raises:
+        ValueError: If there is not one reward per trace.
     """
+    if len(traces) != len(rewards):
+        raise ValueError(f"Got {len(traces)} traces and {len(rewards)} rewards; they must be parallel.")
     return sorted({record.agent for trace in traces for record in trace.records})
 
 
@@ -299,8 +258,8 @@ def truncate(value: str, limit: int) -> str:
 def groups(traces: list[Trace], size: int, rng: np.random.RandomState) -> list[list[int]]:
     """Split rollout indices into comparable groups: same query, chunked, shuffled.
 
-    Chunk before shuffling, and shuffle only within the chunk, which is the
-    seed's order and is what the parity fixture pins. A chunk of one is
+    Chunk before shuffling, and shuffle only within the chunk, the order the
+    parity fixture pins. A chunk of one is
     dropped rather than sent: one execution offers nothing to contrast, and a
     judgement made without contrast is not the method.
     """
@@ -321,9 +280,8 @@ def groups(traces: list[Trace], size: int, rng: np.random.RandomState) -> list[l
 
 def prompt(template: str, payload: dict[str, Any], group: Sequence[Trace], names: list[str]) -> str:
     """Render the judging prompt for one group of executions, ``group`` in payload order."""
-    # The judge is told which key holds the answer. The seed hardcoded
-    # "prediction"; here it is whatever the last agent to write wrote, in a
-    # rollout that finished: a failed one keeps only the agents before the failure.
+    # The judge is told which key holds the answer: whatever the last agent to write wrote, in a
+    # rollout that finished; a failed one keeps only the agents before the failure.
     records = next((trace.records for trace in group if not trace.failed), ())
     output_variable = next(iter(records[-1].outputs), "prediction") if records else "prediction"
     return (
