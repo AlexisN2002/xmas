@@ -37,6 +37,9 @@ dependencies = [
   "pandas>=2.2.2",
 ]
 
+[project.scripts]
+xmas = "xmas.cli:main"
+
 [project.urls]
 Repository = "https://github.com/gepromptet/xmas"
 Documentation = "https://github.com/gepromptet/xmas/tree/main/docs"

@@ -8,8 +8,11 @@ one is missing.
 from __future__ import annotations
 
 import copy
+import json
 import re
+import shutil
 import stat
+import tomllib
 import warnings
 import zipfile
 from pathlib import Path
@@ -20,9 +23,11 @@ import pytest
 import yaml
 from promptolution.llms.base_llm import BaseLLM
 
+import xmas.mas
 from xmas import MAS, Agent
 from xmas import bundle as mas_bundle
 from xmas.bundle import LOCK, Lock, compare, dump_prompt, lock_of, parse_prompt, read
+from xmas.cli import main
 from xmas.config import Config, ModelEntry, ModelNameWarning, ToolServer, Unconfigured, read_catalogue
 from xmas.llms.api_llm import APILLM
 from xmas.llms.meta import TokenPrice
@@ -805,3 +810,87 @@ def test_models_entries_and_the_overlay(tmp_path: Path, clean_env: pytest.Monkey
         offline.get_response("x")
     trace = unconfigured.run_state({"plan": PLAN, "house": "plain"})
     assert trace.failed and "has no endpoint" in str(trace.error)
+
+
+def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    clean_env.chdir(tmp_path)
+    clean_env.setenv("XMAS_API_KEY", "sk-secret")
+    seen: list[str] = []
+
+    def out(code: int, *args: str) -> str:
+        assert main(list(args)) == code, args
+        captured = capsys.readouterr()
+        seen.append(captured.out + captured.err)
+        return captured.out + captured.err
+
+    hello = tmp_path / "hello.mas"
+    assert "wrote" in out(0, "init", str(hello))
+    assert sorted(read(hello)) == ["examples/warmup.yaml", "optimize.yaml", "prompts/assistant.md", LOCK, "xmas.yaml"]
+    assert "exists" in out(2, "init", str(hello))
+    assert "names at least one agent" in out(2, "init", str(tmp_path / "none.mas"), "--agents", ",")
+    assert "no bundle at" in out(2, "check", str(tmp_path / "none.mas"))
+    assert out(0, "check", str(hello)) == "ok: 1 node, 0 edges, 0 chains\n"
+    pair = tmp_path / "pair.mas"
+    out(0, "init", str(pair), "--agents", "writer,editor", "--model", "small-model")
+    assert "editor  agent  small-model  query text, writer_draft text -> answer text" in out(0, "show", str(pair))
+
+    path = deck().save(tmp_path / "deck.mas")
+    assert out(0, "check", str(path)) == "ok: 7 nodes, 6 edges, 2 chains\n"
+    shown = out(0, "show", str(path))
+    assert "  checker -> drafter  while not verdict.fits (max 2)" in shown
+    assert "  render          step   render_page  draft text -> measure json  for each page in plan.slides" in shown
+    assert json.loads(out(0, "show", "--json", str(path))) == deck().describe()
+    (path / "examples").mkdir()
+    (path / "examples" / "warmup.yaml").write_text("version: 1\nexamples: [{name: a, nodes: x}]\n", "utf-8")
+    assert "unknown: nodes" in out(1, "check", str(path))
+    (path / "examples" / "warmup.yaml").unlink()
+
+    other = tmp_path / "other.mas"
+    shutil.copytree(path, other)
+    (other / "prompts" / "noter.md").write_text("Notes, by hand: {plan}\n", encoding="utf-8")
+    changed = out(1, "diff", str(path), str(other))
+    assert "-Write" in changed and "+Notes, by hand: {plan}" in changed
+    assert out(0, "diff", str(path), str(path)) == "same files\n"
+    assert out(1, "diff", str(other)) == "changed: prompts/noter.md\n"
+    assert json.loads(out(1, "diff", "--json", str(other))) == {
+        "changed": ["prompts/noter.md"],
+        "added": [],
+        "missing": [],
+    }
+    assert out(0, "diff", str(path)) == "unchanged since saved (xmas.lock)\n"
+    assert json.loads(out(1, "diff", "--json", str(path), str(hello)))["removed"][0] == "callables.yaml"
+    assert "no bundle at" in out(2, "diff", str(tmp_path / "none.mas"))
+    (pair / LOCK).unlink()
+    assert "has no xmas.lock; give a second bundle" in out(1, "diff", str(pair))
+
+    assert "no endpoint: set XMAS_BASE_URL" in out(1, "run", str(hello), "--query", "Why?")
+    clean_env.setenv("XMAS_BASE_URL", "http://127.0.0.1:9/v1")
+    clean_env.setenv("XMAS_MODELS", "text-model,writer-model,judge-model")
+    scripted = {**deck_llms(), "text-model": MockLLM(lambda p: "Rayleigh.", meta=True)}
+    clean_env.setattr(xmas.mas, "build_llms", lambda names, models, config: scripted)
+    answered = out(0, "run", str(hello), "--query", "Why?", "--budget", "1")
+    assert re.fullmatch(r"Rayleigh\.\nok: 1 model calls, 0\.0100 USD, \d+\.\d s\n", answered)
+    ran = out(0, "run", str(path), "--input", f"plan={json.dumps(PLAN)}", "--input", "house=plain")
+    assert json.loads(ran.split("\nok: ")[0])["notes"] == "Notes."
+    assert "--input takes NAME=VALUE" in out(2, "run", str(path), "--input", "nope=1")
+    assert "a json input is JSON" in out(2, "run", str(path), "--input", "plan={", "--input", "house=plain")
+    clean_env.setattr(xmas.mas, "build_llms", lambda names, models, config: {"text-model": MockLLM(answers=[])})
+    assert "IndexError" in out(1, "run", str(hello), "--query", "Why?").splitlines()[-1]
+    clean_env.setenv("XMAS_MODELS", "writer-model")
+    refused = out(1, "run", str(hello), "--query", "Why?")
+    assert "warning: model 'text-model' (agent assistant)" in refused and "Model names not in the catalogue" in refused
+
+    clean_env.delenv("XMAS_BASE_URL")
+    clean_env.delenv("XMAS_MODELS")
+    clean_env.setattr(xmas.mas, "build_llms", lambda names, models, config: scripted)
+    assert out(0, "verify", str(hello)).splitlines()[-1] == "ok: level 1"
+    assert (
+        out(0, "verify", str(hello), "--level", "2", "--strict").splitlines()[-1] == "ok: 1 example passed, 0.0100 USD"
+    )
+    assert json.loads(out(0, "verify", "--json", str(hello), "--level", "0"))["ok"] is True
+    (hello / "prompts" / "assistant.md").write_text("Answer briefly: {query}\n", encoding="utf-8")
+    assert "level 0: changed: prompts/assistant.md" in out(0, "verify", str(hello), "--level", "0")
+    assert out(1, "verify", str(hello), "--level", "0", "--strict").splitlines()[-1] == "not ok: level 0 differs"
+    assert not any("sk-secret" in text for text in seen)
+    scripts = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert scripts["scripts"] == {"xmas": "xmas.cli:main"}
