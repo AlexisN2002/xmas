@@ -45,6 +45,8 @@ The record a run leaves behind, and the input an attributor computes on.
 
 ::: xmas.trace.TokenUsage
 
+::: xmas.trace.Event
+
 ## Budgets and errors
 
 `MAS(..., budget=Budget(...))` limits every run, and every item of a batch, on
@@ -144,12 +146,14 @@ version 2 system can do:
   also be an agent's tool. A step reads its parameters and writes one value
   named like the callable; `Step(reads={param: value}, writes={write: value})`
   renames them, and `tool(writes={"counts": "json"})` declares other writes.
-- **Typed values.** Every value is `text` or `json` (`TEXT`, `JSON`); a
+- **Typed values.** Every value is `text` or `json` (`TEXT`, `JSON`), or a
+  list of them at any depth (`list of text`, `list of list of json`); a
   callable's `string` parameters read text, the others json, and its write is
   text when the function returns `str` (or the tool is remote), else json. A
-  json value reaches a prompt as one line of JSON. Images, files and lists of
-  them are type words the format knows, but only text and json run: the check
-  refuses the others.
+  json value or a list reaches a prompt as one line of JSON, and a list may be
+  read where json is declared (`fits`). `check_value` checks every item of a
+  list; an item may be `null`. Images, audio, documents, tables and files are
+  type words the format knows, but the check refuses them.
 - **Answer forms.** `Agent(..., output_type="json", schema={...})` makes the
   agent answer in JSON. Its prompt ends with format lines no optimizer can
   drop; an answer that does not fit gets exactly one retry, then the run fails
@@ -169,17 +173,21 @@ The answer-form dialect, one entry per field:
 `int`, `number`, `json`, `object` or `list of <type>`, and `fields` describes
 an object or a list's objects.
 
-A version 2 spec (`version: 2`) has the keys `inputs`, `agents` (`reads`,
-`writes: {name: type}`, `schema`, `tools`, `model`), `steps`, `boxes`, `edges`
-(a string is a chain, `a -> b -> c`), `state`, `frozen`, `health`, `callables`
-(what each callable reads and writes), `default_model` and `prompts` (one per
-agent). Models
+A version 2 spec (`version: 2`) has the keys `inputs`, `outputs`, `agents`
+(`model`, `prompt`, `for each`, `reads`, `writes: {name: type}`, `tools`,
+`schema`, `retry`), `steps` (`uses`, `for each`, `reads`, `writes`, `retry`),
+`boxes` (`for each`, `reads`, `writes`, `system`), `edges` (a string is a
+chain of edges, `a -> b -> c`), `state`, `frozen`, `health`, `callables` (what
+each callable reads and writes), `default_model` and `prompts`. An agent's
+`reads` is a list of values or a map `{placeholder: value}`; its `prompt` names
+an entry of `prompts` that several agents may share, by default its own name.
+Models
 appear by name only and keys never appear: endpoints and keys come from
 configuration, never from the spec.
 
 Refused, with a message saying so: `to_yaml` on a version 2 system (its file
 format is the `.mas` bundle; `to_dict()` gives its spec), and `run(query)` on a
-system whose inputs are not exactly `{query: text}`.
+system whose inputs are not exactly `{query: text}` (`run_state(values)` runs it).
 
 ::: xmas.nodes.Step
 
@@ -197,6 +205,9 @@ system whose inputs are not exactly `{query: text}`.
         - JSON
         - parse_type
         - LIST_PREFIX
+        - check_value
+        - fits
+        - render_value
 
 ::: xmas.schemas
     options:
@@ -211,6 +222,8 @@ system whose inputs are not exactly `{query: text}`.
       members:
         - check_system
         - SystemInfo
+        - RESERVED_READS
+        - RETRYABLE
 
 ::: xmas.routes
     options:
@@ -228,7 +241,9 @@ taken); a one-key mapping gives the operator:
   `switch` edge of the same node is.
 - **`while`.** `judge -> writer: {when: not verdict.fits, max_visits: 3}` loops
   back until its target ran `max_visits` times; then the record is `capped` and
-  the `else` edge is taken, even when a later `when` edge holds.
+  the `else` edge is taken, even when a later `when` edge holds. The count
+  includes the run before the loop, so `max_visits: 2` is one redraw, and a
+  cap of 1 on `check -> redraw` runs `redraw` once.
 - **`switch`.** `judge -> shorten: {switch: verdict.action}` is taken when the
   path equals the case (the target's name unless `case:` says otherwise); a
   value outside the cases takes `else`.
@@ -251,12 +266,14 @@ holds the inner trace (`Trace.walk()` yields every record with its box path).
 `frozen: [judge]` (`MAS(frozen=...)`) keeps a node as it is through every
 optimizer: no prompt, model, read, write or edge of it changes, none removes it.
 The topology search also leaves conditional edges and their endpoints alone,
-keeps steps and boxes, and drops a candidate the check refuses.
+holds every member of a `for each` chain, keeps steps and boxes, and drops a
+candidate the check refuses.
 
 Every run gets **health** signals in `Trace.health`, for information only:
-`retried`, `bad_format`, `error_routed`, `empty`, `stuck`, `unfilled`, `leak`,
-`long` and `short` per record, how often each `while` edge was taken, and each
-set budget limit's use. A spec tunes them with `health: {length_factor,
+`retried`, `bad_format`, `error_routed`, `item_failed`, `empty`, `stuck`,
+`unfilled`, `leak`, `long`, `short` and `item_over_budget` per record, how often
+each `while` edge was taken, each set budget limit's use, and per chain its
+items, failed items and each item's cost (`Health.items`). A spec tunes them with `health: {length_factor,
 min_samples, leak}`; a healthy run's trace dict has no `health` key.
 
 `MAS.describe()` returns plain data: every node with its kind, model name,
@@ -278,6 +295,64 @@ models only: endpoints and keys come from configuration.
         - HealthSettings
         - Flag
         - summarize
+
+## Version 2: for each, run_state, events
+
+A **`for each` chain** runs some nodes once per item of a list:
+`MAS(..., each={"writer": ForEach("page", "plan.slides", at_once=4, key="id"),
+"render": "page in plan.slides"})`, or `for each: page in plan.slides` on each
+node of a spec. Every member names the same item and list; the options
+`at_once` (items in flight), `key` (a scalar field that names an item in its
+records) and `item_budget` (`cost_usd`, `wall_s`: flagged as
+`item_over_budget`, never stopped) sit on the head, the node every edge from
+outside lands on. Inside, the item has the list's item type (json for a path
+with fields) and each write its declared type; outside, a write is a list in
+item order. Exits leave the chain by one plain or `else` edge to one target;
+a chain with no exit ends the run and needs declared outputs. Chains do not
+nest, also not through a box.
+
+Items run in parallel behind LangGraph's `Send`, each on a run of the chain's
+own system with the item's index and key on every record (`AgentRecord.item`,
+`item_key`, `visit`). An item that fails with any kind but `budget`, `stopped`
+or an unrouted `money` gets a failed record and `None` in every gathered list,
+and the run goes on; those three end the run. A `while` edge inside a chain
+loops per item, and its cap counts per item; a `while` edge into the head
+counts passes of the whole chain. `Budget(max_parallel_calls=n)` caps the model
+calls in flight across branches, boxes and items.
+
+**`MAS.run_state(values, on_event=None)`** runs a version 2 system on all of
+its inputs by name (a version 1 system on text values, `query` among them). A
+missing, extra or mistyped input raises one `ValueError` listing them all,
+before any call. `MAS(..., outputs={"deck": "json", "notes": "text"})` names
+the values the trace returns in `Trace.outputs` (`None` for one nothing wrote);
+`Trace.output` renders the first. With outputs, several terminals may end the
+run, joined at the end. The trace of a version 2 run carries `run_id` and
+`graph_id` (`describe()["id"]`). `on_event` receives an `Event` for each
+visit's `start` and `end` and each item's `item_start` and `item_end`, on the
+run's threads; a listener that raises is warned about once and dropped.
+
+`MAS(..., retry={"render": {"outage": 1}})` runs an agent or step again for a
+kind in `RETRYABLE`, on the same visit: one record, with `retries` and the cost
+of every attempt. Two reads are reserved and written by no node: `error`, the
+`{kind, message, node}` of the failure an `on error` edge routed to the reading
+node, and `run`, `{cost_usd, elapsed_s, calls, records}` at read time.
+`Agent(..., inputs={"slide": "page"})` fills a placeholder from a value of
+another name, and records key their inputs by placeholder.
+`MAS(..., prompt_names={"checker": "judge", "figure_checker": "judge"})` lets agents share one
+prompt; an optimizer's `copy(prompts=...)` changes it for all of them.
+
+`describe()` gains `for each`, `placeholders` and `retry` on nodes, and
+`outputs` and `groups` (one per chain) at the top, each only when set.
+
+::: xmas.chains
+    options:
+      members:
+        - ForEach
+        - Chain
+        - ChainShape
+        - find_chains
+        - collapse
+        - ITEM_BUDGET_KEYS
 
 ## Prompts
 
