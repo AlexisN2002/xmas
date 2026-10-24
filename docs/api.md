@@ -384,8 +384,9 @@ are refused ("return a Path or a Ref, Ref.from_bytes stores bytes"). A model's
 pictures and an MCP tool's image, audio and blob blocks go to the store too
 (`MCPTools(..., writes={"paint": {"png": "image"}})`). The store is
 `FileStore(XMAS_STORE)`, by default `~/.cache/xmas/store`, read on every
-call and never a spec key; it writes `<root>/<sha[:2]>/<sha><ext>` once,
-through a temporary file.
+call and never a spec key (a relative path is taken from the working
+directory); it writes `<root>/<sha[:2]>/<sha><ext>` once, through a
+temporary file, with the mode `open()` would give it.
 
 **Capabilities.** What a model takes and gives comes from the first of: the
 system's `models` entry for its binding name (`MAS(..., models={...})` or a
@@ -418,13 +419,17 @@ problems:
   'video'; a model may accept image, audio`.
 - `step 'draw' passes image 'png' to remote tool 'paint'; remote tools read no
   media`.
+- `Agent 'reader' uses tool 'document_text', which reads document 'source'; a
+  model passes no media to a tool, so run it as a step.` A model would make up
+  the ref, and the tool would read whatever file it names; this holds in
+  version 1 too.
 
 **Parts.** An agent that reads an image or audio renders its prompt with
 `render_parts`: the text as `safe_format` gives it, with each ref in its
 place. A list labels its items `[pages 0]`, `[pages 1]`, ... (0-based, as
-`item`), and a `None` item reads `(none)`. The record's `rendered_prompt`
-holds `marker` lines such as `[image slide-1.png, image/png, 182 KB]` in place
-of the refs, and its `inputs` the refs' JSON lines; a json agent's format lines
+`item`), a list of lists `[pages 1.0]`, and a `None` item reads `(none)`.
+The record's `rendered_prompt` holds `marker` lines such as
+`[image slide-1.png, image/png, 182 KB]` in place of the refs, and its `inputs` the refs' JSON lines; a json agent's format lines
 join the last text part. `to_content` makes the request content (a data URI or
 the URL of a remote image, `input_audio` for wav and mp3) and refuses a part
 over `MAX_PART_BYTES`. A tool agent sends the parts in its first message. An

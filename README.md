@@ -652,6 +652,8 @@ The rest of the rules:
   takes no tools.
 - An MCP tool may write a picture too: `MCPTools(..., writes={"paint": {"png": "image"}})`.
   A remote tool reads no media, so the check refuses a step that passes it one.
+- A tool an agent calls reads no media either: the model would make up the reference.
+  Run such a function as a step.
 
 ## 💾 Save and share
 
