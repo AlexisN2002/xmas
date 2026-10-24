@@ -339,7 +339,7 @@ def test_the_run_log_keeps_a_run_that_dies_midway() -> None:
     )
     with pytest.raises(KeyboardInterrupt):
         mas.run_state({"query": "cats"}, run_id="dies")
-    store = mas._runs()
+    store = mas.runs()
     died = store.trace("dies")
     assert [record.agent for record in died.records] == ["writer"] and died.records[0].outputs == {
         "draft": "echo:Write cats"

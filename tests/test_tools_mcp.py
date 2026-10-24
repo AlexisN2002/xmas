@@ -30,7 +30,7 @@ from xmas.errors import BadFormat, XmasError
 from xmas.media import Ref
 from xmas.nodes import Step
 from xmas.tools import index_tools, run_step
-from xmas.tools.mcp import MCPTools, _media_blocks, result_text
+from xmas.tools.mcp import MCPTools, media_blocks, result_text
 from xmas.values import JSON, TEXT, parse_type
 
 from .conftest import MockLLM, req
@@ -122,9 +122,11 @@ class Server:
             """A name OpenAI would refuse."""
             return ""
 
-        self.app = self._auth(mcp.streamable_http_app())
+        self.app = self.auth(mcp.streamable_http_app())
 
-    def _auth(self, app: ASGIApp) -> ASGIApp:
+    def auth(self, app: ASGIApp) -> ASGIApp:
+        """Wrap ``app`` so each request needs a known bearer key; some keys get a set error status."""
+
         async def guarded(scope: Scope, receive: Receive, send: Send) -> None:
             if scope["type"] != "http":
                 await app(scope, receive, send)
@@ -365,7 +367,7 @@ def test_result_mapping_for_foreign_servers() -> None:
         result_text(CallToolResult(content=[], is_error=True))
     bad = CallToolResult(content=[ImageContent(type="image", data="not base64!", mime_type="image/png")])
     with pytest.raises(XmasError, match="base64 is invalid"):
-        _media_blocks(bad)
+        media_blocks(bad)
     assert result_text(as_result({"other": 1}, is_error=False)) == '{"other": 1}'
 
 

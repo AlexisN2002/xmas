@@ -183,17 +183,19 @@ class SlowServer:
         self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}/v1"
         self.bodies: list[dict[str, Any]] = []
         self.gone: list[float] = []
-        threading.Thread(target=self._serve, daemon=True).start()
+        threading.Thread(target=self.serve, daemon=True).start()
 
-    def _serve(self) -> None:
+    def serve(self) -> None:
+        """Accept connections until the socket closes, each answered on its own thread."""
         while True:
             try:
                 conn, _ = self.sock.accept()
             except OSError:
                 return
-            threading.Thread(target=self._answer, args=(conn,), daemon=True).start()
+            threading.Thread(target=self.answer, args=(conn,), daemon=True).start()
 
-    def _answer(self, conn: socket.socket) -> None:
+    def answer(self, conn: socket.socket) -> None:
+        """Note one request, answer it slowly and note when the client goes away."""
         with conn:
             data = b""
             while b"\r\n\r\n" not in data:
@@ -484,7 +486,7 @@ def test_stop_a_paused_run() -> None:
         mas.run_state({"query": "q"}, run_id="turn-2")
     assert mas.stop("turn-2", "Tom pressed Stop") is True
     assert asker.withdrawn == [("turn-2/approve/1", "Tom pressed Stop")]
-    row = mas._runs().run("turn-2")
+    row = mas.runs().run("turn-2")
     assert row is not None and row.status == "stopped"
     approved = {"turn-2/approve/1": {"approved": True, "who": "tom"}}
     with pytest.raises(ValueError, match="is stopped, not paused"):
@@ -536,7 +538,7 @@ def test_a_stop_while_running_ends_the_run_even_at_a_pause() -> None:
     trace = mas.run_state({"query": "q"}, run_id="turn-3", on_event=events.append)
     assert (trace.status, trace.error) == ("stopped", "Stopped: Tom pressed Stop")
     assert asker.asked == [] and "pause" not in [event.kind for event in events]
-    row = mas._runs().run("turn-3")
+    row = mas.runs().run("turn-3")
     assert row is not None and (row.status, row.paused) == ("stopped", ())
     with pytest.raises(ValueError, match="is stopped, not paused"):
         mas.resume("turn-3", {"turn-3/approve/1": {"approved": True, "who": "tom"}})
@@ -559,7 +561,7 @@ def test_a_stop_while_running_ends_the_run_even_at_a_pause() -> None:
     assert (trace.status, trace.pause, asker.asked) == ("stopped", None, ["turn-5/approve/1"])
     assert asker.withdrawn == [("turn-5/approve/1", "Tom pressed Stop")]
     assert [record.agent for record in trace.records] == ["pre", "writer", "think"]
-    row = mas._runs().run("turn-5")
+    row = mas.runs().run("turn-5")
     assert row is not None and (row.status, row.paused) == ("stopped", ())
 
 
@@ -654,7 +656,7 @@ def test_the_first_of_a_race_writes() -> None:
     model = PollingLLM(lambda prompt: SECONDS[prompt.split()[0]])
     events: list[Event] = []
     mas = racing(model)
-    assert mas._checked().joins["polish"].kind == "join"  # the race is one group of the join
+    assert mas.checked().joins["polish"].kind == "join"  # the race is one group of the join
     started = time.monotonic()
     trace = mas.run_state({"query": "q"}, on_event=events.append)
     assert time.monotonic() - started < 1.0, "the wall is the fastest contestant's"
@@ -677,7 +679,7 @@ def test_the_first_of_a_race_writes() -> None:
         outputs={"final": "text"},
         llm=PollingLLM(lambda prompt: SECONDS[prompt.split()[0]]),
     )
-    assert merged._checked().joins["polish"].kind == "merge"
+    assert merged.checked().joins["polish"].kind == "merge"
     trace = merged.run_state({"query": "q"})
     assert trace.outputs == {"final": "done"} and [r.agent for r in trace.records].count("polish") == 1
 

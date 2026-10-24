@@ -23,7 +23,7 @@ from xmas.nodes import Step
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
 from xmas.optimization.topology import TopologyBudget
-from xmas.runtime import _initial_state, _run_config
+from xmas.runtime import initial_state, run_config
 from xmas.tools import tool
 
 from .conftest import (
@@ -410,7 +410,7 @@ def test_langgraph_signals_pass_the_wrapper() -> None:
     )
     meter = RunMeter(owner=mas)
     with pytest.raises(GraphBubbleUp):
-        mas.compiled.invoke(_initial_state({"pages": ["a", "b"]}, mas.prompts()), config=_run_config(mas, meter))
+        mas.compiled.invoke(initial_state({"pages": ["a", "b"]}, mas.prompts()), config=run_config(mas, meter))
     assert [(r.agent, r.error) for r in meter.records] == [("writer", None), ("writer", None)]  # no failed record
 
 
@@ -456,7 +456,7 @@ def slides(*, assemble: bool) -> tuple[MAS, SeeingLLM, SeeingLLM]:
 
 def test_the_judge_sees_each_slide(png: Path) -> None:  # the fixture keeps the store apart
     mas, eye, desk = slides(assemble=True)
-    assert str(mas._checked().types["png"]) == "list of image"
+    assert str(mas.checked().types["png"]) == "list of image"
     trace = mas.run_state(plan_of("intro", "method", "result"))
     assert trace.error is None
     assert trace.outputs["verdict"] == ["fits slide intro", "fits slide method", "fits slide result"]

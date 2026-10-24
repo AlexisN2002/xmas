@@ -25,10 +25,10 @@ from tests.conftest import (
     PNG,
     MockLLM,
     SeeingLLM,
-    _draft,
-    _judge,
     assemble_deck,
     deck,
+    draft,
+    judge,
     render_page,
     render_pages,
 )
@@ -307,7 +307,7 @@ def test_level_2_node_cases(tmp_path: Path) -> None:
         run_node(d, "render", {"page": "x"})
     stubborn = MAS.from_dict(
         yaml.safe_load(DECK),
-        llms={"writer-model": MockLLM(_draft, meta=True), "judge-model": MockLLM(lambda p: "no JSON", meta=True)},
+        llms={"writer-model": MockLLM(draft, meta=True), "judge-model": MockLLM(lambda p: "no JSON", meta=True)},
         tools=[render_page, assemble_deck],
     )
     failed = run_node(stubborn, "checker", CHECKER["inputs"])
@@ -368,7 +368,7 @@ def test_level_2_run_cases_and_budgets(tmp_path: Path) -> None:
 
     unpriced = MAS.from_dict(
         yaml.safe_load(DECK),
-        llms={"writer-model": MockLLM(_draft, meta=True), "judge-model": MockLLM(_judge)},
+        llms={"writer-model": MockLLM(draft, meta=True), "judge-model": MockLLM(judge)},
         tools=[render_page, assemble_deck],
     )
     report = check(unpriced, 2, examples=examples_file(tmp_path, CHECKER, RENDER))

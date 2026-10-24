@@ -62,16 +62,17 @@ class MockLLM(BaseLLM):
         """Script the answers and, optionally, the tool turns and the call metadata."""
         super().__init__()
         self.answers = list(answers or [])
-        self.responder = responder or (self._next_answer if answers is not None else lambda prompt: f"echo:{prompt}")
+        self.responder = responder or (self.next_answer if answers is not None else lambda prompt: f"echo:{prompt}")
         self.calls: list[str] = []
         self.turns = list(turns or [])
         self.default = default
         self.seen: list[tuple[list[dict[str, Any]], list[str]]] = []
         self.full_response = meta
         if turns is not None:
-            self.get_tool_response = self._tool_turn
+            self.get_tool_response = self.tool_turn
 
-    def _next_answer(self, prompt: str) -> str:
+    def next_answer(self, prompt: str) -> str:
+        """Return the next scripted answer, raising it when it is an exception."""
         answer = self.answers.pop(0)
         if isinstance(answer, Exception):
             raise answer
@@ -82,7 +83,7 @@ class MockLLM(BaseLLM):
         self.calls.extend(prompts)
         return [self.responder(prompt) for prompt in prompts]
 
-    def _tool_turn(self, messages: list[dict[str, Any]], tools: Sequence[Tool]) -> Turn:
+    def tool_turn(self, messages: list[dict[str, Any]], tools: Sequence[Tool]) -> Turn:
         """Record a snapshot of the history and the tools offered, and answer from the script."""
         self.seen.append((json.loads(json.dumps(messages)), [t.name for t in tools]))
         return self.turns.pop(0) if self.turns else self.default
@@ -371,7 +372,7 @@ def assemble_deck(draft: list[str], verdict: list[Any], caption: list[str]) -> d
     return {"pages": draft, "captions": caption, "fits": [item["fits"] for item in verdict]}
 
 
-def _draft(prompt: str) -> str:
+def draft(prompt: str) -> str:
     """The writer: a long first draft, a short one once a verdict came back; ``limits`` stays long."""
     if prompt.startswith("Draft slide"):
         if '"intro"' in prompt:
@@ -384,7 +385,7 @@ def _draft(prompt: str) -> str:
     return "Notes."
 
 
-def _judge(prompt: str) -> str:
+def judge(prompt: str) -> str:
     """The judge: a page fits unless its render overflows."""
     if '"overflow": true' in prompt:
         return '{"fits": false, "fix": "cut it"}'
@@ -393,7 +394,7 @@ def _judge(prompt: str) -> str:
 
 def deck_llms() -> dict[str, MockLLM]:
     """The deck's scripted models, by the names its agents bind; each call costs 0.01."""
-    return {"writer-model": MockLLM(_draft, meta=True), "judge-model": MockLLM(_judge, meta=True)}
+    return {"writer-model": MockLLM(draft, meta=True), "judge-model": MockLLM(judge, meta=True)}
 
 
 def deck() -> MAS:
@@ -439,7 +440,7 @@ class SeeingLLM(MockLLM):
             if isinstance(part, Ref):
                 part.read_bytes()
         if self.answers:
-            return self._next_answer(""), META
+            return self.next_answer(""), META
         return (self.answer if isinstance(self.answer, str) else self.answer(list(parts))), META
 
 

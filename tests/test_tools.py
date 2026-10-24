@@ -83,26 +83,26 @@ def test_decorated_function_stays_callable() -> None:
         Tool("remote", "r", {"type": "object"})()
 
 
-def _no_doc(a: int) -> int:
+def no_doc(a: int) -> int:
     return a
 
 
-def _no_hint(a):  # type: ignore[no-untyped-def]
+def no_hint(a):  # type: ignore[no-untyped-def]
     """Doc."""
     return a
 
 
-def _star_args(*a: int) -> int:
+def star_args(*a: int) -> int:
     """Doc."""
     return 0
 
 
-def _star_kwargs(**a: int) -> int:
+def star_kwargs(**a: int) -> int:
     """Doc."""
     return 0
 
 
-def _positional(a: int, /) -> int:
+def positional(a: int, /) -> int:
     """Doc."""
     return a
 
@@ -110,11 +110,11 @@ def _positional(a: int, /) -> int:
 @pytest.mark.parametrize(
     ("fn", "message"),
     [
-        (_no_doc, "docstring"),
-        (_no_hint, "no type hint"),
-        (_star_args, r"\*args"),
-        (_star_kwargs, r"\*\*kwargs"),
-        (_positional, "positional-only"),
+        (no_doc, "docstring"),
+        (no_hint, "no type hint"),
+        (star_args, r"\*args"),
+        (star_kwargs, r"\*\*kwargs"),
+        (positional, "positional-only"),
     ],
 )
 def test_tool_rejects_what_it_cannot_describe(fn: Any, message: str) -> None:

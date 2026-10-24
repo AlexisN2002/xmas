@@ -144,7 +144,7 @@ def test_approve_pauses_and_resumes(tmp_path: Path) -> None:
         ("Ship a draft", "Redraw"),
         {"draft": "a draft"},
     )
-    store = mas._runs()
+    store = mas.runs()
     row = cast("Any", store.run("r1"))
     assert (row.status, row.paused, row.totals["calls"]) == ("paused", ("r1/approve/1",), 1)
     with pytest.raises(ValueError, match="is taken"):
@@ -343,7 +343,7 @@ def test_resume_after_a_restart(tmp_path: Path) -> None:
     assert done.status == "ok" and done.outputs["shipped"] == "done"
     assert [r.agent for r in done.records] == ["writer", "approve", "ship"]
     assert done.cost_usd == pytest.approx(0.02)
-    assert cast("Any", fresh._runs().run("r9")).totals["calls"] == 2
+    assert cast("Any", fresh.runs().run("r9")).totals["calls"] == 2
 
     # The calls made before the pause count: one call left of a limit of one is none.
     subprocess.run([sys.executable, "-c", RESTART, str(tmp_path / "b.db")], cwd=ROOT, check=True, timeout=120)
@@ -355,8 +355,8 @@ def test_resume_after_a_restart(tmp_path: Path) -> None:
     later = gated()
     later.store = str(tmp_path / "later.db")  # a path set after construction opens there
     assert run(later, {"query": "q"}, "r10").status == "paused"
-    assert later._runs().path == tmp_path / "later.db"
-    later._runs().delete_thread("r10")
+    assert later.runs().path == tmp_path / "later.db"
+    later.runs().delete_thread("r10")
     with pytest.raises(ValueError, match="holds no checkpoint of run 'r10'"):
         resume(later, "r10", {"r10/approve/1": {"approved": True, **TOM}})
     assert "r10" not in RUNNING
@@ -364,7 +364,7 @@ def test_resume_after_a_restart(tmp_path: Path) -> None:
     def broken(*args: Any, **kwargs: Any) -> Any:
         raise OSError("disk full")
 
-    later._runs().save_run = broken  # type: ignore[method-assign]
+    later.runs().save_run = broken  # type: ignore[method-assign]
     with pytest.raises(OSError, match="disk full"):
         run(later, {"query": "q"}, "r11")
     assert "r11" not in RUNNING
@@ -384,7 +384,7 @@ def test_timeouts_take_the_default() -> None:
     waits = gated(human=gate(timeout_s=0.2, default={"approved": False}))
     paused = run(waits, {"query": "q"}, "t2")
     assert cast("Any", paused.pause).questions[0].deadline is not None
-    store = waits._runs()
+    store = waits.runs()
     assert store.due() == ()
     with pytest.raises(ValueError, match="none is answered or past its deadline"):
         resume(waits, "t2")
@@ -408,7 +408,7 @@ def test_forms_and_answer_checks() -> None:
     with pytest.raises(ValueError) as refused:
         resume(asked, "f1", {"f1/pick/1": {"option": "medium", "extra": 1}})
     assert all(word in str(refused.value) for word in ("medium", "extra", "who"))  # every problem in one error
-    store = asked._runs()
+    store = asked.runs()
     assert cast("Any", store.run("f1")).status == "paused" and store.question("f1/pick/1").answer is None  # type: ignore[union-attr]
     assert resume(asked, "f1", {"f1/pick/1": {"option": "long", **TOM}}).outputs == {}
     assert store.question("f1/pick/1").answer["option"] == "long"  # type: ignore[union-attr,index]
@@ -513,7 +513,7 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def landing(value: Any) -> Any:
         for question in value["questions"]:
-            if cast("Any", gated_mas._runs().question(question)).answer is None:
+            if cast("Any", gated_mas.runs().question(question)).answer is None:
                 gated_mas.answer("e2", {question: {"approved": True, **TOM}})
         return real(value)
 
@@ -549,17 +549,17 @@ def serde_events() -> Iterator[list[SerdeEvent]]:
 def test_store_keeps_deadlines_totals_and_threads(tmp_path: Path) -> None:
     mas = chained(side=False, store=Store(tmp_path / "runs.db"))
     run(mas, plan("a", "b"), "s1")
-    store = mas._runs()
+    store = mas.runs()
     (row,) = store.runs("paused")
     assert row.paused == ("s1/fix/a/1", "s1/fix/b/1") and row.totals is not None and row.totals["calls"] == 2
     question = cast("Any", store.question("s1/fix/b/1"))
     assert question.payload["item_key"] == "b" and question.deadline is None
-    threads = {t for (t,) in store._execute("SELECT DISTINCT thread_id FROM checkpoints")}
+    threads = {t for (t,) in store.execute("SELECT DISTINCT thread_id FROM checkpoints")}
     assert threads == {"s1", "s1/drafter/1/0", "s1/drafter/1/1"}
     assert store.prune_runs(0) == ()  # a paused run is kept
     resume(mas, "s1", {"s1/fix/a/1": {"approved": True, **TOM}, "s1/fix/b/1": {"approved": True, **TOM}})
     assert store.prune_runs(1) == () and store.prune_runs(0) == ("s1",)
-    assert store.run("s1") is None and store._execute("SELECT COUNT(*) FROM checkpoints") == [(0,)]
+    assert store.run("s1") is None and store.execute("SELECT COUNT(*) FROM checkpoints") == [(0,)]
 
 
 def test_checkpoints_hold_xmas_types(
@@ -647,7 +647,7 @@ def test_a_stopped_visit_keeps_its_record() -> None:
 def test_a_paused_and_resumed_run_is_in_the_run_log() -> None:
     mas = gated()
     paused = run(mas, {"query": "cats"}, "logged")
-    store = mas._runs()
+    store = mas.runs()
     assert store.path is not None
     kept = store.trace("logged")
     assert kept == paused and kept.status == "paused" and open_ids(kept) == open_ids(paused)

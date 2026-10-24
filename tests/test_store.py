@@ -314,7 +314,7 @@ def rows(path: Path | None, sql: str, *params: Any) -> list[tuple[Any, ...]]:
 def test_every_run_is_logged_and_its_trace_rebuilds(run_log_home: Path) -> None:
     mas = deck()
     trace = mas.run_state(deck_values("a", "b"))
-    store = mas._runs()
+    store = mas.runs()
     assert store.path == run_log_home / "xmas" / "runs.sqlite"
     rebuilt = store.trace(cast("str", trace.run_id))
     assert rebuilt == trace and rebuilt.records == trace.records and rebuilt.outputs == trace.outputs
@@ -378,8 +378,8 @@ def test_memory_opts_out_of_the_log(run_log_home: Path, monkeypatch: pytest.Monk
     assert mas.run_state(deck_values("a")).status == "ok"
     explicit = MAS([Agent("a", "Answer {query}", "answer")], llm=MockLLM(), store=":memory:")
     explicit.run("x")
-    assert mas._runs().path is None and cast("Store", explicit.store).path is None
-    assert mas._runs().runs() == () and not (run_log_home / "xmas").exists()
+    assert mas.runs().path is None and cast("Store", explicit.store).path is None
+    assert mas.runs().runs() == () and not (run_log_home / "xmas").exists()
 
 
 def test_writing_the_log_is_quick_and_a_failed_write_warns_once(tmp_path: Path) -> None:
@@ -395,7 +395,7 @@ def test_writing_the_log_is_quick_and_a_failed_write_warns_once(tmp_path: Path) 
     assert took < 0.5, took  # 200 records, events and calls: one insert each
     trace = Trace("q", "o", tuple(replace(RECORD, agent=f"n{i % 3}", step=i) for i in range(200)))
     log.end(trace, {"calls": 200, "cost_usd": 0.0, "uncosted_calls": 0, "active_s": 1.0})
-    assert store.trace("r") == trace and RunLog(store, "r")._positions.__next__() == 200
+    assert store.trace("r") == trace and RunLog(store, "r").positions.__next__() == 200
 
     with sqlite3.connect(tmp_path / "runs.db") as conn:
         conn.execute("DROP TABLE xmas_events")
@@ -431,7 +431,7 @@ def test_no_secret_reaches_the_log(run_log_home: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(llm.client.chat.completions, "create", create)
     mas = MAS([Agent("a", "Answer {query}", "answer")], llm=llm, version=2)
     trace = mas.run("Why?")
-    calls = mas._runs().calls(cast("str", trace.run_id))
+    calls = mas.runs().calls(cast("str", trace.run_id))
     assert calls[0]["params"] == {"max_tokens": llm.max_tokens, "temperature": 0.2}
     assert (calls[0]["model"], calls[0]["served_model"]) == ("m", "m")
     files = list((run_log_home / "xmas").iterdir())

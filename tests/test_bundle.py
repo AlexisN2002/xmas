@@ -77,11 +77,11 @@ def example_mas() -> MAS:
     return MAS.from_dict(
         yaml.safe_load(EXAMPLE),
         llms={"text-model": MockLLM(turns=[])},
-        tools=[*_conftest_tools(), RemoteTools()],
+        tools=[*conftest_tools(), RemoteTools()],
     )
 
 
-def _conftest_tools() -> list[Tool]:
+def conftest_tools() -> list[Tool]:
     from .conftest import apology_text, count_words, publish_text
 
     return [count_words, publish_text, apology_text]
@@ -149,7 +149,7 @@ def test_a_zipped_bundle_is_the_same_bundle(tmp_path: Path) -> None:
         read(tmp_path / "absent.mas")
 
 
-def _zip_with(path: Path, name: str, data: bytes = b"x", mode: int = stat.S_IFREG | 0o644) -> Path:
+def zip_with(path: Path, name: str, data: bytes = b"x", mode: int = stat.S_IFREG | 0o644) -> Path:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("xmas.yaml", b"version: 1\n")
         info = zipfile.ZipInfo(name)
@@ -170,13 +170,13 @@ def _zip_with(path: Path, name: str, data: bytes = b"x", mode: int = stat.S_IFRE
 def test_a_zip_entry_that_leaves_the_bundle_is_refused(tmp_path: Path, name: str, mode: int, message: str) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # zipfile warns of the duplicate name it writes
-        bad = _zip_with(tmp_path / "bad.mas", name, mode=mode)
+        bad = zip_with(tmp_path / "bad.mas", name, mode=mode)
     with pytest.raises(ValueError, match=message):
         read(bad)
 
 
 def test_a_zip_that_understates_a_size_is_refused(tmp_path: Path) -> None:
-    data = bytearray(_zip_with(tmp_path / "bomb.mas", "examples/pad.txt", b"A" * 4096).read_bytes())
+    data = bytearray(zip_with(tmp_path / "bomb.mas", "examples/pad.txt", b"A" * 4096).read_bytes())
     for header, offset in ((b"PK\x01\x02", 24), (b"PK\x03\x04", 22)):  # the stated size of the last entry
         at = data.rfind(header) + offset
         data[at : at + 4] = (10).to_bytes(4, "little")
@@ -237,14 +237,14 @@ def test_bad_front_matter_is_refused_naming_the_file(raw: str, message: str) -> 
     assert str(info.value).startswith("prompts/judge.md: ")
 
 
-def _shared_judges(fix: dict[str, Any]) -> MAS:
+def shared_judges(fix: dict[str, Any]) -> MAS:
     spec = yaml.safe_load(DECK)
     spec["agents"][3]["schema"] = copy.deepcopy(spec["agents"][1]["schema"]) | fix
     return MAS.from_dict(spec, llms=dict(deck_llms()), tools=[render_page, assemble_deck])
 
 
 def test_a_shared_schema_moves_into_the_prompt_file_only_when_every_sharer_agrees(tmp_path: Path) -> None:
-    agreeing = _shared_judges({})
+    agreeing = shared_judges({})
     path = agreeing.save(tmp_path / "agree.mas")
     text, schema = parse_prompt((path / "prompts/judge.md").read_text(encoding="utf-8"), "judge")
     assert schema == agreeing.agents["checker"].schema and text == agreeing.prompts()["checker"]
@@ -257,7 +257,7 @@ def test_a_shared_schema_moves_into_the_prompt_file_only_when_every_sharer_agree
     with pytest.raises(ValueError, match=r"Agent 'checker' has a schema in both prompts/judge.md and xmas.yaml"):
         MAS.load(path, llms=deck_llms(), config=NO_CATALOGUE)
 
-    differing = _shared_judges({"fix": {"type": "text", "means": "another"}})
+    differing = shared_judges({"fix": {"type": "text", "means": "another"}})
     path = differing.save(tmp_path / "differ.mas")
     assert parse_prompt((path / "prompts/judge.md").read_text(encoding="utf-8"), "judge")[1] is None
     assert MAS.load(path, llms=deck_llms(), config=NO_CATALOGUE).to_dict() == differing.to_dict()
@@ -353,13 +353,13 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     spec = made.to_dict()
     spec["boxes"][0]["system"] = "boxes/shorten.mas"
     with pytest.raises(ValueError, match=r"names its system 'boxes/shorten.mas': MAS.load reads a bundle's boxes"):
-        MAS.from_dict(spec, llms=llms, tools=[*_conftest_tools(), RemoteTools()])
+        MAS.from_dict(spec, llms=llms, tools=[*conftest_tools(), RemoteTools()])
     spec = made.to_dict()
     spec["callables"]["web_fetch"]["server"] = "https://tools.example.com/mcp"
     with pytest.raises(ValueError, match=r"its address goes to the configuration"):
-        MAS.from_dict(spec, llms=llms, tools=[*_conftest_tools(), RemoteTools()])
+        MAS.from_dict(spec, llms=llms, tools=[*conftest_tools(), RemoteTools()])
 
-    plain = MAS.from_dict(yaml.safe_load(EXAMPLE) | {"callables": {}}, llms=llms, tools=[*_conftest_tools(), Offered()])
+    plain = MAS.from_dict(yaml.safe_load(EXAMPLE) | {"callables": {}}, llms=llms, tools=[*conftest_tools(), Offered()])
     assert plain.to_dict()["callables"]["web_fetch"] == {
         "kind": "mcp",
         "reads": {"url": "text"},
@@ -370,7 +370,7 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
 
     spec = made.to_dict() | {"default_model": "text-model"}
     spec["boxes"][0]["system"]["default_model"] = "cut-model"
-    two = MAS.from_dict(spec, llms=llms, tools=[*_conftest_tools(), RemoteTools()])
+    two = MAS.from_dict(spec, llms=llms, tools=[*conftest_tools(), RemoteTools()])
     boxed = MAS.load(two.save(tmp_path / "two.mas"), tools=[RemoteTools()], config=NO_CATALOGUE)
     inner = boxed.boxes["shorten"].system
     built = {name: llm.model for name, llm in boxed.llms.items() if isinstance(llm, Unconfigured)}
@@ -533,7 +533,7 @@ pad:   # padded to ten
 }
 
 
-def _steps_bundle(root: Path, monkeypatch: pytest.MonkeyPatch, callables: str | None = None) -> Path:
+def steps_bundle(root: Path, monkeypatch: pytest.MonkeyPatch, callables: str | None = None) -> Path:
     (root / "stepsmod.py").write_text(STEPS_MODULE, encoding="utf-8")
     monkeypatch.syspath_prepend(str(root))
     path = root / "steps.mas"
@@ -544,7 +544,7 @@ def _steps_bundle(root: Path, monkeypatch: pytest.MonkeyPatch, callables: str | 
 
 
 def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    path = _steps_bundle(tmp_path, monkeypatch)
+    path = steps_bundle(tmp_path, monkeypatch)
     monkeypatch.delitem(sys.modules, "stepsmod", raising=False)
     with pytest.raises(ValueError, match=r"'stepsmod:shout' is in a module not imported yet; .*trust=True"):
         MAS.load(path, config=NO_CATALOGUE)  # an untrusted bundle imports nothing
@@ -558,7 +558,7 @@ def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.Monke
     (path / "xmas.yaml").write_text("version: 2\nsteps:\n- {name: go, uses: shell, reads: {}}\n", encoding="utf-8")
     with pytest.raises(ValueError, match=r"'os:system' is not a tool made with @tool"):
         MAS.load(path, config=NO_CATALOGUE)
-    path = _steps_bundle(tmp_path, monkeypatch)
+    path = steps_bundle(tmp_path, monkeypatch)
     item, _ = mas.resolve_callable(mas.steps["wide"])
     assert (item.params, sorted(item.reads), item(text="a")) == ({"width": 10}, ["text"], "a.........")
     assert mas.to_dict()["callables"]["pad"]["params"] == {"width": 10}
@@ -575,7 +575,7 @@ def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.Monke
     mismatch = STEPS_BUNDLE["callables.yaml"].replace(
         "reads: {text: text}, writes: {shout", "reads: {text: json}, writes: {shout"
     )
-    _steps_bundle(tmp_path, monkeypatch, mismatch)
+    steps_bundle(tmp_path, monkeypatch, mismatch)
     with pytest.raises(ValueError, match=r"callable 'shout' reads {'text': 'json'} in the spec"):
         MAS.load(path, config=NO_CATALOGUE, trust=True)
     for callables, message in [
@@ -599,7 +599,7 @@ def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.Monke
             "binds params, which only a python callable takes",
         ),
     ]:
-        _steps_bundle(tmp_path, monkeypatch, callables)
+        steps_bundle(tmp_path, monkeypatch, callables)
         with pytest.raises(ValueError, match=message):
             MAS.load(path, config=NO_CATALOGUE, trust=True)
     (path / "xmas.yaml").write_text(STEPS_BUNDLE["xmas.yaml"] + "callables: {}\n", encoding="utf-8")
@@ -643,7 +643,7 @@ def test_lock_compare_and_code_hashes(tmp_path: Path, monkeypatch: pytest.Monkey
         with pytest.raises(ValueError, match=r"is not a lock written by MAS.save"):
             Lock.from_yaml(text)  # the last: a line changed to match an edited file, the digest left as it was
 
-    steps = _steps_bundle(tmp_path, monkeypatch)
+    steps = steps_bundle(tmp_path, monkeypatch)
     mas = MAS.load(steps, config=NO_CATALOGUE, trust=True)
     mas.save(steps)
     saved = Lock.from_yaml((steps / LOCK).read_text(encoding="utf-8"))

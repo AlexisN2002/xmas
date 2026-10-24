@@ -606,7 +606,7 @@ def test_the_deck_example_round_trips() -> None:
     assert mas.each["drafter"] == ForEach("page", "plan.slides", 4, "id", {"cost_usd": 0.05})
     assert mas.agents["drafter"].reads == {"slide": "page", "rules": "house", "verdict": "verdict"}
     assert mas.agents["checker"].prompt == mas.agents["figure_checker"].prompt == DECK_DATA["prompts"]["judge"]
-    info = mas._checked()
+    info = mas.checked()
     drafter, captioner = info.chains["drafter"], info.chains["captioner"]
     assert (sorted(drafter.nodes), drafter.each.root, captioner.nodes) == (
         ["checker", "drafter", "render"],
@@ -966,7 +966,7 @@ def load_media(data: dict[str, Any] | None = None, llm: Any = None) -> MAS:
 
 def test_the_media_example_round_trips(png: Path) -> None:
     mas = load_media()
-    assert {name: str(vtype) for name, vtype in mas._checked().types.items()} == {
+    assert {name: str(vtype) for name, vtype in mas.checked().types.items()} == {
         "plan": "json",
         "house": "document",
         "review": "text",
@@ -1197,7 +1197,7 @@ def test_capabilities_resolve_in_order(png: Path) -> None:
         "outputs": {"verdict": "list of text"},
     }
     chained = MAS([judge], llms={"seer": seer}, models={"seer": {"accepts": ["image"]}}, **each)
-    assert chained._checked().chains["judge"].system.models == chained.models
+    assert chained.checked().chains["judge"].system.models == chained.models
     with pytest.raises(
         ValueError, match="chain 'judge': agent 'judge' reads image 'png', but model 'seer' accepts only"
     ):
@@ -1269,9 +1269,9 @@ def test_humans_and_races_round_trip() -> None:
         ("title_fix", "final_draft"),
     )
     assert mas.each["fix_title"] == ForEach("page", "plan.slides")
-    info = mas._checked()
+    info = mas.checked()
     assert (info.humans, info.races) == (("drafter", "approve"), {"outline": ("quick_notes", "careful_notes")})
-    assert info.chains["drafter"].system._checked().humans == ("fix_title",)  # the human inside the item's system
+    assert info.chains["drafter"].system.checked().humans == ("fix_title",)  # the human inside the item's system
     assert {name: str(info.types[name]) for name in ("title_fix", "final_draft", "approval", "notes")} == {
         "title_fix": "list of json",
         "final_draft": "list of text",
@@ -1334,16 +1334,16 @@ def test_humans_and_races_round_trip() -> None:
     held.asker, held.store = asker, store
     copied = held.copy()
     assert (copied.asker, copied.store, copied.humans) == (asker, store, held.humans)
-    assert copied.to_dict() == spec and held._v2_kwargs()["humans"] == tuple(held.humans.values())
-    assert held._runs() is store and isinstance(mas._runs(), Store) and mas._runs() is mas._runs()
-    assert held._checked().chains["drafter"].system._runs() is store  # a chain's items keep the outer runs
+    assert copied.to_dict() == spec and held.v2_kwargs()["humans"] == tuple(held.humans.values())
+    assert held.runs() is store and isinstance(mas.runs(), Store) and mas.runs() is mas.runs()
+    assert held.checked().chains["drafter"].system.runs() is store  # a chain's items keep the outer runs
 
 
 def test_a_human_makes_a_system_version_2() -> None:
     gate = Human("approve", "approve", ["draft"], "approval", question="Ship this? {draft}")
     writer = Agent("writer", "Write {query}", "draft")
     mas = MAS([writer], humans=[gate], edges=[("writer", "approve")], llm=MockLLM())
-    assert (mas.version, mas._checked().humans, mas.describe()["nodes"][1]["kind"]) == (2, ("approve",), "human")
+    assert (mas.version, mas.checked().humans, mas.describe()["nodes"][1]["kind"]) == (2, ("approve",), "human")
     alone = MAS([], humans=[Human("pick", "ask", ["query"], options=["a", "b"])], outputs={"answer": "json"})
     assert alone.to_dict()["humans"] == [{"name": "pick", "form": "ask", "reads": ["query"], "writes": "answer",
                                           "options": ["a", "b"]}]  # fmt: skip
@@ -1361,8 +1361,8 @@ def test_a_human_makes_a_system_version_2() -> None:
     retitled = MAS([], humans=[fix], inputs={"title": "text"}, outputs={"final": "text"})
     per_item = MAS([], humans=[fix], inputs={"titles": "list of text"}, each={"fix": "title in titles"},
                    outputs={"final": "list of text"})  # fmt: skip
-    assert str(retitled._checked().types["final"]) == "text" and per_item._checked().humans == ("fix",)
-    assert per_item._checked().chains["fix"].writes == {"fix": ValueType("json"), "final": ValueType("text")}
+    assert str(retitled.checked().types["final"]) == "text" and per_item.checked().humans == ("fix",)
+    assert per_item.checked().chains["fix"].writes == {"fix": ValueType("json"), "final": ValueType("text")}
     refused: list[tuple[dict[str, Any], str]] = [
         ({"name": ""}, "needs a name"),
         ({"reads": "draft"}, "reads is a list of texts"),
@@ -1414,15 +1414,15 @@ def routed(when: str) -> dict[str, Any]:
 
 
 def test_the_gate_checks() -> None:
-    assert gate()._checked().humans == ("approve",)
-    assert gate(form="ask", options="plan.choices")._checked().humans == ("approve",)
+    assert gate().checked().humans == ("approve",)
+    assert gate(form="ask", options="plan.choices").checked().humans == ("approve",)
     timed = gate(timeout_s=0, default=None, spec=routed("approval.approved"))  # the else edge takes a timeout
-    assert timed._checked().joins[END].kind == "merge"
+    assert timed.checked().joins[END].kind == "merge"
 
 
 def test_a_mapping_write_names_the_answer() -> None:
     typed = gate(writes={"approval": "json"})  # {name: type}, as an agent writes
-    assert typed.humans["approve"] == gate().humans["approve"] and typed._checked().humans == ("approve",)
+    assert typed.humans["approve"] == gate().humans["approve"] and typed.checked().humans == ("approve",)
     with pytest.raises(ValueError, match=r"writes is a value name, \{name: json\}"):
         gate(writes={"approval": "text"})
 
@@ -1600,12 +1600,12 @@ FIRST = [{"outline -> quick": "first of"}, {"outline -> careful": "first of"}]
 
 
 def test_a_race_checks() -> None:
-    info = race()._checked()
+    info = race().checked()
     assert info.races == {"outline": ("quick", "careful")} and info.writers["notes"] == ("quick", "careful")
     assert info.joins[END].kind == "merge"  # the winner's writes arrive
     polish = {"name": "polish", "reads": ["notes"], "writes": {"final": "text"}}
     joined = race(polish, edges=[*FIRST, "quick -> polish", "careful -> polish"], outputs={"final": "text"})
-    assert joined._checked().joins["polish"].kind == "merge"
+    assert joined.checked().joins["polish"].kind == "merge"
 
 
 @pytest.mark.parametrize(

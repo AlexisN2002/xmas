@@ -125,7 +125,7 @@ def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert repr(store()) == f"FileStore({str(tmp_path / 'home' / '.cache' / 'xmas' / 'store')!r})"
 
 
-def _kinds(tmp_path: Path) -> None:
+def case_kinds(tmp_path: Path) -> None:
     assert [kind_of(t) for t in ("image/png", "audio/x-wav", "application/pdf", "text/html; charset=utf-8")] == [
         "image",
         "audio",
@@ -151,7 +151,7 @@ def _kinds(tmp_path: Path) -> None:
         Kind("video")
 
 
-def _checks(tmp_path: Path) -> None:
+def case_checks(tmp_path: Path) -> None:
     png, csv = Ref("/a.png", "image/png"), Ref("/t.csv", "text/csv")
     image, images = parse_type("image"), parse_type("list of image")
     assert [check_value(value, image) for value in (png, csv, "a.png", b"\x89PNG")] == [
@@ -169,7 +169,7 @@ def _checks(tmp_path: Path) -> None:
     assert check_value({"page": png}, JSON) == "not JSON at page: Ref"
 
 
-def _renders(tmp_path: Path) -> None:
+def case_renders(tmp_path: Path) -> None:
     png = Ref("/a.png", "image/png", 6, "ab12")
     line = '{"location": "/a.png", "media_type": "image/png", "size": 6, "sha256": "ab12"}'
     assert render_value(png, parse_type("image")) == line
@@ -179,14 +179,14 @@ def _renders(tmp_path: Path) -> None:
     assert json.loads(render_value([], parse_type("list of file"))) == []
 
 
-def _plain(tmp_path: Path) -> None:
+def case_plain(tmp_path: Path) -> None:
     png = Ref("/a.png", "image/png")
     as_dict = {"location": "/a.png", "media_type": "image/png"}
     assert plain({"pages": [png, None, (png,)], "n": 1}) == {"pages": [as_dict, None, [as_dict]], "n": 1}
     assert plain("text") == "text"
 
 
-def _hints(tmp_path: Path) -> None:
+def case_hints(tmp_path: Path) -> None:
     assert [
         str(type_of_hint(hint)) for hint in (Image, Document, list[Image], Ref, list[Ref], Annotated[Ref, "x"])
     ] == [
@@ -246,14 +246,14 @@ def _hints(tmp_path: Path) -> None:
     assert type_of_hint({"anyOf": [{"x-xmas-kind": "audio"}, {"type": "integer"}]}) == JSON
 
 
-def _fits(tmp_path: Path) -> None:
+def case_fits(tmp_path: Path) -> None:
     image, images = parse_type("image"), parse_type("list of image")
     assert (fits(image, FILE), fits(parse_type("table"), FILE), fits(image, image)) == (True, True, True)
     assert (fits(images, parse_type("list of file")), fits(FILE, image), fits(TEXT, FILE)) == (False, False, False)
     assert fits(images, JSON)
 
 
-def _coerce(tmp_path: Path) -> None:
+def case_coerce(tmp_path: Path) -> None:
     picture = tmp_path / "a.png"
     picture.write_bytes(PNG)
     image, images = parse_type("image"), parse_type("list of image")
@@ -272,7 +272,7 @@ def _coerce(tmp_path: Path) -> None:
     assert coerce_media(picture, images) is picture
 
 
-def _capabilities(tmp_path: Path) -> None:
+def case_capabilities(tmp_path: Path) -> None:
     vision = Capabilities.parse({"accepts": ["image", "audio"]}, "models entry 'vision'")
     assert vision == Capabilities(accepts=("image", "audio"))
     assert (vision.takes("image"), vision.takes("json"), vision.gives("image"), TEXT_ONLY.takes("audio")) == (
@@ -301,14 +301,14 @@ def _capabilities(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "case",
-    [_kinds, _checks, _renders, _plain, _hints, _fits, _coerce, _capabilities],
-    ids=lambda case: case.__name__[1:],
+    [case_kinds, case_checks, case_renders, case_plain, case_hints, case_fits, case_coerce, case_capabilities],
+    ids=lambda case: case.__name__.removeprefix("case_"),
 )
 def test_media_kinds_check_render_and_hints(case: Callable[[Path], None], tmp_path: Path) -> None:
     case(tmp_path)
 
 
-def _file(tmp_path: Path, name: str, data: str, media_type: str | None = None) -> Ref:
+def file(tmp_path: Path, name: str, data: str, media_type: str | None = None) -> Ref:
     path = tmp_path / name
     path.write_text(data, encoding="utf-8")
     return Ref.from_path(path, media_type)
@@ -352,7 +352,7 @@ def _file(tmp_path: Path, name: str, data: str, media_type: str | None = None) -
 )
 def test_conversions(name: str, files: list[tuple[str, str, str | None]], expected: Any, tmp_path: Path) -> None:
     convert = {"document_text": document_text, "table_rows": table_rows}[name]
-    refs = [_file(tmp_path, *entry) for entry in files]
+    refs = [file(tmp_path, *entry) for entry in files]
     if isinstance(expected, str):
         with pytest.raises(ValueError, match=expected):
             convert(refs[0])
@@ -363,6 +363,6 @@ def test_conversions(name: str, files: list[tuple[str, str, str | None]], expect
         {"table": parse_type("table")},
     )
     assert (dict(document_text.writes), dict(table_rows.writes)) == ({"content": TEXT}, {"rows": JSON})
-    ragged = _file(tmp_path, "ragged.csv", "a,b\n1,2,3\n")
+    ragged = file(tmp_path, "ragged.csv", "a,b\n1,2,3\n")
     with pytest.raises(ValueError, match=r"line 2 of ragged\.csv does not have the header's 2 fields"):
         table_rows(ragged)

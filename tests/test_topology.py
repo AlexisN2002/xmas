@@ -91,7 +91,7 @@ def test_every_mutation_and_crossover_builds_a_runnable_system(max_cycles: int) 
         parent = rng.choice(population)
         names, edges = mutate(*parent, budget, rng, rng.randint(1, 3), "solver")
         assert is_valid(names, edges, budget, "solver"), (names, edges)
-        _build(names, edges).run("q")
+        build(names, edges).run("q")
         cyclic += 1 if cycles(names, edges) else 0
 
         population.append((names, edges))
@@ -99,12 +99,12 @@ def test_every_mutation_and_crossover_builds_a_runnable_system(max_cycles: int) 
 
         child = crossover(rng.choice(population), rng.choice(population), budget, rng, "solver")
         assert is_valid(*child, budget, "solver"), child
-        _build(*child).run("q")
+        build(*child).run("q")
 
     assert (cyclic > 0) is (max_cycles > 0), "the cycle budget decides whether cycles appear at all"
 
 
-def _build(names: list[str], edges: list[tuple[str, str]]) -> MAS:
+def build(names: list[str], edges: list[tuple[str, str]]) -> MAS:
     """Construct a system from a bare topology, which is the validity predicate."""
     agents = [Agent(name, f"{name} {{query}}", output=f"{name}_out") for name in names]
     return MAS(agents=agents, edges=mas_edges(names, edges, "solver"), llm=MockLLM(lambda prompt: "ok"))
@@ -159,7 +159,7 @@ def test_a_retry_loop_gets_both_its_entry_and_its_exit_named() -> None:
     # engine hands the loop-or-continue decision to.
     assert (("checker", END)) in wiring
 
-    mas = _build(names, edges)
+    mas = build(names, edges)
     assert back_edges(mas.graph) == {("checker", "solver")}
     assert mas.run("q").error is None
 
@@ -319,7 +319,7 @@ def test_the_population_keeps_the_best_candidates_as_future_parents() -> None:
 # ----------------------------------------------------------------- version 2
 
 
-def _judged(*, branches: bool = False) -> MAS:
+def judged(*, branches: bool = False) -> MAS:
     """Build planner -> writer -> count -> judge: a step, a frozen json judge, health and every runtime field set.
 
     With ``branches``, the judge decides between ``publish`` and ``apology``,
@@ -373,7 +373,7 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
     # candidate the check refuses (say the writer was removed, so nothing
     # writes the draft) is dropped rather than raised.
     budget = TopologyBudget(min_agents=2, max_agents=7, max_edges=12)
-    mas = _judged()
+    mas = judged()
     mas.max_visits = 1  # not the default, so a rebuild that drops it shows
     candidates = updater(seed=2, budget=budget).propose(mas, {}, n=6)
 
@@ -389,7 +389,7 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
         assert candidate.run("cats").error is None
 
     # Conditional edges and their endpoints stay exactly as they were, in order.
-    branched = _judged(branches=True)
+    branched = judged(branches=True)
     conditions = [edge for edge in branched.edges if edge.kind is not EdgeKind.PLAIN]
     proposer = updater(seed=4, budget=budget)
     candidates = proposer.propose(branched, {}, n=6) + proposer.recombine(branched, branched, n=2)
