@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
-import pandas as pd
 from promptolution.tasks.base_task import BaseTask
+
+if TYPE_CHECKING:
+    import numpy as np
+    import pandas as pd
 
 __all__ = [
     "MASTask",

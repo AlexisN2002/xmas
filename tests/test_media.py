@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -50,12 +51,16 @@ def stored(root: Path) -> list[str]:
     return sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())
 
 
+def png_sha() -> str:
+    return hashlib.sha256(PNG).hexdigest()
+
+
 def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "store"
     monkeypatch.setenv("XMAS_STORE", str(root))
     first, again = Ref.from_bytes(PNG, "image/png", "a.png"), Ref.from_bytes(PNG, "image/png", "a.png")
     sha = first.sha256
-    assert sha is not None
+    assert sha == png_sha()
     assert first == again == Ref(str(root / sha[:2] / f"{sha}.png"), "image/png", 6, sha)
     assert stored(root) == [f"{sha[:2]}/{sha}.png"]
     assert (first.name, first.kind, first.remote, first.read_bytes()) == (f"{sha}.png", "image", False, PNG)
@@ -63,10 +68,12 @@ def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     with pytest.raises(TypeError, match="keeps bytes, not str"):
         FileStore(root).put("text", "text/plain")  # type: ignore[arg-type]
 
+
+def test_path_refs_notice_a_changed_file(tmp_path: Path) -> None:
     picture = tmp_path / "slide-1.png"
     picture.write_bytes(PNG)
     ref = Ref.from_path(picture)
-    assert ref == Ref(str(picture.resolve()), "image/png", 6, sha)
+    assert ref == Ref(str(picture.resolve()), "image/png", 6, png_sha())
     assert Ref.from_path(picture, "image/x-custom").media_type == "image/x-custom"
     odd = tmp_path / "notes.unknownext"
     odd.write_text("x")
@@ -77,11 +84,16 @@ def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     with pytest.raises(ValueError, match="is not a file"):
         Ref.from_path(tmp_path)
 
+
+def test_remote_refs_and_the_dict_round_trip(tmp_path: Path) -> None:
     remote = Ref("https://example.org/deck/page-2.png?size=large", "image/png")
     assert (remote.name, remote.remote) == ("page-2.png", True)
     with pytest.raises(ValueError, match=r"page-2\.png is remote"):
         remote.read_bytes()
 
+    picture = tmp_path / "slide-1.png"
+    picture.write_bytes(PNG)
+    ref = Ref.from_path(picture)
     assert remote.to_dict() == {"location": remote.location, "media_type": "image/png"}
     assert list(ref.to_dict()) == ["location", "media_type", "size", "sha256"]
     assert Ref.from_dict(ref.to_dict()) == ref
@@ -95,6 +107,8 @@ def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         with pytest.raises(ValueError, match=words):
             Ref.from_dict(bad)
 
+
+def test_the_store_survives_a_crowd_and_a_full_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     crowd = tmp_path / "crowd"
     threads = [threading.Thread(target=FileStore(crowd).put, args=(PNG * 1000, "image/png")) for _ in range(8)]
     for thread in threads:
@@ -107,11 +121,15 @@ def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     def full_disk(self: Path, target: Path) -> Path:
         raise OSError("no space left")
 
-    with monkeypatch.context() as patch, pytest.raises(OSError, match="no space left"):
+    with monkeypatch.context() as patch:
         patch.setattr(Path, "replace", full_disk)
-        FileStore(tmp_path / "full").put(PNG, "image/png")
+        with pytest.raises(OSError, match="no space left"):
+            FileStore(tmp_path / "full").put(PNG, "image/png")
     assert stored(tmp_path / "full") == []
 
+
+def test_store_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sha = png_sha()
     # a relative root is taken from the working directory; a stored file gets the mode open() gives it
     monkeypatch.chdir(tmp_path)
     near = FileStore("near").put(PNG, "image/png")
@@ -120,7 +138,7 @@ def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     os.umask(umask)
     assert stat.S_IMODE(Path(near.location).stat().st_mode) == 0o666 & ~umask
 
-    monkeypatch.delenv("XMAS_STORE")
+    monkeypatch.delenv("XMAS_STORE", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     assert repr(store()) == f"FileStore({str(tmp_path / 'home' / '.cache' / 'xmas' / 'store')!r})"
 
@@ -323,9 +341,11 @@ def file(tmp_path: Path, name: str, data: str, media_type: str | None = None) ->
                 ("deck.md", "# Rules\n\nOne idea per slide.\n", None),
                 (
                     "rules.html",
-                    "<html><head><style>p {}</style><script>go()</script></head>"
-                    "<body><h1>Rules</h1><p>One <b>idea</b> &amp;\n  one   claim.</p>"
-                    "<ul><li>a</li><li>b</li></ul></body></html>",
+                    (
+                        "<html><head><style>p {}</style><script>go()</script></head>"
+                        "<body><h1>Rules</h1><p>One <b>idea</b> &amp;\n  one   claim.</p>"
+                        "<ul><li>a</li><li>b</li></ul></body></html>"
+                    ),
                     None,
                 ),
                 ("notes.txt", "plain\n", "text/plain; charset=utf-8"),

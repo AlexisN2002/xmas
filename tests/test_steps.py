@@ -79,7 +79,9 @@ def test_a_step_runs_between_agents_with_typed_values() -> None:
     assert step.inputs == {"plan": PLAN_TEXT}
     assert step.outputs == {"counts": COUNTS_TEXT}
     assert step.raw_response == COUNTS_TEXT
-    assert step.model is None and step.cost_usd == 0.0 and step.latency_s is not None  # a step makes no call
+    assert step.model is None
+    assert step.cost_usd == 0.0
+    assert step.latency_s is not None
     assert writer.inputs == {"plan": PLAN_TEXT, "counts": COUNTS_TEXT}
     assert trace.output == "A note."
     assert trace.to_dict()["records"][1]["kind"] == "step"
@@ -105,7 +107,8 @@ def test_one_callable_is_a_tool_and_a_step() -> None:
     loud = Step("loud", "shout", reads={"text": "draft"}, writes={"shout": "loud"})
     mas = MAS([writer], [("writer", "loud")], steps=[loud], llm=llm, tools=[shout])
     assert list(index_tools(mas.tools)) == ["shout"]
-    assert shout.reads == {"text": TEXT} and shout.writes == {"shout": TEXT}
+    assert shout.reads == {"text": TEXT}
+    assert shout.writes == {"shout": TEXT}
 
     trace = mas.run("Tom")
     assert trace.error is None
@@ -144,14 +147,18 @@ def calls_spent(trace: Any) -> int:
 def test_an_answer_outside_the_form_is_asked_once_more() -> None:
     llm = MockLLM(answers=['Sure: {"fits": true}', '{"fits": true}'], meta=True)
     trace = judge_mas(llm).run("this")
-    assert trace.error is None and trace.output == '{"fits": true}'
+    assert trace.error is None
+    assert trace.output == '{"fits": true}'
     (record,) = trace.records
     (rejected,) = record.rejected
-    assert rejected.raw_response == 'Sure: {"fits": true}' and re.fullmatch(r"<root>: .+", rejected.error)
+    assert rejected.raw_response == 'Sure: {"fits": true}'
+    assert re.fullmatch(r"<root>: .+", rejected.error)
     assert llm.calls == [RENDERED, f"{RENDERED}\n\n{RETRY_NOTE.format(problem=rejected.error)}"]
-    assert record.raw_response == '{"fits": true}' and record.rendered_prompt == RENDERED
+    assert record.raw_response == '{"fits": true}'
+    assert record.rendered_prompt == RENDERED
     assert record.outputs == {"verdict": '{"fits": true}'}
-    assert record.cost_usd == pytest.approx(0.02) and record.tokens == TokenUsage(20, 4)
+    assert record.cost_usd == pytest.approx(0.02)
+    assert record.tokens == TokenUsage(20, 4)
     assert calls_spent(trace) == 2
     assert trace.to_dict()["records"][0]["rejected"] == [
         {"raw_response": 'Sure: {"fits": true}', "error": rejected.error}
@@ -160,7 +167,8 @@ def test_an_answer_outside_the_form_is_asked_once_more() -> None:
 
 def test_a_second_answer_outside_the_form_is_a_bad_format() -> None:
     trace = judge_mas(MockLLM(answers=["Sure.", '{"fits": "perhaps"}'], meta=True)).run("this")
-    assert trace.error_kind == ErrorKind.BAD_FORMAT and trace.error is not None
+    assert trace.error_kind == ErrorKind.BAD_FORMAT
+    assert trace.error is not None
     assert re.fullmatch(r"BadFormat: Bad format from 'judge': <root>: .+; after the retry: fits: .+", trace.error)
     assert calls_spent(trace) == 2
     (failed,) = trace.records  # both paid attempts stay in the judge's failed record
@@ -182,7 +190,8 @@ def test_a_tool_agent_answers_outside_the_form_and_gets_one_more_turn() -> None:
     assert [names for _, names in llm.seen] == [["shout"], ["shout"], []]
     (record,) = trace.records
     (rejected,) = record.rejected
-    assert rejected == Rejected("Sure.", rejected.error) and re.fullmatch(r"<root>: .+", rejected.error)
+    assert rejected == Rejected("Sure.", rejected.error)
+    assert re.fullmatch(r"<root>: .+", rejected.error)
     last = llm.seen[2][0]
     assert last[1] == {"role": "user", "content": RENDERED}
     assert last[-2:] == [
@@ -191,11 +200,13 @@ def test_a_tool_agent_answers_outside_the_form_and_gets_one_more_turn() -> None:
     ]
     assert record.tool_calls == (ToolCall("shout", {"text": "hi"}, "HI!"),)
     assert record.raw_response == '{"fits": true}'
-    assert calls_spent(trace) == 3 and record.cost_usd == pytest.approx(0.03)
+    assert calls_spent(trace) == 3
+    assert record.cost_usd == pytest.approx(0.03)
 
     # a second miss fails the run with both problems
     again = judge_mas(MockLLM(meta=True, turns=[("Sure.", []), ("Sure!", [])]), tools=[shout]).run("this")
-    assert again.error_kind == ErrorKind.BAD_FORMAT and again.error is not None
+    assert again.error_kind == ErrorKind.BAD_FORMAT
+    assert again.error is not None
     assert re.fullmatch(r"BadFormat: Bad format from 'judge': <root>: .+; after the retry: <root>: .+", again.error)
 
 
@@ -210,7 +221,8 @@ def test_a_step_costs_nothing() -> None:
     )
     trace = mas.run("cats")
     assert [(r.agent, r.cost_usd) for r in trace.records] == [("writer", 0.01), ("shout", 0.0)]
-    assert trace.cost_usd == pytest.approx(0.01) and trace.output == "A DRAFT!"
+    assert trace.cost_usd == pytest.approx(0.01)
+    assert trace.output == "A DRAFT!"
 
 
 class Refusing(ToolSource):
@@ -266,9 +278,12 @@ def test_a_failed_visit_keeps_every_paid_call(
     failed, apology = trace.records
     assert (failed.agent, failed.error_kind, failed.route) == ("judge", kind, ("sorry",))
     calls = round(paid / 0.01)
-    assert failed.cost_usd == pytest.approx(paid) and failed.tokens == TokenUsage(10 * calls, 2 * calls)
-    assert apology.cost_usd == pytest.approx(0.01) and trace.cost_usd == pytest.approx(paid + 0.01)
-    assert trace.health is not None and trace.health.budget["cost_usd"]["spent"] == pytest.approx(paid + 0.01)
+    assert failed.cost_usd == pytest.approx(paid)
+    assert failed.tokens == TokenUsage(10 * calls, 2 * calls)
+    assert apology.cost_usd == pytest.approx(0.01)
+    assert trace.cost_usd == pytest.approx(paid + 0.01)
+    assert trace.health is not None
+    assert trace.health.budget["cost_usd"]["spent"] == pytest.approx(paid + 0.01)
 
 
 def test_an_optional_text_parameter_reads_text() -> None:
@@ -291,6 +306,9 @@ def test_a_json_null_is_a_value_and_renders_as_null() -> None:
     llm = MockLLM(answers=["null", "noted"], meta=True)
     trace = MAS([judge, reader], [("judge", "reader")], llm=llm, inputs={"query": "text"}).run("q")
     assert trace["judge"][0].outputs == {"verdict": "null"}
-    assert trace["reader"][0].inputs == {"verdict": "null"} and llm.calls[1] == "Read null"
+    assert trace["reader"][0].inputs == {"verdict": "null"}
+    assert llm.calls[1] == "Read null"
     alone = MAS([judge], llm=MockLLM(answers=["null"], meta=True), inputs={"query": "text"}).run("q")
-    assert alone.output == "null" and alone.health is not None and alone.health.flags == ()
+    assert alone.output == "null"
+    assert alone.health is not None
+    assert alone.health.flags == ()

@@ -79,7 +79,7 @@ def return_type(fn: Callable[..., Any] | None) -> ValueType:
         return TEXT
     try:
         hint = typing.get_type_hints(fn, include_extras=True).get("return")
-    except Exception:  # an unresolvable hint, or no hints at all, says nothing about the type
+    except Exception:  # noqa: BLE001  get_type_hints evaluates arbitrary annotation strings; a hint that fails says nothing
         hint = None
     return type_of_hint(hint)
 
@@ -110,7 +110,7 @@ class Tool:
     writes: dict[str, ValueType]
     params: dict[str, Any]
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917  the public constructor, kept for version 1 callers
         self,
         name: str,
         description: str,
@@ -467,7 +467,7 @@ def turn_usage(
     count: Callable[[str], float], messages: list[dict[str, Any]], text: str, requests: Sequence[ToolCallRequest]
 ) -> TokenUsage:
     """Estimate one tool turn's tokens with ``count``: every message's text in, the text and call arguments out."""
-    from xmas.llms.parts import content_text  # here, not at the top: xmas.llms imports this module
+    from xmas.llms.parts import content_text  # noqa: PLC0415  here, not at the top: xmas.llms imports this module
 
     return TokenUsage(
         input_tokens=sum(int(count(content_text(item.get("content") or ""))) for item in messages),
@@ -475,7 +475,7 @@ def turn_usage(
     )
 
 
-def run_tool_loop(
+def run_tool_loop(  # noqa: PLR0913, PLR0917  the public signature, kept for version 1 callers
     llm: Any,
     rendered: str | Sequence[Part],
     tools: ToolIndex,
@@ -506,52 +506,92 @@ def run_tool_loop(
         EmptyResponse: If a turn came back empty after its retries.
         XmasError: If a tool source refused the caller (``status`` 401, 403 or 429).
     """
-    from xmas.llms.meta import supports_meta  # here, not at the top: xmas.llms imports this module
-    from xmas.llms.parts import prompt_messages
+    from xmas.llms.meta import supports_meta  # noqa: PLC0415  here, not at the top: xmas.llms imports this module
+    from xmas.llms.parts import prompt_messages  # noqa: PLC0415  the same import cycle
 
-    messages = prompt_messages(rendered, system_prompt)
+    conversation = ToolConversation(
+        llm,
+        cast("SupportsMeta", llm) if supports_meta(llm) else None,
+        meter,
+        count_tokens,
+        prompt_messages(rendered, system_prompt),
+    )
     specs = [spec for spec, _ in tools.values()]
     calls: list[ToolCall] = []
-    usage = TokenUsage()
-    meta: CallMeta | None = None
-    with_meta = cast("SupportsMeta", llm) if supports_meta(llm) else None
+    for _ in range(max_rounds):
+        text, requests = conversation.turn(specs)
+        if not requests:
+            return conversation.answer(text, check, calls)
+        calls.extend(conversation.run_calls(tools, text, requests))
+    text, _ = conversation.turn([])
+    return conversation.answer(text, check, calls)
 
-    def ask(offered: list[Tool]) -> tuple[tuple[str, list[ToolCallRequest]], CallMeta | None]:
-        if with_meta is None:
-            return llm.get_tool_response(messages, offered), None
-        text, requests, call_meta = with_meta.get_tool_response_meta(messages, offered)
+
+@dataclass
+class ToolConversation:
+    """The messages of one tool loop, and the usage and metadata its turns have added up.
+
+    Attributes:
+        llm: The model answering.
+        with_meta: The same model when it reports call metadata, else ``None``.
+        meter: Checks every turn before it starts.
+        count_tokens: Estimates the tokens of a text.
+        messages: The conversation so far, sent whole on every turn.
+        usage: The approximate usage over the turns so far.
+        meta: The turns' combined metadata, or ``None`` when the model gives none.
+    """
+
+    llm: Any
+    with_meta: SupportsMeta | None
+    meter: RunMeter | VisitMeter
+    count_tokens: Callable[[str], float]
+    messages: list[dict[str, Any]]
+    usage: TokenUsage = field(default_factory=TokenUsage)
+    meta: CallMeta | None = None
+
+    def ask(self, offered: list[Tool]) -> tuple[tuple[str, list[ToolCallRequest]], CallMeta | None]:
+        """Send the conversation with ``offered`` tools; return the turn and its metadata, if the model gives any."""
+        if self.with_meta is None:
+            return self.llm.get_tool_response(self.messages, offered), None
+        text, requests, call_meta = self.with_meta.get_tool_response_meta(self.messages, offered)
         return (text, requests), call_meta
 
-    def turn(offered: list[Tool]) -> tuple[str, list[ToolCallRequest]]:
-        nonlocal usage, meta
-        (text, requests), turn_meta = meter.metered(lambda: ask(offered), llm=llm)
+    def turn(self, offered: list[Tool]) -> tuple[str, list[ToolCallRequest]]:
+        """Take one metered turn and add its usage and metadata."""
+        (text, requests), turn_meta = self.meter.metered(lambda: self.ask(offered), llm=self.llm)
         if turn_meta is not None:
-            meta = turn_meta if meta is None else meta.combine(turn_meta)
-        usage = usage + turn_usage(count_tokens, messages, text, requests)
+            self.meta = turn_meta if self.meta is None else self.meta.combine(turn_meta)
+        self.usage = self.usage + turn_usage(self.count_tokens, self.messages, text, requests)
         return text, requests
 
-    def checked(text: str) -> str:
+    def checked(self, text: str, check: Callable[[str], str | None] | None) -> str:
+        """Return ``text``, or the answer to one more turn, tools withheld, when ``check`` names a problem with it."""
         problem = None if check is None else check(text)
         if problem is None:
             return text
-        messages.append({"role": "assistant", "content": text})
-        messages.append({"role": "user", "content": RETRY_NOTE.format(problem=problem)})
-        return turn([])[0]
+        self.messages.append({"role": "assistant", "content": text})
+        self.messages.append({"role": "user", "content": RETRY_NOTE.format(problem=problem)})
+        return self.turn([])[0]
 
-    for _ in range(max_rounds):
-        text, requests = turn(specs)
-        if not requests:
-            return checked(text), tuple(calls), usage, meta
+    def answer(
+        self, text: str, check: Callable[[str], str | None] | None, calls: list[ToolCall]
+    ) -> tuple[str, tuple[ToolCall, ...], TokenUsage, CallMeta | None]:
+        """Return the checked final text, the calls made, and the usage and metadata of every turn."""
+        final = self.checked(text, check)
+        return final, tuple(calls), self.usage, self.meta
+
+    def run_calls(self, tools: ToolIndex, text: str, requests: list[ToolCallRequest]) -> list[ToolCall]:
+        """Add a turn's tool requests to the conversation, run them in order, and add each result."""
         wired = [
             {"id": r.id, "type": "function", "function": {"name": r.name, "arguments": r.arguments}} for r in requests
         ]
-        messages.append({"role": "assistant", "content": text or None, "tool_calls": wired})
+        self.messages.append({"role": "assistant", "content": text or None, "tool_calls": wired})
+        calls = []
         for request in requests:
             call = execute_tool_call(tools, request)
             calls.append(call)
-            messages.append({"role": "tool", "tool_call_id": request.id, "content": call.result})
-    text, _ = turn([])
-    return checked(text), tuple(calls), usage, meta
+            self.messages.append({"role": "tool", "tool_call_id": request.id, "content": call.result})
+        return calls
 
 
 def execute_tool_call(tools: ToolIndex, request: ToolCallRequest) -> ToolCall:

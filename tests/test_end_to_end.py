@@ -34,10 +34,14 @@ from .conftest import MockLLM
 SLICE = pd.DataFrame(
     {
         "question": [
-            "Natalia sold clips to 48 friends in April, and then she sold half as many "
-            "clips in May. How many clips did Natalia sell altogether in April and May?",
-            "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes "
-            "of babysitting. How much did she earn?",
+            (
+                "Natalia sold clips to 48 friends in April, and then she sold half as many "
+                "clips in May. How many clips did Natalia sell altogether in April and May?"
+            ),
+            (
+                "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes "
+                "of babysitting. How much did she earn?"
+            ),
         ],
         "answer": ["#### 72", "#### 10"],
     }

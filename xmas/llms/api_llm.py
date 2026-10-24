@@ -8,12 +8,12 @@ import binascii
 import os
 import re
 import time
-from collections.abc import Sequence
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import openai
@@ -31,6 +31,9 @@ from xmas.media import Capabilities
 from xmas.tools import Tool, ToolCallRequest, turn_usage
 from xmas.trace import TokenUsage
 from xmas.utils import approximate_tokens, error_message, retry_after_seconds, timestamp
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "APILLM",
@@ -56,6 +59,7 @@ class Progress:
     messages: list[dict[str, Any]] | None = None
     text: list[str] = field(default_factory=list)
     model: str | None = None
+    started: float = field(default_factory=time.perf_counter)
 
 
 # ask's thread sets an attempt's progress; the request coroutine, scheduled from
@@ -113,18 +117,18 @@ class APILLM(promptolution.APILLM):
             ``"image"`` for a model that draws.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917  the public constructor, kept for version 1 callers
         self,
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         call_log: CallLog | None = None,
         backend_tag: str = "gateway",
-        full_response: bool | None = None,
+        full_response: bool | None = None,  # noqa: FBT001  public positional parameter of the constructor
         price: TokenPrice | None = None,
         accepts: Sequence[str] = ("text",),
         produces: Sequence[str] = ("text",),
-        stream: bool = False,
+        stream: bool = False,  # noqa: FBT001, FBT002  public positional parameter of the constructor
         **kwargs: Any,
     ) -> None:
         """Initialize the model.
@@ -465,15 +469,14 @@ class APILLM(promptolution.APILLM):
         paid: CallMeta | None = None
         flag = cancel_flag()
         for attempt in range(self.max_retries + 1):
-            started = time.perf_counter()
             progress = Progress()
             token = current_progress.set(progress)
             try:
                 future = asyncio.run_coroutine_threadsafe(self.send(request), self._loop)
             finally:
                 current_progress.reset(token)
-            completion = self.wait(future, what, flag, started, progress, paid)
-            meta = meta_from_completion(completion, time.perf_counter() - started, self.price)
+            completion = self.wait(future, what, flag, progress, paid)
+            meta = meta_from_completion(completion, time.perf_counter() - progress.started, self.price)
             paid = meta if paid is None else paid.combine(meta)
             if completion.choices:
                 message = completion.choices[0].message
@@ -503,7 +506,6 @@ class APILLM(promptolution.APILLM):
         future: Future[ChatCompletion],
         what: str,
         flag: CancelFlag | None,
-        started: float,
         progress: Progress,
         paid: CallMeta | None,
     ) -> ChatCompletion:
@@ -522,18 +524,20 @@ class APILLM(promptolution.APILLM):
                 return future.result(timeout=deadline if flag is None else min(SLICE_S, ends - time.monotonic()))
             except FuturesTimeout:
                 if flag is not None and flag.is_set():
-                    future.cancel()
-                    received = "".join(progress.text)
-                    tokens = (
-                        None
-                        if progress.messages is None
-                        else turn_usage(approximate_tokens, progress.messages, received, [])
-                    )
-                    cut = cut_meta(time.perf_counter() - started, tokens, progress.model, self.price)
-                    flag.check(cut if paid is None else paid.combine(cut), received)
+                    self.stop_attempt(future, flag, progress, paid)
                 if flag is None or time.monotonic() >= ends:
                     future.cancel()
                     raise TimeoutError(f"{what} timed out after {deadline}s") from None
+
+    def stop_attempt(
+        self, future: Future[ChatCompletion], flag: CancelFlag, progress: Progress, paid: CallMeta | None
+    ) -> None:
+        """Cancel a stopped attempt and raise :class:`~xmas.errors.Stopped` with what it used and received."""
+        future.cancel()
+        received = "".join(progress.text)
+        tokens = None if progress.messages is None else turn_usage(approximate_tokens, progress.messages, received, [])
+        cut = cut_meta(time.perf_counter() - progress.started, tokens, progress.model, self.price)
+        flag.check(cut if paid is None else paid.combine(cut), received)
 
     async def send(self, request: dict[str, Any]) -> ChatCompletion:
         """Make ``request``, retrying with promptolution's backoff unless the error is permanent."""
@@ -704,7 +708,9 @@ def decode_image(url: str) -> tuple[bytes, str]:
 
 def is_permanent(exc: BaseException) -> bool:
     """Whether retrying cannot help: a 4xx other than 408, 409 and 429, or a 4xx that names money."""
-    if not isinstance(exc, openai.APIStatusError) or not 400 <= exc.status_code < 500:
+    if not isinstance(exc, openai.APIStatusError) or not (
+        HTTPStatus.BAD_REQUEST <= exc.status_code < HTTPStatus.INTERNAL_SERVER_ERROR
+    ):
         return False
     text = str(exc) if exc.body is None else f"{exc} {exc.body}"
     return exc.status_code not in (408, 409, 429) or MONEY_WORDS.search(text) is not None
@@ -733,13 +739,13 @@ def parse_score(response: httpx.Response) -> ScoredSequence:
         XmasError: On an error status or a body without tokens/token_logprobs.
     """
     status = response.status_code
-    if status == 501:
+    if status == HTTPStatus.NOT_IMPLEMENTED:
         raise XmasError(f"llm: scoring unsupported (501): {error_message(response)}", status=501)
-    if status == 429:
+    if status == HTTPStatus.TOO_MANY_REQUESTS:
         retry_after = retry_after_seconds(response.headers)
         message = f"llm: rate limited (429), retry after {retry_after}s: {error_message(response)}"
         raise XmasError(message, status=429, retry_after=retry_after)
-    if status >= 400:
+    if status >= HTTPStatus.BAD_REQUEST:
         raise XmasError(f"llm: scoring failed ({status}): {error_message(response)}", status=status)
     body = response.json()
     tokens = body.get("tokens")

@@ -12,8 +12,10 @@ changed are rewritten, and the rewrite is told exactly which variables to use.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from promptolution.llms.base_llm import BaseLLM
+if TYPE_CHECKING:
+    from promptolution.llms.base_llm import BaseLLM
 
 __all__ = [
     "LLMPromptSynthesizer",

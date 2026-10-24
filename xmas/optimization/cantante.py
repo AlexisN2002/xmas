@@ -5,18 +5,20 @@ from __future__ import annotations
 
 import math
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from promptolution.optimizers.base_optimizer import BaseOptimizer
-
-from xmas.mas import MAS
-from xmas.optimization.attribution import Attributor
 from xmas.optimization.broker import Board, ProxyTask, Request, rounds
 from xmas.optimization.optimizer import MASOptimizer
 from xmas.optimization.updaters import AgentPromptView, movable_agents
 from xmas.prompts import encode_prompts
-from xmas.tasks.base import MASTask
-from xmas.trace import Trace
+
+if TYPE_CHECKING:
+    from promptolution.optimizers.base_optimizer import BaseOptimizer
+
+    from xmas.mas import MAS
+    from xmas.optimization.attribution import Attributor
+    from xmas.tasks.base import MASTask
+    from xmas.trace import Trace
 
 __all__ = [
     "CantanteOptimizer",
@@ -52,7 +54,7 @@ class CantanteOptimizer(MASOptimizer):
 
     attributor: Attributor
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  the public constructor, kept for version 1 callers
         self,
         mas: MAS,
         task: MASTask,

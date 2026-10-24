@@ -379,7 +379,8 @@ def test_graph_updater_keeps_kinds_frozen_and_conditions(monkeypatch: pytest.Mon
 
     assert candidates
     for candidate in candidates:
-        assert candidate.steps == mas.steps and isinstance(candidate.steps["count"], Step)
+        assert candidate.steps == mas.steps
+        assert isinstance(candidate.steps["count"], Step)
         assert "count" not in candidate.agents
         assert candidate.agents["judge"] == mas.agents["judge"]
         kept = ("version", "inputs", "merges", "boxes", "frozen", "health")

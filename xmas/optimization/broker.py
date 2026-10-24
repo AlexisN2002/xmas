@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +33,9 @@ import numpy as np
 from promptolution.tasks.base_task import BaseTask, EvalResult
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Iterator
+    from concurrent.futures import Future
+
     from promptolution.utils.prompt import Prompt
 
     from xmas.tasks.base import MASTask
@@ -46,6 +47,9 @@ __all__ = [
     "credit_result",
     "rounds",
 ]
+
+WAKE_INTERVAL_S = 0.25
+"""Seconds between looks at the board while a round settles, so a worker that ends or dies is noticed."""
 
 
 @dataclass
@@ -226,24 +230,44 @@ def rounds(
     """
     while True:
         with board.condition:
-            deadline: float | None = None
-            while True:
-                parked = board.posted()
-                if parked:
-                    if deadline is None:
-                        deadline = time.monotonic() + settle_timeout
-                    if sum(1 for worker in workers if not worker.done()) <= parked or time.monotonic() >= deadline:
-                        break
-                else:
-                    for worker in workers:
-                        error = worker.exception() if worker.done() else None
-                        if error is not None:
-                            raise error
-                    if all(worker.done() for worker in workers):
-                        return
-                board.condition.wait(timeout=0.25)
+            if not settle_round(board, workers, settle_timeout):
+                return
             batch = board.collect()
         yield batch
+
+
+def settle_round(board: Board, workers: list[Future[Any]], settle_timeout: float) -> bool:
+    """Wait on the board's condition, held by the caller, until a round is ready to serve.
+
+    Returns:
+        ``True`` once every running worker has posted or the settle timeout ran
+        out, ``False`` once every worker finished with nothing posted.
+
+    Raises:
+        BaseException: Whatever a worker raised, once it is seen to have failed.
+    """
+    deadline: float | None = None
+    while True:
+        parked = board.posted()
+        if parked:
+            if deadline is None:
+                deadline = time.monotonic() + settle_timeout
+            running = sum(1 for worker in workers if not worker.done())
+            if running <= parked or time.monotonic() >= deadline:
+                return True
+        else:
+            raise_worker_failure(workers)
+            if all(worker.done() for worker in workers):
+                return False
+        board.condition.wait(timeout=WAKE_INTERVAL_S)
+
+
+def raise_worker_failure(workers: list[Future[Any]]) -> None:
+    """Raise the error of the first finished worker that failed, if any."""
+    for worker in workers:
+        error = worker.exception() if worker.done() else None
+        if error is not None:
+            raise error
 
 
 def credit_result(prompts: list[str], scores: list[list[float]]) -> EvalResult:

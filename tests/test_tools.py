@@ -536,9 +536,12 @@ def test_a_cut_tool_turn_fails_as_a_cut_plain_answer_does(monkeypatch: pytest.Mo
     log = CallLog()
     llm, sent = recording_llm(monkeypatch, [answer(None, finish="length")], call_log=log)
     trace = MAS(agents=[coder(["add"])], llm=llm, tools=[add]).run("q")
-    assert trace.error_kind == ErrorKind.LENGTH_CUT and trace.output == ""
-    assert trace.error is not None and trace.error.startswith("EmptyResponse: Empty content from model")
-    assert len(sent) == 1 and log.records[-1].ok is False  # sent once: the same request would be cut again
+    assert trace.error_kind == ErrorKind.LENGTH_CUT
+    assert trace.output == ""
+    assert trace.error is not None
+    assert trace.error.startswith("EmptyResponse: Empty content from model")
+    assert len(sent) == 1
+    assert log.records[-1].ok is False
 
 
 def test_stopped_in_a_local_tool_stops_the_run() -> None:
@@ -549,7 +552,8 @@ def test_stopped_in_a_local_tool_stops_the_run() -> None:
 
     llm = MockLLM(turns=[("", [req("slow", '{"text": "x"}')]), ("finished anyway", [])])
     trace = MAS(agents=[coder(["slow"])], llm=llm, tools=[slow]).run("q")
-    assert trace.error_kind == ErrorKind.STOPPED and trace.output == ""
+    assert trace.error_kind == ErrorKind.STOPPED
+    assert trace.output == ""
     assert trace.error == "Stopped: stop pressed"
 
 
@@ -578,7 +582,8 @@ def test_a_step_writes_media_as_stored_refs(monkeypatch: pytest.MonkeyPatch, tmp
     source = LocalTools([paint])
     first = run_step(paint, source, {"page": "1"})["png"]  # the file is rewritten for page 2
     second = run_step(paint, source, {"page": "2"})["png"]
-    assert isinstance(first, Ref) and first.location.startswith(str(tmp_path / "store"))
+    assert isinstance(first, Ref)
+    assert first.location.startswith(str(tmp_path / "store"))
     assert (first.read_bytes(), second.read_bytes(), first.media_type) == (b"png-1", b"png-2", "image/png")
 
     raw = Tool("raw", "Return bytes.", page, fn=lambda page: b"png", writes={"png": "image"})

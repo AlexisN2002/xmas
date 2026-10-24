@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from promptolution.optimizers.base_optimizer import BaseOptimizer
 from promptolution.predictors.base_predictor import BasePredictor
 
-from xmas.mas import MAS
 from xmas.prompts import encode_prompts
-from xmas.tasks.base import MASTask
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from promptolution.optimizers.base_optimizer import BaseOptimizer
+
+    from xmas.mas import MAS
+    from xmas.tasks.base import MASTask
 
 __all__ = [
     "AgentPromptView",

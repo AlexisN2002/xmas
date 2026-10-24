@@ -4,62 +4,90 @@ from __future__ import annotations
 
 import inspect
 import typing
-from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
+if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Callable, Iterator
+
 __all__ = [
+    "args_sections",
     "arguments_from",
     "arguments_model",
     "describe_validation_error",
+    "docstring_summary",
     "function_name",
     "indent_of",
     "is_args_header",
     "json_schema",
+    "parse_args_section",
     "split_docstring",
     "valid_tool_name",
 ]
 
+MAX_TOOL_NAME_LENGTH = 64
+"""The longest tool name the OpenAI ``tools`` payload accepts."""
+
 
 def valid_tool_name(name: str) -> bool:
     """Whether the OpenAI ``tools`` payload accepts ``name``: ASCII letters, digits, ``_`` and ``-``, 1 to 64 long."""
-    return 0 < len(name) <= 64 and all((c.isascii() and c.isalnum()) or c in "_-" for c in name)
+    return 0 < len(name) <= MAX_TOOL_NAME_LENGTH and all((c.isascii() and c.isalnum()) or c in "_-" for c in name)
 
 
 def split_docstring(doc: str) -> tuple[str, dict[str, str]]:
     """Return ``(summary, {param: description})`` for a cleaned docstring (Google ``Args:``)."""
     lines = doc.splitlines()
+    params: dict[str, str] = {}
+    for section in args_sections(lines):
+        params.update(parse_args_section(section))
+    return docstring_summary(lines), params
+
+
+def docstring_summary(lines: list[str]) -> str:
+    """Join the docstring lines before the first blank line or parameter section."""
     summary_lines: list[str] = []
     for line in lines:
         if not line.strip() or is_args_header(line.strip()):
             break
         summary_lines.append(line.strip())
-    summary = " ".join(summary_lines)
+    return " ".join(summary_lines)
 
-    params: dict[str, str] = {}
-    in_args = False
+
+def args_sections(lines: list[str]) -> Iterator[list[str]]:
+    """Yield the non-blank lines of each parameter section, its header left out.
+
+    A line indented no deeper than the header (``Returns:``, ``Raises:``, prose)
+    ends the section, and opens a new one if it is a parameter header itself.
+    """
+    section: list[str] | None = None
     header_indent = 0
-    entry_indent: int | None = None
-    current: str | None = None
     for line in lines:
         stripped = line.strip()
-        if not in_args:
+        if section is None:
             if is_args_header(stripped):
-                in_args = True
-                header_indent = indent_of(line)
-                entry_indent = None
-                current = None
+                section, header_indent = [], indent_of(line)
             continue
         if not stripped:
             continue
-        indent = indent_of(line)
-        if indent <= header_indent:  # the next section (Returns:, Raises:, prose) ends Args
-            in_args = is_args_header(stripped)
-            header_indent = indent
-            entry_indent = None
-            current = None
+        if indent_of(line) > header_indent:
+            section.append(line)
             continue
+        yield section
+        section = [] if is_args_header(stripped) else None
+        header_indent = indent_of(line)
+    if section is not None:
+        yield section
+
+
+def parse_args_section(section: list[str]) -> dict[str, str]:
+    """Return ``{param: description}`` from one section's lines; deeper lines continue the entry above."""
+    params: dict[str, str] = {}
+    entry_indent: int | None = None
+    current: str | None = None
+    for line in section:
+        stripped = line.strip()
+        indent = indent_of(line)
         if entry_indent is None:
             entry_indent = indent
         head, sep, text = stripped.partition(":")
@@ -69,7 +97,7 @@ def split_docstring(doc: str) -> tuple[str, dict[str, str]]:
             params[current] = text.strip()
         elif indent > entry_indent and current is not None:
             params[current] = f"{params[current]} {stripped}".strip()
-    return summary, params
+    return params
 
 
 def is_args_header(stripped: str) -> bool:

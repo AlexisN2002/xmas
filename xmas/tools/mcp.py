@@ -10,8 +10,8 @@ import binascii
 import json
 import logging
 import os
-from collections.abc import Mapping
-from typing import Any
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any
 
 from mcp.types import AudioContent, BlobResourceContents, CallToolResult, EmbeddedResource, ImageContent, TextContent
 
@@ -19,6 +19,9 @@ from xmas.errors import XmasError
 from xmas.tools import Tool, ToolSource
 from xmas.tools.mcp_session import McpSession
 from xmas.tools.schema import valid_tool_name
+
+if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Mapping
 
 __all__ = [
     "MCPTools",
@@ -43,7 +46,7 @@ class MCPTools(ToolSource):
     because a tool call need not be idempotent.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  the public constructor, kept for version 1 callers
         self,
         url: str,
         key: str | None = None,
@@ -203,7 +206,7 @@ def result_text(result: CallToolResult) -> str:
         message = str(body.get("message") or body["error"])
         if code == "insufficient_budget":  # arrives with 429 already; the run ends either way
             raise XmasError(f"mcp: {code} ({status}): {message}", status=429)
-        if status == 429:
+        if status == HTTPStatus.TOO_MANY_REQUESTS:
             raw = body.get("retry_after_s")
             retry_after = float(raw) if isinstance(raw, int | float) and not isinstance(raw, bool) else None
             raise XmasError(f"mcp: {code} ({status}): {message}", status=429, retry_after=retry_after)

@@ -14,11 +14,13 @@ from __future__ import annotations
 import base64
 import re
 import uuid
-from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from xmas.media import MAX_PART_BYTES, Ref
 from xmas.prompts import safe_format
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 __all__ = [
     "Part",
@@ -36,6 +38,12 @@ Part = str | Ref
 """One piece of a prompt: text, or a media ref sent as a picture or a sound."""
 
 AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mpeg": "mp3"}
+
+KILOBYTE = 1024
+"""Bytes in the ``KB`` a record shows."""
+
+MEGABYTE = KILOBYTE * KILOBYTE
+"""Bytes in the ``MB`` a record shows."""
 
 
 def render_parts(
@@ -106,11 +114,11 @@ def marker(ref: Ref) -> str:
 
 def size(count: int) -> str:
     """Return a byte count as ``6 B``, ``182 KB`` or ``3.4 MB``."""
-    if count < 1024:
+    if count < KILOBYTE:
         return f"{count} B"
-    if count < 1024 * 1024:
-        return f"{round(count / 1024)} KB"
-    return f"{count / (1024 * 1024):.1f} MB"
+    if count < MEGABYTE:
+        return f"{round(count / KILOBYTE)} KB"
+    return f"{count / MEGABYTE:.1f} MB"
 
 
 def has_media(parts: Sequence[Part]) -> bool:

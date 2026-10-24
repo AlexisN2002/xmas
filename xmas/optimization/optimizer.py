@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from promptolution.utils.prompt import Prompt
 
-from xmas.mas import MAS
-from xmas.optimization.attribution import Attributor
-from xmas.tasks.base import MASTask
-from xmas.trace import Trace
+if TYPE_CHECKING:
+    from xmas.mas import MAS
+    from xmas.optimization.attribution import Attributor
+    from xmas.tasks.base import MASTask
+    from xmas.trace import Trace
 
 __all__ = [
     "MASOptimizer",
@@ -98,7 +99,7 @@ class MASOptimizer(ABC):
             self.rollouts.extend((trace, float(grid[index][column])) for (index, column), trace in traces.items())
         return scores
 
-    def run_task(self, predictor: MAS, encoded: list[str], full: bool) -> tuple[Any, dict[tuple[int, int], Trace]]:
+    def run_task(self, predictor: MAS, encoded: list[str], *, full: bool) -> tuple[Any, dict[tuple[int, int], Trace]]:
         """Evaluate encoded prompt sets on the task; ``full`` runs every datapoint and keys the traces by cell."""
         cached = set(self.task.eval_cache)
         prompts = [Prompt(text) for text in encoded]

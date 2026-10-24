@@ -1,5 +1,5 @@
-# Operators adapted from tritthart/mas-optimization, mas_lib/optimization/
-# architecture_evolution/{graph_ops,mutation,crossover}.py
+# The operators are adapted from the graph_ops, mutation and crossover modules
+# of the architecture_evolution package in tritthart/mas-optimization.
 """Graph operators for topology search.
 
 The operators work on the *agent* edge set, by name: the edges between agents,
@@ -21,12 +21,15 @@ candidate is built.
 
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import networkx as nx
 
 from xmas.graph import END, START, back_edges, build_graph, terminal_agent, validate_graph
+
+if TYPE_CHECKING:
+    import random
 
 __all__ = [
     "KEEP_FROM_FIRST",
@@ -176,7 +179,7 @@ def mas_edges(names: list[str], edges: Edges, entry: str | None = None) -> Edges
 
     wiring = list(edges)
     if not sources(names, edges):
-        wiring = [(START, entry if entry in names else sorted(names)[0]), *wiring]
+        wiring = [(START, entry if entry in names else min(names)), *wiring]
     if not terminals(names, edges):
         wiring = [*wiring, (exit_agent(names, wiring), END)]
     return wiring
@@ -185,7 +188,7 @@ def mas_edges(names: list[str], edges: Edges, entry: str | None = None) -> Edges
 def exit_agent(names: list[str], wiring: Edges) -> str:
     """Return the source of a cycle-closing edge of ``wiring``, else the last agent by name."""
     closing = sorted(back_edges(digraph([START, *names], wiring)))
-    return closing[0][0] if closing else sorted(names)[-1]
+    return closing[0][0] if closing else max(names)
 
 
 def is_buildable(names: list[str], edges: Edges, entry: str | None = None) -> bool:
@@ -343,7 +346,7 @@ def next_name(names: list[str]) -> str:
 # ------------------------------------------------------------------ mutation
 
 
-def mutate(
+def mutate(  # noqa: PLR0913, PLR0917  the public operator signature, kept for version 1 callers
     names: list[str],
     edges: Edges,
     budget: TopologyBudget,
@@ -413,7 +416,7 @@ falls back.
 """
 
 
-def crossover(
+def crossover(  # noqa: PLR0913, PLR0917  the public operator signature, kept for version 1 callers
     first: tuple[list[str], Edges],
     second: tuple[list[str], Edges],
     budget: TopologyBudget,

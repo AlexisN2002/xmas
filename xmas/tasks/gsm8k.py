@@ -64,8 +64,7 @@ class GSM8KTask(MASTask):
         Returns:
             The loaded task.
         """
-        # optional dependency, imported lazily: it pulls a large tree most installs never need
-        from datasets import load_dataset
+        from datasets import load_dataset  # noqa: PLC0415  optional dependency, imported only when this loader runs
 
         data = load_dataset("openai/gsm8k", "main", split=split)
         df = pd.DataFrame(data)
@@ -102,7 +101,7 @@ def extract_number(text: str) -> float | None:
     """
     # GSM8K references end in `#### 18`; the worked solution before it is not the answer
     if "####" in text:
-        text = text.split("####")[-1]
+        text = text.rsplit("####", maxsplit=1)[-1]
     # numbers as models write them: 1,234.5 / -7 / $18 / 42
     matches = re.findall(r"-?\d[\d,]*\.?\d*", text)
     if not matches:
