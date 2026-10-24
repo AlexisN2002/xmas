@@ -809,7 +809,7 @@ print(team.describe()["id"] == mas.describe()["id"])  # True
 ```
 
 `MAS.load` builds each model the bundle names on the endpoint of your configuration (see
-Configuration). It imports each function from where `callables.yaml` says it lives. Pass
+Configuration). It finds each function where `callables.yaml` says it lives. Pass
 `llm=`, `llms=` or `tools=[...]` to supply your own instead. The folder holds one file
 per part:
 
@@ -890,8 +890,10 @@ The parameters are `max_tokens`, `timeout_s`, `temperature`, `top_p`, `seed` and
 `verify()` to compare. Saving again rewrites only the files whose content changed. A new
 prompt from an optimizer changes one prompt file and the lock, and your comments in the
 other files stay. A bundle never holds an endpoint, a key, a tool server's address, a
-budget or a run. Loading a bundle imports the code that `callables.yaml` names, so load
-only bundles you trust. A function passed in `tools=[...]` is used by its name instead.
+budget or a run. A bundle may name any code, so by default `MAS.load` imports nothing: a
+function must be a `@tool` in a module your program has already imported, or be passed
+in `tools=[...]`. `MAS.load(path, trust=True)` imports the modules `callables.yaml` names
+and wraps plain functions; use it only for bundles you trust.
 
 A version 1 system, such as the quickstart's, also saves as one YAML file:
 
@@ -1002,7 +1004,8 @@ picture. It prints the output, then one line with the status, the model calls, t
 and the time. It refuses a model name the catalogue does not hold. `show`, `diff` and
 `verify` take `--json`, and `verify --strict` fails when the report is not ok. The exit
 status is 0 when all is well, 1 for a problem, and 2 for a usage error or a missing
-bundle. A bundle's functions import from the current folder.
+bundle. `check`, `show`, `run` and `verify` take `--trust` to import the functions a bundle
+names, from the current folder too.
 
 ## 🧠 Optimization built in
 

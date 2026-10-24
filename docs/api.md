@@ -591,14 +591,19 @@ holds only the answer's `schema`), `boxes/<box>.mas/`, and `xmas.lock` (the
 sha256 of every other file and of each python callable's source), written last.
 Into an existing folder it writes only the files whose parsed content changed
 and never touches `examples/` or `optimize.yaml`. **`MAS.load(path, *, llm=None,
-llms=None, tools=(), config=None, overlay=None, resolve=True, verify=None)`**
-reads one back: a callable in `tools` wins, a python callable is imported by its
-`import` path and bound to its `params`, a remote one reaches the server its
-`server` names under `[tools.<name>]`, and every bound model name not given gets
-`build_llms`. With `resolve`, the names are checked against the catalogue: a
-miss warns with a `ModelNameWarning`, lands in `mas.unresolved`, and every run
-entry point refuses until it is fixed. A load refuses absolute paths, `..`,
-symlinks and bundles over `MAX_BYTES`.
+llms=None, tools=(), config=None, overlay=None, resolve=True, verify=None,
+trust=False)`** reads one back: a callable in `tools` wins, a python callable is
+found by its `import` path and bound to its `params`, a remote one reaches the
+server its `server` names under `[tools.<name>]`, and every bound model name not
+given gets `build_llms`, each box's `default_model` too. A bundle may name any
+code, so without `trust` nothing is imported: a python callable must be a `Tool`
+(made with `@tool`) in a module already imported, else the load refuses and
+names `tools=[...]` and `trust=True`. With `resolve`, the names are checked
+against the catalogue: a miss warns with a `ModelNameWarning`, lands in
+`mas.unresolved`, and every run entry point, `resume` included, refuses until it
+is fixed. A load refuses absolute paths, `..`, symlinks, a zip entry there
+twice, a broken zip and bundles over `MAX_BYTES`; a lock whose bundle digest is
+not that of its files is a level 0 difference.
 
 **`MAS.verify(level=1, *, budget=None, strict=False, only=(), examples=None,
 config=None)`** returns a `VerifyReport`: level 0 compares the bundle with its
