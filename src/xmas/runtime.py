@@ -9,12 +9,14 @@ run config under :data:`_RUN_KEY`. Nodes check the budget on it before each call
 and keep every finished visit's record there, so a failed run still returns
 what it did.
 
-In a version 2 system values are typed (text or json) and render by
+In a version 2 system values are typed and render by
 :func:`~xmas.values.render_value`; steps run callables; a json agent answers in
-its answer form, with one retry; a node with conditional or error edges routes
-by a :class:`_Decision` after each visit; a join is a barrier that runs once per
-pass, after all its groups, where version 1 defers; and a box runs a whole
-inner system as one node, on the outer run's meter.
+its answer form, with one retry; an agent reading an image or audio sends it to
+its model as a content part, and an agent writing an image keeps the model's
+picture in :func:`~xmas.media.store`; a node with conditional or error edges
+routes by a :class:`_Decision` after each visit; a join is a barrier that runs
+once per pass, after all its groups, where version 1 defers; and a box runs a
+whole inner system as one node, on the outer run's meter.
 
 A ``for each`` chain compiles to three nodes around its head ``h``:
 ``__each__.h.in`` starts a pass and fans the list out with one ``Send`` per
@@ -42,12 +44,13 @@ from promptolution.utils.token_counter import get_token_counter
 
 from xmas.agent import Agent
 from xmas.budget import RunMeter, VisitMeter
-from xmas.check import step_maps
+from xmas.check import SENT, step_maps
 from xmas.edges import ANY_ERROR, Edge, EdgeKind
 from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, classify
 from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
 from xmas.llms.meta import SupportsMeta, supports_meta
+from xmas.media import Ref, store
 from xmas.nodes import Box, Step
 from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
@@ -55,7 +58,7 @@ from xmas.routes import Join
 from xmas.schemas import RETRY_NOTE, AnswerForm, FormError, compile_form
 from xmas.tools import run_step, run_tool_loop
 from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
-from xmas.values import JSON, TEXT, ValueType, check_value, parse_type, render_value
+from xmas.values import JSON, TEXT, ValueType, check_value, coerce_media, media_kind, parse_type, plain, render_value
 
 if TYPE_CHECKING:  # pragma: no cover
     from promptolution.llms.base_llm import BaseLLM
@@ -73,6 +76,9 @@ _RUN_KEY = "xmas_run"
 
 _ITEM_KEY = "xmas_item"
 """Key of the chain item a run works on, ``(index, key)``, in ``config["configurable"]``."""
+
+Prompt = str | list[str | Ref]
+"""What an agent sends its model: one text, or content parts when it reads an image or audio."""
 
 
 class MASState(TypedDict):
@@ -159,14 +165,37 @@ def _run_value(meter: RunMeter, mas: MAS) -> dict[str, Any]:
     }
 
 
-def _generate(llm: BaseLLM, rendered: str) -> tuple[str, CallMeta | None]:
-    """Make a plain agent's one model call; the metadata is ``None`` unless the model opted in to ``full_response``."""
+def _generate(llm: BaseLLM, rendered: Prompt) -> tuple[str, CallMeta | None]:
+    """Make a plain agent's one model call; the metadata is ``None`` unless the model opted in to ``full_response``.
+
+    Content parts go through ``generate_parts_with_meta``, which the check
+    made sure the model has.
+    """
+    if not isinstance(rendered, str):
+        answer: tuple[str, CallMeta] = cast("Any", llm).generate_parts_with_meta(rendered)
+        return answer
     if supports_meta(llm):
         return cast("SupportsMeta", llm).generate_with_meta(rendered)
     return llm.get_response([rendered])[0], None
 
 
-def _call(llm: BaseLLM, rendered: str, meter: VisitMeter, *, batch_error: bool = False) -> tuple[str, CallMeta | None]:
+def _text(prompt: Prompt) -> str:
+    """Return a prompt's text parts, joined: what a token estimate counts."""
+    return prompt if isinstance(prompt, str) else "".join(part for part in prompt if isinstance(part, str))
+
+
+def _joined(prompt: Prompt, text: str) -> Prompt:
+    """Return a prompt with ``text`` added at its end, to its last text part when it ends in one."""
+    if isinstance(prompt, str):
+        return prompt + text
+    if prompt and isinstance(prompt[-1], str):
+        return [*prompt[:-1], prompt[-1] + text]
+    return [*prompt, text]
+
+
+def _call(
+    llm: BaseLLM, rendered: Prompt, meter: VisitMeter, *, batch_error: bool = False
+) -> tuple[str, CallMeta | None]:
     """Make one metered model call.
 
     With ``batch_error`` (a version 1 agent) a failed call raises as
@@ -278,7 +307,7 @@ def _combine(first: CallMeta | None, second: CallMeta | None) -> CallMeta | None
 def _answer_plain(
     node: str,
     llm: BaseLLM,
-    rendered: str,
+    rendered: Prompt,
     form: AnswerForm,
     count_tokens: Callable[[str], float],
     meter: VisitMeter,
@@ -290,18 +319,40 @@ def _answer_plain(
     either raises :class:`~xmas.errors.BadFormat` with both problems.
     """
     response, meta = _call(llm, rendered, meter)
-    usage = _usage(count_tokens, rendered, response)
+    usage = _usage(count_tokens, _text(rendered), response)
     try:
         return response, form.parse(response), (), usage, meta
     except FormError as first:
-        retry = f"{rendered}\n\n{RETRY_NOTE.format(problem=first.problem)}"
+        retry = _joined(rendered, f"\n\n{RETRY_NOTE.format(problem=first.problem)}")
         again, again_meta = _call(llm, retry, meter)
-        usage, meta = usage + _usage(count_tokens, retry, again), _combine(meta, again_meta)
+        usage, meta = usage + _usage(count_tokens, _text(retry), again), _combine(meta, again_meta)
         try:
             value = form.parse(again)
         except FormError as second:
             raise BadFormat(node, (first.problem, second.problem), meta) from second
         return again, value, (Rejected(response, first.problem),), usage, meta
+
+
+def _paint(
+    node: str, llm: BaseLLM, prompt: Prompt, vtype: ValueType, meter: VisitMeter
+) -> tuple[str, Any, CallMeta | None]:
+    """Ask for an image answer and keep each picture in the store; return the text, the ref (or refs) and the meta.
+
+    An ``image`` takes exactly one picture, a ``list of image`` at least one;
+    anything else raises :class:`~xmas.errors.BadFormat` with the count.
+    """
+    (text, images), meta = meter.metered(lambda: _images(llm, prompt))
+    wanted = "at least one image" if vtype.item is not None else "one image"
+    if not images or (vtype.item is None and len(images) > 1):
+        raise BadFormat(node, (f"expected {wanted}, got {len(images)}",), meta)
+    refs = [store().put(data, media_type) for data, media_type in images]
+    return text, refs if vtype.item is not None else refs[0], meta
+
+
+def _images(llm: BaseLLM, prompt: Prompt) -> tuple[tuple[str, list[tuple[bytes, str]]], CallMeta]:
+    """Make one image call through ``generate_image_with_meta``, which the check made sure the model has."""
+    text, images, meta = cast("Any", llm).generate_image_with_meta(prompt)
+    return (text, list(images)), meta
 
 
 def _agent_body(
@@ -310,16 +361,24 @@ def _agent_body(
     """Build what an agent does in one visit.
 
     Inputs render by their types (text when ``types`` does not name them, as
-    in version 1). A json agent's prompt ends with its form's format block, and
-    its answer is parsed into the value it writes: a plain agent retries in a
-    second call (:func:`_answer_plain`), an agent with tools in one more turn of
-    its conversation, tools withheld.
+    in version 1). An image or audio read goes to the model as a content part
+    (``render_parts``), and the record shows a marker in its place. A json
+    agent's prompt ends with its form's format block, and its answer is parsed
+    into the value it writes: a plain agent retries in a second call
+    (:func:`_answer_plain`), an agent with tools in one more turn of its
+    conversation, tools withheld. An agent writing an image keeps the model's
+    picture (:func:`_paint`).
     """
-    form = compile_form(agent.schema) if parse_type(agent.output_type) == JSON else None
+    written = parse_type(agent.output_type)
+    form = compile_form(agent.schema) if written == JSON else None
+    paints = media_kind(written) == "image"
     tools = mas.resolve_tools(agent) if agent.tools else None
     batch_error = mas.version != 2
     reads = agent.reads
     reads_run = mas.version == 2 and "run" in reads.values()
+    shown = {placeholder for placeholder, name in reads.items() if media_kind(types.get(name, TEXT)) in SENT}
+    if shown:
+        from xmas.llms.parts import render_parts  # type: ignore[import-not-found, unused-ignore]
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         template = state["prompts"].get(agent.name, agent.prompt)
@@ -328,9 +387,15 @@ def _agent_body(
             placeholder: render_value(values.get(name), types.get(name, TEXT), present=name in values)
             for placeholder, name in reads.items()
         }
-        rendered = safe_format(template, inputs)
+        prompt: Prompt
+        if shown:
+            text = {placeholder: line for placeholder, line in inputs.items() if placeholder not in shown}
+            prompt, rendered = render_parts(template, text, {p: values.get(reads[p]) for p in shown})
+        else:
+            prompt = rendered = safe_format(template, inputs)
         if form is not None:
-            rendered = f"{rendered}\n\n{form.format_block()}"
+            block = f"\n\n{form.format_block()}"
+            prompt, rendered = _joined(prompt, block), rendered + block
 
         calls: tuple[ToolCall, ...] = ()
         rejected: tuple[Rejected, ...] = ()
@@ -347,7 +412,7 @@ def _agent_body(
 
             response, calls, usage, meta = run_tool_loop(
                 llm,
-                rendered,
+                prompt,  # type: ignore[arg-type, unused-ignore]
                 tools,
                 mas.max_tool_rounds,
                 DEFAULT_SYS_PROMPT,
@@ -363,10 +428,13 @@ def _agent_body(
                 except FormError as error:
                     raise BadFormat(agent.name, (*(r.error for r in refused), error.problem), meta) from error
         elif form is not None:
-            response, value, rejected, usage, meta = _answer_plain(agent.name, llm, rendered, form, count_tokens, meter)
+            response, value, rejected, usage, meta = _answer_plain(agent.name, llm, prompt, form, count_tokens, meter)
+        elif paints:
+            response, value, meta = _paint(agent.name, llm, prompt, written, meter)
+            usage = _usage(count_tokens, _text(prompt), response)
         else:
-            response, meta = _call(llm, rendered, meter, batch_error=batch_error)
-            value, usage = response, _usage(count_tokens, rendered, response)
+            response, meta = _call(llm, prompt, meter, batch_error=batch_error)
+            value, usage = response, _usage(count_tokens, _text(prompt), response)
 
         record = AgentRecord(
             agent=agent.name,
@@ -374,7 +442,7 @@ def _agent_body(
             prompt=template,
             rendered_prompt=rendered,
             inputs=inputs,
-            outputs={agent.output: render_value(value, TEXT if form is None else JSON)},
+            outputs={agent.output: render_value(value, written if paints else TEXT if form is None else JSON)},
             tool_calls=calls,
             usage=usage,
             model=agent.model,
@@ -431,7 +499,7 @@ def _step_body(mas: MAS, step: Step, types: Mapping[str, ValueType]) -> _NodeBod
 
 def _raw(outputs: dict[str, str], writes: dict[str, Any]) -> str:
     """Return a node's raw response: its one rendered write, or all its writes as one JSON object."""
-    return next(iter(outputs.values())) if len(outputs) == 1 else render_value(writes, JSON)
+    return next(iter(outputs.values())) if len(outputs) == 1 else render_value(plain(writes), JSON)
 
 
 def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
@@ -451,7 +519,7 @@ def _box_body(box: Box, types: Mapping[str, ValueType]) -> _NodeBody:
         run.adopt(inner)
         values = state["values"]
         given = {inside: values[outside] for inside, outside in box.reads.items() if outside in values}
-        query = render_value(given, JSON)
+        query = render_value(plain(given), JSON)
         kept = len(run.records_of(inner))
         try:
             config = _run_config(inner, run, item=_item())
@@ -1035,17 +1103,24 @@ def run_state(
     """Run a MAS on its declared inputs with a given prompt set; a failure is recorded in the trace, not raised.
 
     A version 2 system takes exactly its inputs, each fitting its type; a
-    version 1 system takes text values, ``query`` among them as ``run`` gives
-    it. ``on_event`` is called with each event of the run, on the run's
-    threads. The trace's query is the ``query`` value, else the values as one
-    line of JSON.
+    :class:`~pathlib.Path` given for a media input is referenced where it is
+    (:func:`~xmas.values.coerce_media`), its sha256 checked whenever it is
+    read. A version 1 system takes text values, ``query`` among them as
+    ``run`` gives it. ``on_event`` is called with each event of the run, on the
+    run's threads. The trace's query is the ``query`` value, else the values as
+    one line of JSON.
 
     Raises:
         ValueError: Before any call, listing every input missing, extra or of
             the wrong type.
     """
+    if mas.version == 2:
+        values = {
+            name: coerce_media(value, mas.inputs[name]) if name in mas.inputs else value
+            for name, value in values.items()
+        }
     _check_inputs(mas, values)
-    query = values["query"] if isinstance(values.get("query"), str) else render_value(dict(values), JSON)
+    query = values["query"] if isinstance(values.get("query"), str) else render_value(plain(dict(values)), JSON)
     return _run_all(mas, [dict(values)], [query], [prompts], on_event)[0]
 
 

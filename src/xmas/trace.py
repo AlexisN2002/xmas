@@ -7,7 +7,8 @@ formatted for human reading.
 
 In the plain-data form a record's first ten keys are always emitted, in order,
 and every later key only when its value is set. Enum values are emitted as plain
-strings, so both ``json.dumps`` and ``yaml.safe_dump`` accept the dicts.
+strings, and a media value (a :class:`~xmas.media.Ref`) as its dict, so both
+``json.dumps`` and ``yaml.safe_dump`` accept the dicts.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from xmas.errors import ErrorKind, RunStatus, status_for
+from xmas.values import plain
 
 if TYPE_CHECKING:  # pragma: no cover
     from xmas.health import Health
@@ -312,7 +314,8 @@ class Trace:
         ``query``, ``output``, ``records`` and ``error`` come first. ``"status"`` follows only for a failed run,
         so it is never ``"ok"``, ``"error_kind"`` only when it is known, and
         ``"health"`` only when it reports something, then ``"outputs"``,
-        ``"run_id"`` and ``"graph_id"`` when set. A reader that finds no
+        ``"run_id"`` and ``"graph_id"`` when set; a media output is its
+        ref's dict. A reader that finds no
         ``"status"`` reads ``"ok"`` when ``error`` is null and ``"failed"``
         otherwise.
         """
@@ -329,7 +332,7 @@ class Trace:
         health = None if self.health is None else self.health.to_dict()
         if health:
             data["health"] = health
-        later = {"outputs": self.outputs or None, "run_id": self.run_id, "graph_id": self.graph_id}
+        later = {"outputs": plain(self.outputs) or None, "run_id": self.run_id, "graph_id": self.graph_id}
         data.update((key, value) for key, value in later.items() if value is not None)
         return data
 
