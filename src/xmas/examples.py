@@ -49,17 +49,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.trace import AgentRecord, Trace
 
 VERSION = 1
-"""The examples file format's version."""
-
 FOLDER = "examples"
-"""The bundle folder that holds the examples files."""
-
 MEDIA = "examples/media"
-"""The bundle folder that holds the examples' pictures and other media."""
-
-CHECK_KINDS = ("form", "equals", "contains", "not contains", "matches", "line", "len", "not empty", "exists", "near")
-"""The kinds of check, one per check mapping."""
-
 _FILE_KEYS = ("version", "budget", "examples")
 _CASE_KEYS = ("name", "node", "from", "inputs", "recorded", "must", "expect")
 _BUDGET_KEYS = {"cost_usd": "max_cost_usd", "wall_s": "max_wall_s"}
@@ -424,42 +415,32 @@ def run_checks(checks: Sequence[Check], values: Mapping[str, Any], record: Agent
     failed = []
     for check in checks:
         found, why = _find(values, check.path)
-        problem = _judge(check, found, record) if found is not _MISSING else why
+        problem = _JUDGES[check.kind](found, check, record) if found is not _MISSING else why
         if problem:
             failed.append(f"{check}: {problem}")
     return failed
 
 
-def _judge(check: Check, found: Any, record: AgentRecord | None) -> str | None:
-    """Return why ``found`` fails ``check``, or ``None``."""
-    kind, want = check.kind, check.value
-    if kind == "form":
-        return "no visit to judge" if record is None else record.error
-    if kind == "exists":
-        return "absent" if found is None else None
-    if kind == "not empty":
-        return "empty" if found is None or found in ("", [], {}) else None
-    if kind == "equals":
-        return None if _same(found, want) else f"got {_show(found)}"
-    if kind in ("contains", "not contains"):
-        if isinstance(found, str) and isinstance(want, str):
-            held = want in found
-        elif isinstance(found, list):
-            held = any(_same(item, want) for item in found)
-        else:
-            return f"got {_show(found)}, not a text or a list"
-        return None if held == (kind == "contains") else f"got {_show(found)}"
-    if kind == "len":
-        if not isinstance(found, str | list | Mapping):
-            return f"got {_show(found)}, which has no length"
-        return None if len(found) == want else f"has length {len(found)}"
-    if not isinstance(found, str) and kind in ("matches", "line"):
+def _contains(found: Any, want: Any, wanted: bool) -> str | None:
+    if isinstance(found, str) and isinstance(want, str):
+        held = want in found
+    elif isinstance(found, list):
+        held = any(_same(item, want) for item in found)
+    else:
+        return f"got {_show(found)}, not a text or a list"
+    return None if held == wanted else f"got {_show(found)}"
+
+
+def _length(found: Any, want: int) -> str | None:
+    if not isinstance(found, str | list | Mapping):
+        return f"got {_show(found)}, which has no length"
+    return None if len(found) == want else f"has length {len(found)}"
+
+
+def _in_text(found: Any, held: Callable[[str], bool], miss: str = "got") -> str | None:
+    if not isinstance(found, str):
         return f"got {_show(found)}, not a text"
-    if kind == "matches":
-        return None if re.search(want, found, re.M) else f"got {_show(found)}"
-    if kind == "line":
-        return None if want in found.splitlines() else f"no such line in {_show(found)}"
-    return _near(found, want, float(check.within or 0))
+    return None if held(found) else f"{miss} {_show(found)}"
 
 
 def _near(found: Any, want: Any, within: float) -> str | None:
@@ -474,6 +455,24 @@ def _near(found: Any, want: Any, within: float) -> str | None:
     else:
         return f"got {_show(found)}, not a text"
     return None if off <= within else f"got {_show(found)}, off by {off:.3g}"
+
+
+_JUDGES: dict[str, Callable[[Any, Check, AgentRecord | None], str | None]] = {
+    "form": lambda _found, _check, record: "no visit to judge" if record is None else record.error,
+    "equals": lambda found, check, _record: None if _same(found, check.value) else f"got {_show(found)}",
+    "contains": lambda found, check, _record: _contains(found, check.value, True),
+    "not contains": lambda found, check, _record: _contains(found, check.value, False),
+    "matches": lambda found, check, _record: _in_text(found, lambda text: bool(re.search(check.value, text, re.M))),
+    "line": lambda found, check, _record: _in_text(
+        found, lambda text: check.value in text.splitlines(), "no such line in"
+    ),
+    "len": lambda found, check, _record: _length(found, check.value),
+    "not empty": lambda found, _check, _record: "empty" if found is None or found in ("", [], {}) else None,
+    "exists": lambda found, _check, _record: "absent" if found is None else None,
+    "near": lambda found, check, _record: _near(found, check.value, float(check.within or 0)),
+}
+CHECK_KINDS = tuple(_JUDGES)
+"""The kinds of check, one per check mapping."""
 
 
 def _parse_rendered(text: str, vtype: ValueType) -> Any:
