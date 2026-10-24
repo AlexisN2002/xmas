@@ -8,12 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from promptolution.optimizers.base_optimizer import BaseOptimizer
-from promptolution.utils.prompt import Prompt
 
 from xmas.mas import MAS
 from xmas.optimization.attribution import Attributor
 from xmas.optimization.broker import Board, ProxyTask, Request, rounds
-from xmas.optimization.optimizer import MASOptimizer, traces_by_position
+from xmas.optimization.optimizer import MASOptimizer
 from xmas.optimization.updaters import AgentPromptView, movable_agents
 from xmas.prompts import encode_prompts
 from xmas.tasks.base import MASTask
@@ -65,7 +64,7 @@ class CantanteOptimizer(MASOptimizer):
         Args:
             mas: The starting system.
             task: The task to optimize against.
-            attributor: Credit assignment. Required here, unlike on the base
+            attributor: Credit assignment, required here, unlike on the base
                 class: without it every agent would see the same score and the
                 inner optimizers would be optimizing noise.
             optimizer_cls: The promptolution optimizer to run per agent, for
@@ -88,13 +87,10 @@ class CantanteOptimizer(MASOptimizer):
     def propose(self) -> list[MAS]:
         """Run one round of every agent's optimizer and return what they settled on.
 
-        A frozen agent gets no optimizer and keeps its prompt.
-
-        Returns:
-            The incumbent and the system built from each agent's best prompt. Both
-            are returned so that the base class measures the proposal against the
-            incumbent on the real task, rather than trusting attributed credit to
-            have been right.
+        A frozen agent gets no optimizer and keeps its prompt. The incumbent
+        comes back with the system built from each agent's best prompt, so the
+        proposal is measured against it on the real task rather than trusting
+        attributed credit to have been right.
 
         Raises:
             ValueError: If every agent is frozen.
@@ -122,18 +118,6 @@ class CantanteOptimizer(MASOptimizer):
             return [self.mas]
         return [self.mas, self.mas.copy(prompts=best)]
 
-    def select(self, candidates: list[MAS], scores: list[float]) -> MAS:
-        """Keep the highest-scoring candidate, preferring the incumbent on a tie.
-
-        Args:
-            candidates: The evaluated systems, incumbent first.
-            scores: Their scores, aligned to ``candidates``.
-
-        Returns:
-            The chosen system.
-        """
-        return candidates[scores.index(max(scores))]
-
     def serve(self, batch: dict[str, Request]) -> None:
         """Answer one round of pending requests with attributed credit."""
         sets = self.joint_sets(batch)
@@ -149,16 +133,9 @@ class CantanteOptimizer(MASOptimizer):
         """Combine each agent's candidates into whole prompt sets to evaluate.
 
         The pairing is positional and wraps: agent A's prompt ``k`` meets agent
-        B's prompt ``k``, and the shorter list repeats. That is the seed's naive
-        selector, and its property that matters is that agent A's prompt ``k``
-        always lands in set ``k``, which is what lets credit be handed back
-        without a lookup table.
-
-        Args:
-            batch: Pending requests by agent.
-
-        Returns:
-            One prompt set per evaluation, keyed by agent name.
+        B's prompt ``k``, and the shorter list repeats, so agent A's prompt ``k``
+        always lands in set ``k``, which lets credit be handed back without a
+        lookup table.
         """
         current = self.mas.prompts()
         varying = {agent: request.prompts for agent, request in batch.items() if request.prompts}
@@ -172,25 +149,11 @@ class CantanteOptimizer(MASOptimizer):
         ]
 
     def measure(self, sets: list[dict[str, str]]) -> tuple[list[list[float]], dict[tuple[int, int], Trace]]:
-        """Evaluate whole prompt sets on the real task and recover their traces.
+        """Evaluate whole prompt sets on the real task: per-set, per-datapoint scores, and the traces by that cell.
 
-        Traces come back only for the rollouts the task actually ran; a pair it
-        answered from its cache has no trace this round. Rather than assume the
-        two line up, the cache is snapshotted first and the misses recomputed, so
-        every trace is attached to the exact prompt set and datapoint it came
-        from.
-
-        Args:
-            sets: The prompt sets to evaluate.
-
-        Returns:
-            Per-set, per-datapoint scores, and the traces keyed by that position.
+        A pair the task answered from its cache has no trace this round.
         """
-        encoded = [encode_prompts(prompt_set) for prompt_set in sets]
-        cached = set(self.task.eval_cache)
-        result = self.task.evaluate([Prompt(text) for text in encoded], predictor=self.mas, eval_strategy="full")
-
-        traces = traces_by_position(self.task, self.mas, encoded, cached)
+        result, traces = self.run_task(self.mas, [encode_prompts(prompt_set) for prompt_set in sets], full=True)
         return [[float(value) for value in row] for row in result.scores.tolist()], traces
 
     def split_credit(
@@ -205,15 +168,7 @@ class CantanteOptimizer(MASOptimizer):
         that rollout, because the inner optimizer needs a number to rank on: the
         verdict a uniform attributor would have given. That is a measurement
         rather than an invention, and :attr:`unattributed` counts it so a run
-        that leaned on it is visible.
-
-        Args:
-            sets: The evaluated prompt sets.
-            rewards: Per-set, per-datapoint task scores.
-            traces: Traces by ``(set, datapoint)``.
-
-        Returns:
-            Per-set, per-datapoint credit for each agent.
+        that leaned on it is visible. Returns per-set, per-datapoint credit for each agent.
         """
         width = len(rewards[0]) if rewards else 0
         names = sorted(movable_agents(self.mas))
