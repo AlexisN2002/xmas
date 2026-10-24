@@ -337,7 +337,9 @@ or an unrouted `money` gets a failed record and `None` in every gathered list,
 and the run goes on; those three end the run. A `while` edge inside a chain
 loops per item, and its cap counts per item; a `while` edge into the head
 counts passes of the whole chain. `Budget(max_parallel_calls=n)` caps the model
-calls in flight across branches, boxes and items.
+calls in flight across branches, boxes and items. Each graph run has a pool of up
+to `xmas.runtime.BRANCH_THREADS` (64) threads, whatever the host's cores, so the
+branches and `at once` items of a run truly run together on a small machine too.
 
 **`MAS.run_state(values, on_event=None)`** runs a version 2 system on all of
 its inputs by name (a version 1 system on text values, `query` among them). A
