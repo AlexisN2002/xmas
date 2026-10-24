@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from xmas.errors import BudgetExceeded, EmptyResponse, RaceLost, Stopped
 from xmas.trace import AgentRecord, Event, Trace
@@ -128,36 +128,7 @@ class Budget:
             raise ValueError(f"Budget.max_parallel_calls must be an integer >= 1, got {cap!r}")
 
 
-class _Counts(Protocol):
-    def slot(self) -> AbstractContextManager[Any]: ...
-    def before_call(self) -> None: ...
-    def after_call(self, meta: CallMeta | None) -> None: ...
-    def flag(self) -> CancelFlag: ...
-
-
-class _Metering:
-    def metered[T](self: _Counts, call: Callable[[], tuple[T, CallMeta | None]]) -> tuple[T, CallMeta | None]:
-        """Make one model call on this meter: in a free slot, refused at a limit, counted when it ends.
-
-        ``call`` returns its result and the call's metadata, and sees the
-        call's :func:`cancel_flag`. An empty answer and a cut call raise, but
-        what they used is counted first.
-        """
-        with self.slot():
-            self.before_call()
-            token = _cancel.set(self.flag())
-            try:
-                result, meta = call()
-            except (EmptyResponse, Stopped) as error:
-                self.after_call(error.meta)
-                raise
-            finally:
-                _cancel.reset(token)
-            self.after_call(meta)
-            return result, meta
-
-
-class RunMeter(_Metering):
+class RunMeter:
     """What one run has used so far, checked against its budget before each call.
 
     The counters and the record list are shared by the run's parallel branches,
@@ -378,6 +349,32 @@ class RunMeter(_Metering):
             else:
                 self.cost_usd += cost
 
+    def metered[T](
+        self, call: Callable[[], tuple[T, CallMeta | None]], metas: list[CallMeta | None] | None = None
+    ) -> tuple[T, CallMeta | None]:
+        """Make one model call on this meter: in a free slot, refused at a limit, counted when it ends.
+
+        ``call`` returns its result and the call's metadata, and sees the
+        call's :func:`cancel_flag`. An empty answer and a cut call raise, but
+        what they used is counted first. ``metas`` collects the metadata of
+        each finished call.
+        """
+        kept = [] if metas is None else metas
+        with self.slot():
+            self.before_call()
+            token = _cancel.set(self.flag())
+            try:
+                result, meta = call()
+            except (EmptyResponse, Stopped) as error:
+                self.after_call(error.meta)
+                kept.append(error.meta)
+                raise
+            finally:
+                _cancel.reset(token)
+            self.after_call(meta)
+            kept.append(meta)
+            return result, meta
+
     def keep(self, record: AgentRecord, system: object | None = None) -> None:
         """Keep a finished visit's record, so a failed run still has it; ``system`` names an adopted system."""
         with self._lock:
@@ -436,7 +433,7 @@ class RunMeter(_Metering):
                 )
 
 
-class VisitMeter(_Metering):
+class VisitMeter:
     """One node visit's share of a run's meter.
 
     Every call counts on the run's meter; the visit also keeps the metadata of
@@ -451,26 +448,9 @@ class VisitMeter(_Metering):
         self.metas: list[CallMeta | None] = []
         self.inner: Trace | None = None
 
-    def slot(self) -> AbstractContextManager[Any]:
-        """Hold a slot of the run's parallel call cap."""
-        return self.run.slot()
-
-    def flag(self) -> CancelFlag:
-        """Return the run's cancel flag for a call starting now."""
-        return self.run.flag()
-
-    def before_call(self) -> None:
-        """Count a call that is about to start on the run's meter, or refuse it."""
-        self.run.before_call()
-
-    def check_boundary(self) -> None:
-        """Check the run's wall and cost limits."""
-        self.run.check_boundary()
-
-    def after_call(self, meta: CallMeta | None) -> None:
-        """Count a finished call on the run's meter and keep its metadata for the visit."""
-        self.run.after_call(meta)
-        self.metas.append(meta)
+    def metered[T](self, call: Callable[[], tuple[T, CallMeta | None]]) -> tuple[T, CallMeta | None]:
+        """Make one model call on the run's meter and keep its metadata for the visit."""
+        return self.run.metered(call, self.metas)
 
     @property
     def meta(self) -> CallMeta | None:

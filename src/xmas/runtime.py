@@ -625,7 +625,7 @@ def _step_body(mas: MAS, step: Step, types: Mapping[str, ValueType]) -> _NodeBod
     reads_run = "run" in read_map.values()
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
-        meter.check_boundary()
+        meter.run.check_boundary()
         values = {**state["values"], "run": _run_value(meter.run, mas)} if reads_run else state["values"]
         arguments: dict[str, Any] = {}
         inputs: dict[str, str] = {}
