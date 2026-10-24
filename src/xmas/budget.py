@@ -5,6 +5,11 @@ spec. Each run gets its own :class:`RunMeter`, which counts the run's calls, cos
 and wall time and refuses a call before it starts once a limit is reached. The
 meter also holds the run's caps on calls and items in flight, and passes the
 run's events to a listener.
+
+A run is stopped through its meter (:meth:`RunMeter.stop`, found by run id in
+:data:`RUNNING`): no call, step or item starts after that, waits for a free slot
+end, and a call in flight sees the stop on its :func:`cancel_flag` and is cut.
+The same flag cuts the calls of a ``first of`` contestant once another one won.
 """
 
 from __future__ import annotations
@@ -13,16 +18,86 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+import weakref
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from xmas.errors import BudgetExceeded, EmptyResponse
+from xmas.errors import BudgetExceeded, EmptyResponse, RaceLost, Stopped
 from xmas.trace import AgentRecord, Event, Trace
 
 if TYPE_CHECKING:
     from xmas.llms.meta import CallMeta
+
+
+SLICE_S = 0.05
+"""How often a wait for a slot, a place or a model's answer checks the cancel flag, in seconds."""
+
+RUNNING: weakref.WeakValueDictionary[str, RunMeter] = weakref.WeakValueDictionary()
+"""The meters of this process's runs by run id, from the meter's making until :meth:`RunMeter.close`."""
+
+_running_lock = threading.Lock()
+_cancel: ContextVar[CancelFlag | None] = ContextVar("xmas_cancel_flag", default=None)
+_race: ContextVar[threading.Event | None] = ContextVar("xmas_race", default=None)
+
+
+def cancel_flag() -> CancelFlag | None:
+    """Return the flag of the model call in flight on this thread, or ``None`` outside a metered call.
+
+    A model wrapper polls it, or waits on it, and ends its call once it is set,
+    raising what :meth:`CancelFlag.check` raises.
+    """
+    return _cancel.get()
+
+
+@contextmanager
+def contestant(race: threading.Event) -> Iterator[None]:
+    """Run the block as a ``first of`` contestant of ``race`` (:meth:`RunMeter.race`): its calls end once it is set."""
+    token = _race.set(race)
+    try:
+        yield
+    finally:
+        _race.reset(token)
+
+
+class CancelFlag:
+    """Whether a call in flight should end: its run was stopped, or its race was won by another contestant."""
+
+    def __init__(self, meter: RunMeter, race: threading.Event | None = None) -> None:
+        """Watch ``meter``'s stop, and ``race`` when the call is a contestant's."""
+        self._meter = meter
+        self._event = meter.halted if race is None else race  # stopping a run sets its races too
+
+    @property
+    def reason(self) -> str | None:
+        """``"stopped"`` once the run is stopped, ``"lost"`` once another contestant won, else ``None``."""
+        if self._meter.stopped is not None:
+            return "stopped"
+        return "lost" if self._event.is_set() else None
+
+    def is_set(self) -> bool:
+        """Whether the call should end."""
+        return self.reason is not None
+
+    def wait(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for the flag, and return whether it is set."""
+        self._event.wait(timeout)
+        return self.is_set()
+
+    def check(self, meta: CallMeta | None = None, text: str = "") -> None:
+        """Raise once the flag is set, with what the cut call used and the answer it received so far.
+
+        Raises:
+            Stopped: With the run's stop reason, once the run is stopped.
+            RaceLost: Once another contestant of the call's race won.
+        """
+        reason = self.reason
+        if reason == "stopped":
+            raise Stopped(str(self._meter.stopped), meta, text)
+        if reason == "lost":
+            raise RaceLost("another contestant finished first", meta, text)
 
 
 @dataclass(frozen=True)
@@ -57,22 +132,27 @@ class _Counts(Protocol):
     def slot(self) -> AbstractContextManager[Any]: ...
     def before_call(self) -> None: ...
     def after_call(self, meta: CallMeta | None) -> None: ...
+    def flag(self) -> CancelFlag: ...
 
 
 class _Metering:
     def metered[T](self: _Counts, call: Callable[[], tuple[T, CallMeta | None]]) -> tuple[T, CallMeta | None]:
         """Make one model call on this meter: in a free slot, refused at a limit, counted when it ends.
 
-        ``call`` returns its result and the call's metadata. An empty answer
-        raises, but its paid attempts are counted first.
+        ``call`` returns its result and the call's metadata, and sees the
+        call's :func:`cancel_flag`. An empty answer and a cut call raise, but
+        what they used is counted first.
         """
         with self.slot():
             self.before_call()
+            token = _cancel.set(self.flag())
             try:
                 result, meta = call()
-            except EmptyResponse as error:
+            except (EmptyResponse, Stopped) as error:
                 self.after_call(error.meta)
                 raise
+            finally:
+                _cancel.reset(token)
             self.after_call(meta)
             return result, meta
 
@@ -95,9 +175,12 @@ class RunMeter(_Metering):
         uncosted_calls: Finished calls whose cost is unknown.
         records: Records of the owner's finished visits, in wall-clock order;
             an adopted system's are kept apart (:meth:`records_of`).
-        run_id: A new random id for the run.
+        run_id: The run's id, given by the host or a new random one; the
+            meter is in :data:`RUNNING` under it until :meth:`close`.
         graph_id: The ``describe()`` id of the owner, when the run was given it.
         listener: Called with each of the run's events (:meth:`emit`), or ``None``.
+        stopped: Why the run was stopped (:meth:`stop`), or ``None``.
+        halted: Set when the run is stopped.
     """
 
     def __init__(
@@ -107,11 +190,16 @@ class RunMeter(_Metering):
         *,
         listener: Callable[[Event], None] | None = None,
         graph_id: str | None = None,
+        run_id: str | None = None,
     ) -> None:
-        """Start the clock with every counter at zero."""
+        """Start the clock with every counter at zero, and register the meter under its run id.
+
+        Raises:
+            ValueError: If ``run_id`` is the id of a run still in :data:`RUNNING`.
+        """
         self.budget = budget
         self.owner = owner
-        self.run_id = uuid.uuid4().hex
+        self.run_id = uuid.uuid4().hex if run_id is None else run_id
         self.graph_id = graph_id
         self.listener = listener
         self.started_s = time.monotonic()
@@ -125,6 +213,81 @@ class RunMeter(_Metering):
         cap = None if budget is None else budget.max_parallel_calls
         self._slots = None if cap is None else threading.BoundedSemaphore(cap)
         self._gates: dict[str, threading.BoundedSemaphore] = {}
+        self.stopped: str | None = None
+        self.halted = threading.Event()
+        self._races: dict[str, threading.Event] = {}
+        self._winners: dict[str, str] = {}
+        with _running_lock:
+            if self.run_id in RUNNING:
+                raise ValueError(f"Run id {self.run_id!r} is in use by a running run.")
+            RUNNING[self.run_id] = self
+
+    def close(self) -> None:
+        """Take the meter out of :data:`RUNNING` once its run ended or paused; a second call does nothing."""
+        with _running_lock:
+            if RUNNING.get(self.run_id) is self:
+                del RUNNING[self.run_id]
+
+    def stop(self, reason: str = "stopped") -> None:
+        """Stop the run: emit one ``stop`` event, cut its calls in flight, and start nothing more.
+
+        Every later :meth:`before_call`, :meth:`check_boundary`, :meth:`slot`
+        and :meth:`gate` raises :class:`~xmas.errors.Stopped` with ``reason``,
+        waits included. A second stop does nothing.
+        """
+        with self._lock:
+            if self.stopped is not None:
+                return
+            self.stopped = reason
+            races = list(self._races.values())
+        self.halted.set()
+        for race in races:
+            race.set()
+        self.emit("stop", "", reason=reason)
+
+    def race(self, key: str) -> threading.Event:
+        """Return the flag of the ``first of`` race ``key``, set once a contestant wins or the run stops."""
+        with self._lock:
+            race = self._races.setdefault(key, threading.Event())
+            if self.stopped is not None:
+                race.set()
+            return race
+
+    def win(self, key: str, node: str) -> bool:
+        """Claim the race ``key`` for ``node``; only the first claim wins, and it sets the race's flag."""
+        with self._lock:
+            if key in self._winners:
+                return False
+            self._winners[key] = node
+            self._races.setdefault(key, threading.Event()).set()
+            return True
+
+    def flag(self) -> CancelFlag:
+        """Return the cancel flag of a call starting now: the run's stop, and the race of the running contestant."""
+        return CancelFlag(self, _race.get())
+
+    def totals(self) -> dict[str, Any]:
+        """Return what the run used so far: ``calls``, ``cost_usd``, ``uncosted_calls`` and ``active_s``."""
+        with self._lock:
+            return {
+                "calls": self.calls,
+                "cost_usd": self.cost_usd,
+                "uncosted_calls": self.uncosted_calls,
+                "active_s": self.elapsed_s,
+            }
+
+    def seed(self, totals: Mapping[str, Any]) -> None:
+        """Continue from :meth:`totals` of an earlier meter of the run, such as one that paused.
+
+        The counts carry over, and the wall clock counts on from ``active_s``,
+        so a wall limit measures active time, not the wait between the two.
+        """
+        with self._lock:
+            self.calls = int(totals["calls"])
+            self.cost_usd = float(totals["cost_usd"])
+            self.uncosted_calls = int(totals["uncosted_calls"])
+            self.started_s = time.monotonic() - float(totals["active_s"])
+            self._started = True
 
     def adopt(self, system: object, into: object | None = None) -> None:
         """Let a nested system, such as a box's, run on this meter: one budget for both.
@@ -167,16 +330,20 @@ class RunMeter(_Metering):
     def before_call(self) -> None:
         """Count a call that is about to start, or refuse it with :class:`~xmas.errors.BudgetExceeded`.
 
-        The limits are checked in order: calls, wall time, a cost limit with a
-        call of unknown cost (``"cost_unknown"``), cost.
+        A stopped run, or a contestant whose race was won, refuses it first
+        (:meth:`CancelFlag.check`); then the limits are checked in order:
+        calls, wall time, a cost limit with a call of unknown cost
+        (``"cost_unknown"``), cost.
         """
         with self._lock:
+            self.flag().check()
             self._check(count_calls=True)
             self.calls += 1
 
     def check_boundary(self) -> None:
-        """Check the wall and cost limits before work that makes no model call, such as a step; nothing is counted."""
+        """Check the stop and the wall and cost limits before work that makes no model call, such as a step."""
         with self._lock:
+            self.flag().check()
             self._check(count_calls=False)
 
     def _check(self, *, count_calls: bool) -> None:
@@ -210,18 +377,34 @@ class RunMeter(_Metering):
             self.records_of(self.owner if system is None else system).append(record)
 
     def slot(self) -> AbstractContextManager[Any]:
-        """Hold one of the run's ``max_parallel_calls`` slots for a model call; no cap holds nothing."""
-        return nullcontext() if self._slots is None else self._slots
+        """Hold one of the run's ``max_parallel_calls`` slots for a model call; no cap holds nothing.
+
+        A wait for a slot ends with :meth:`CancelFlag.check`'s error once the flag is set.
+        """
+        return nullcontext() if self._slots is None else self._held(self._slots)
 
     def gate(self, key: str, limit: int | None) -> AbstractContextManager[Any]:
         """Hold one of ``limit`` places under ``key``, such as a chain's items at once; ``None`` holds nothing.
 
-        The first ``limit`` given for a key holds for the run.
+        The first ``limit`` given for a key holds for the run. A wait ends as a wait for a slot does.
         """
         if limit is None:
             return nullcontext()
         with self._lock:
-            return self._gates.setdefault(key, threading.BoundedSemaphore(limit))
+            places = self._gates.setdefault(key, threading.BoundedSemaphore(limit))
+        return self._held(places)
+
+    @contextmanager
+    def _held(self, places: threading.BoundedSemaphore) -> Iterator[None]:
+        """Hold one of ``places``, checking the cancel flag after each wait of :data:`SLICE_S` and once held."""
+        flag = self.flag()
+        while not places.acquire(timeout=SLICE_S):
+            flag.check()
+        try:
+            flag.check()
+            yield
+        finally:
+            places.release()
 
     def emit(self, kind: str, node: str, **fields: Any) -> None:
         """Pass an event to the listener, which is called on the run's threads.
@@ -264,6 +447,10 @@ class VisitMeter(_Metering):
     def slot(self) -> AbstractContextManager[Any]:
         """Hold a slot of the run's parallel call cap."""
         return self.run.slot()
+
+    def flag(self) -> CancelFlag:
+        """Return the run's cancel flag for a call starting now."""
+        return self.run.flag()
 
     def before_call(self) -> None:
         """Count a call that is about to start on the run's meter, or refuse it."""

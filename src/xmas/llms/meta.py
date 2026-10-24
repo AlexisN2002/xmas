@@ -207,6 +207,19 @@ def meta_from_completion(completion: ChatCompletion, latency_s: float, price: To
     )
 
 
+def cut_meta(
+    latency_s: float, tokens: TokenUsage | None, served_model: str | None, price: TokenPrice | None
+) -> CallMeta:
+    """Return the meta of a call cut before it finished.
+
+    ``tokens`` are an estimate, what was sent and the text received so far,
+    or ``None`` when not known; the cost is theirs at ``price``, else unknown.
+    A cut call has no finish reason.
+    """
+    cost = None if tokens is None or price is None else price.cost_usd(tokens)
+    return CallMeta(latency_s=latency_s, tokens=tokens, cost_usd=cost, served_model=served_model)
+
+
 def _tokens(usage: CompletionUsage) -> TokenUsage | None:
     """Return the provider's counts, with cache reads and reasoning when it sent them.
 
