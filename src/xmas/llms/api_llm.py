@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import os
+import re
 import time
 from collections.abc import Callable, Coroutine, Sequence
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -12,13 +15,14 @@ from typing import Any
 
 import httpx
 import openai
-from openai.types.chat import ChatCompletion
+from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from promptolution.llms import api_llm as promptolution
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 
 from xmas.errors import MONEY_WORDS, EmptyResponse, XmasError
 from xmas.llms.call_log import CallLog, CallRecord
 from xmas.llms.meta import CallMeta, TokenPrice, meta_from_completion
+from xmas.llms.parts import Part, has_media, record_text, to_content
 from xmas.llms.scoring import ScoredSequence
 from xmas.tools import Tool, ToolCallRequest, _turn_usage
 from xmas.trace import TokenUsage
@@ -29,6 +33,11 @@ from xmas.utils import approximate_tokens, error_message, retry_after_seconds, t
 # prompt of a batch runs as its own task). Delete it, _Completion and the two hook
 # overrides once promptolution returns the completion.
 _completion_id: ContextVar[list[str | None] | None] = ContextVar("xmas_completion_id", default=None)
+
+_IMAGE_MODALITIES = ("image", "text")
+"""What an image request asks for: OpenRouter's ``modalities``, images first."""
+
+_DATA_URI = re.compile(r"data:([^;,]+);base64,(.*)", re.DOTALL)
 
 
 class _Completion(str):
@@ -50,8 +59,10 @@ class APILLM(promptolution.APILLM):
     timed and logged. :meth:`generate_with_meta` sends the same request through
     ``_ainvoke_once`` and keeps what the provider reported (tokens, cost, finish
     reason, served model) as a :class:`~xmas.llms.meta.CallMeta`;
-    :meth:`get_tool_response_meta` does the same for a tool turn. Both send a
-    permanent client error once (see :meth:`tool_turn_once`) and ask an empty
+    :meth:`get_tool_response_meta` does the same for a tool turn,
+    :meth:`generate_parts_with_meta` for a prompt with pictures or sound in it,
+    and :meth:`generate_image_with_meta` for an answer with images. Each sends a
+    permanent client error once (see :meth:`tool_turn_once`) and asks an empty
     answer again with promptolution's attempt count and backoff, unless the model
     was cut or refused; every paid attempt is summed into the meta.
 
@@ -59,6 +70,10 @@ class APILLM(promptolution.APILLM):
         full_response: Whether the engine reads this model through
             :meth:`generate_with_meta` and :meth:`get_tool_response_meta`.
         price: The price used for a call whose response reports no cost.
+        accepts: The kinds the model reads, as stated: ``"text"``, and
+            ``"image"`` or ``"audio"`` for a model that sees or hears.
+        produces: The kinds the model answers with, as stated: ``"text"``, and
+            ``"image"`` for a model that draws.
     """
 
     def __init__(
@@ -70,6 +85,8 @@ class APILLM(promptolution.APILLM):
         backend_tag: str = "gateway",
         full_response: bool | None = None,
         price: TokenPrice | None = None,
+        accepts: Sequence[str] = ("text",),
+        produces: Sequence[str] = ("text",),
         **kwargs: Any,
     ) -> None:
         """Initialize the model.
@@ -87,6 +104,9 @@ class APILLM(promptolution.APILLM):
                 ``get_tool_response``, so a subclass keeps the path it hooked.
             price: USD per million tokens, used only when a response reports
                 no cost. ``None`` leaves such a cost unknown.
+            accepts: The kinds the model reads; a MAS sends media only to a
+                model that accepts their kind.
+            produces: The kinds the model answers with.
             **kwargs: Forwarded to promptolution's ``APILLM``.
 
         Raises:
@@ -101,6 +121,8 @@ class APILLM(promptolution.APILLM):
         self.backend_tag = backend_tag
         self.full_response: bool = not _overrides_call_path(type(self)) if full_response is None else full_response
         self.price = price
+        self.accepts = tuple(accepts)
+        self.produces = tuple(produces)
         api_key = api_key or os.environ.get("XMAS_API_KEY")
         super().__init__(model_id=model, api_url=base_url.rstrip("/"), api_key=api_key, **kwargs)
 
@@ -131,13 +153,13 @@ class APILLM(promptolution.APILLM):
     ) -> TokenUsage:
         """Record an answered ``generate`` call with the provider's token counts, else ``estimate``; return them."""
         tokens = estimate if meta.tokens is None else meta.tokens
+        fields.setdefault("params", self.call_params())
         self._log(
             "generate",
             started,
             started_at,
             input_tokens=tokens.input_tokens,
             output_tokens=tokens.output_tokens,
-            params=self.call_params(),
             **fields,
         )
         return tokens
@@ -305,31 +327,112 @@ class APILLM(promptolution.APILLM):
                 refused; otherwise after the last attempt.
             TimeoutError: If the call outlives ``gather_timeout_s + 5``.
         """
-        started_at = timestamp()
-        started = time.perf_counter()
-        try:
-            completion, meta = self._ask(
-                lambda: self._retrying(lambda: self._ainvoke_once(prompt, system_prompt)), "model call"
-            )
-        except Exception as error:
-            fields = self._provenance(prompt, system_prompt, None, None)
-            self._log("generate", started, started_at, error=error, params=self.call_params(), **fields)
-            raise
-        text = completion.choices[0].message.content or ""
-        self.update_token_count([prompt, system_prompt], [text])
-        estimate = TokenUsage(approximate_tokens(prompt) + approximate_tokens(system_prompt), approximate_tokens(text))
-        self._log_answer(
-            started, started_at, meta, estimate, **self._provenance(prompt, system_prompt, [text], [completion.id])
+        _, text, meta = self._generate(
+            lambda: self._retrying(lambda: self._ainvoke_once(prompt, system_prompt)), prompt, system_prompt
         )
         return text, meta
 
+    def generate_parts_with_meta(
+        self, parts: Sequence[Part], system_prompt: str = DEFAULT_SYS_PROMPT
+    ) -> tuple[str, CallMeta]:
+        """Answer a prompt of text and media parts, as :meth:`generate_with_meta` answers text.
+
+        The request has the same keys (``model``, ``messages``, ``max_tokens``,
+        then ``call_kwargs``); the user content is the parts'
+        :func:`~xmas.llms.parts.to_content`, or the plain string when no part is
+        media. The record's prompt shows a marker per ref, never its bytes.
+
+        Raises:
+            ValueError: If a part cannot be sent (see :func:`~xmas.llms.parts.to_content`).
+            EmptyResponse: As :meth:`generate_with_meta`.
+            TimeoutError: As :meth:`generate_with_meta`.
+        """
+        request = self._request(parts, system_prompt)
+        _, text, meta = self._generate(lambda: self.tool_turn_once(request), parts, system_prompt)
+        return text, meta
+
+    def generate_image_with_meta(
+        self, prompt: str | Sequence[Part], system_prompt: str = DEFAULT_SYS_PROMPT
+    ) -> tuple[str, list[tuple[bytes, str]], CallMeta]:
+        """Ask for an answer with images, and keep its metadata.
+
+        The request adds ``"modalities": ["image", "text"]`` after
+        ``max_tokens`` (``call_kwargs`` still override it). The images are read
+        from the message's ``images`` list of ``data:`` URIs, as OpenRouter
+        sends them; images without text are an answer, not an empty one.
+
+        Returns:
+            The answer's text (``""`` when it has none), each image as
+            ``(bytes, media type)`` in order, and the call's metadata.
+
+        Raises:
+            XmasError: If an image is not a base64 ``data:`` URI.
+            ValueError: If a part cannot be sent (see :func:`~xmas.llms.parts.to_content`).
+            EmptyResponse: If the answer has neither text nor images, as :meth:`generate_with_meta`.
+            TimeoutError: As :meth:`generate_with_meta`.
+        """
+        request = self._request(prompt, system_prompt, modalities=list(_IMAGE_MODALITIES))
+        params = self.call_params()
+        params.setdefault("modalities", list(_IMAGE_MODALITIES))
+        completion, text, meta = self._generate(
+            lambda: self.tool_turn_once(request), prompt, system_prompt, images=True, params=params
+        )
+        return text, [_decode_image(url) for url in _image_urls(completion.choices[0].message)], meta
+
+    def _request(self, prompt: str | Sequence[Part], system_prompt: str, **extra: Any) -> dict[str, Any]:
+        """Return promptolution's request for ``prompt``, with ``extra`` keys before ``call_kwargs``."""
+        content: str | list[dict[str, Any]]
+        if isinstance(prompt, str) or not has_media(prompt):
+            content = prompt if isinstance(prompt, str) else record_text(prompt)
+        else:
+            content = to_content(prompt)
+        messages = [{"role": "system", "content": str(system_prompt)}, {"role": "user", "content": content}]
+        request: dict[str, Any] = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
+        request.update(extra)
+        request.update(self._call_kwargs)
+        return request
+
+    def _generate(
+        self,
+        send: Callable[[], Coroutine[Any, Any, ChatCompletion]],
+        prompt: str | Sequence[Part],
+        system_prompt: str,
+        *,
+        images: bool = False,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[ChatCompletion, str, CallMeta]:
+        """Send one generation, record it, and move the token counters by its text parts."""
+        shown = prompt if isinstance(prompt, str) else record_text(prompt)
+        counted = prompt if isinstance(prompt, str) else "".join(part for part in prompt if isinstance(part, str))
+        logged = {"params": self.call_params() if params is None else params}
+        started_at = timestamp()
+        started = time.perf_counter()
+        try:
+            completion, meta = self._ask(send, "model call", images=images)
+        except Exception as error:
+            fields = self._provenance(shown, system_prompt, None, None)
+            self._log("generate", started, started_at, error=error, **logged, **fields)
+            raise
+        text = completion.choices[0].message.content or ""
+        self.update_token_count([counted, system_prompt], [text])
+        estimate = TokenUsage(approximate_tokens(counted) + approximate_tokens(system_prompt), approximate_tokens(text))
+        fields = self._provenance(shown, system_prompt, [text], [completion.id])
+        self._log_answer(started, started_at, meta, estimate, **logged, **fields)
+        return completion, text, meta
+
     def _ask(
-        self, send: Callable[[], Coroutine[Any, Any, ChatCompletion]], what: str, *, tool_turn: bool = False
+        self,
+        send: Callable[[], Coroutine[Any, Any, ChatCompletion]],
+        what: str,
+        *,
+        tool_turn: bool = False,
+        images: bool = False,
     ) -> tuple[ChatCompletion, CallMeta]:
         """Send until the response has an answer, summing the paid attempts into one meta.
 
-        A plain answer needs content; a tool turn needs a choice, and its text
-        may be empty when it calls tools or finished cleanly. An empty answer
+        A plain answer needs content, or with ``images`` an image; a tool turn
+        needs a choice, and its text may be empty when it calls tools or
+        finished cleanly. An empty answer
         that was cut or refused raises at once, since the same request would
         only repeat it.
         """
@@ -347,7 +450,11 @@ class APILLM(promptolution.APILLM):
             paid = meta if paid is None else paid.combine(meta)
             if completion.choices:
                 message = completion.choices[0].message
-                empty = message.content is None and not (tool_turn and message.tool_calls)
+                empty = (
+                    message.content is None
+                    and not (tool_turn and message.tool_calls)
+                    and not (images and _image_urls(message))
+                )
                 if empty and meta.error_kind is not None:
                     raise EmptyResponse(
                         f"Empty content from model (finish_reason={meta.finish_reason}, refused={meta.refused})",
@@ -437,6 +544,33 @@ class APILLM(promptolution.APILLM):
             scored_tokens=scored.token_count,
         )
         return scored
+
+
+def _image_urls(message: ChatCompletionMessage) -> list[str]:
+    """Return the image URLs of an answer's ``images`` list, which the client keeps as an extra field."""
+    entries = (message.model_extra or {}).get("images") or []
+    urls = []
+    for entry in entries:
+        image_url = entry.get("image_url") if isinstance(entry, dict) else None
+        url = image_url.get("url") if isinstance(image_url, dict) else None
+        if isinstance(url, str):
+            urls.append(url)
+    return urls
+
+
+def _decode_image(url: str) -> tuple[bytes, str]:
+    """Return a ``data:`` URI's bytes and media type.
+
+    Raises:
+        XmasError: For any other URL, which xmas would have to fetch, or invalid base64.
+    """
+    found = _DATA_URI.fullmatch(url)
+    if found is None:
+        raise XmasError(f"llm: an image answer is not a base64 data URI ({url[:40]}...); xmas reads no network")
+    try:
+        return base64.b64decode(found.group(2), validate=True), found.group(1)
+    except binascii.Error as exc:
+        raise XmasError(f"llm: an image answer's base64 is invalid: {exc}") from None
 
 
 def _is_permanent(exc: BaseException) -> bool:

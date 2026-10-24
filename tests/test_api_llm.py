@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import pickle
+from pathlib import Path
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
 from openai.types.chat import ChatCompletion
 
 from xmas import MAS, Agent, AgentRecord, Budget, TokenUsage
+from xmas.budget import RunMeter
 from xmas.errors import EmptyResponse, ErrorKind, XmasError
 from xmas.llms.api_llm import APILLM
-from xmas.llms.meta import TokenPrice, supports_meta
-from xmas.tools import ToolCallRequest
+from xmas.llms.call_log import CallLog
+from xmas.llms.meta import TokenPrice, supports_images, supports_meta, supports_parts
+from xmas.llms.parts import Part, content_text, has_media, marker, render_parts, to_content
+from xmas.media import MAX_PART_BYTES, Ref
+from xmas.prompts import safe_format
+from xmas.tools import ToolCallRequest, index_tools, run_tool_loop
+from xmas.utils import approximate_tokens
 
 from .conftest import BASE_URL, add, answer, recording_llm, requires_gateway
 
@@ -341,3 +351,196 @@ def test_the_paid_attempts_behind_an_empty_answer_reach_the_meter(monkeypatch: p
             "calls": {"spent": 1, "limit": 10},
             "cost_usd": {"spent": pytest.approx(6 * 0.01), "limit": 0.05},
         }
+
+
+# ------------------------------------------------------- pictures and sound
+
+
+def picture(tmp_path: Path, name: str, data: bytes) -> Ref:
+    """A file on disk, referenced where it is."""
+    path = tmp_path / name
+    path.write_bytes(data)
+    return Ref.from_path(path)
+
+
+def test_parts_request_body(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # render_parts substitutes as safe_format does, labels list items 0-based and marks a failed one
+    a, b, c = (picture(tmp_path, f"{name}.png", name.encode()) for name in ("a", "b", "c"))
+    template = 'Plan: {plan} {{lit}} {"k": 1}\nPages: {pages}\nCover: {cover}{gone}{empty} {unknown}'
+    media: dict[str, Any] = {"pages": [a, None, b], "cover": c, "gone": None, "empty": []}
+    parts, shown = render_parts(template, {"plan": "p"}, media)
+    assert parts == [
+        'Plan: p {{lit}} {"k": 1}\nPages: \n[pages 0] ',
+        a,
+        "\n[pages 1] (none)\n[pages 2] ",
+        b,
+        "\nCover: ",
+        c,
+        " {unknown}",
+    ]
+    assert shown == (
+        'Plan: p {{lit}} {"k": 1}\nPages: \n[pages 0] [image a.png, image/png, 1 B]\n[pages 1] (none)'
+        "\n[pages 2] [image b.png, image/png, 1 B]\nCover: [image c.png, image/png, 1 B] {unknown}"
+    )
+    text_only = "Plan: {plan} {{lit}} {other}"
+    rendered = safe_format(text_only, {"plan": "p"})
+    assert render_parts(text_only, {"plan": "p"}, {}) == ([rendered], rendered)
+    one = (["\n[pages 0] ", a], "\n[pages 0] [image a.png, image/png, 1 B]")
+    assert render_parts("{pages}", {}, {"pages": [a]}) == one
+    assert (has_media(parts), has_media(["x"])) == (True, False)
+    assert marker(Ref("/s/x.png", "image/png", 182 * 1024)) == "[image x.png, image/png, 182 KB]"
+    assert marker(Ref("https://h/d/x.wav", "audio/wav")) == "[audio x.wav, audio/wav]"
+    assert marker(Ref("/s/x.png", "image/png", 3 * 1024 * 1024 + 400_000)) == "[image x.png, image/png, 3.4 MB]"
+
+    # to_content: data URIs, URLs as they are, wav and mp3, nothing a model reads through a conversion step
+    wav, mp3 = picture(tmp_path, "v.wav", b"RIFF"), picture(tmp_path, "v.mp3", b"ID3")
+    remote = Ref("https://cdn.example/p.png", "image/png")
+    assert to_content(["Look", a, remote, wav, mp3]) == [
+        {"type": "text", "text": "Look"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"a").decode()}},
+        {"type": "image_url", "image_url": {"url": "https://cdn.example/p.png"}},
+        {"type": "input_audio", "input_audio": {"data": base64.b64encode(b"RIFF").decode(), "format": "wav"}},
+        {"type": "input_audio", "input_audio": {"data": base64.b64encode(b"ID3").decode(), "format": "mp3"}},
+    ]
+    refused = [
+        (Ref("/s/big.png", "image/png", MAX_PART_BYTES + 1), r"\[image big.png, image/png, 20.0 MB\] is over"),
+        (Ref("https://h/a.wav", "audio/wav"), "audio is sent as bytes, and xmas reads no network"),
+        (picture(tmp_path, "v.ogg", b"Ogg"), "a model takes wav or mp3 audio, not audio/ogg"),
+        (picture(tmp_path, "d.pdf", b"%PDF"), "a model reads a document through a conversion step"),
+        (picture(tmp_path, "t.csv", b"a,b"), "a model reads a table through a conversion step"),
+    ]
+    for ref, match in refused:
+        with pytest.raises(ValueError, match=match):
+            to_content([ref])
+    monkeypatch.setattr("xmas.llms.parts.MAX_PART_BYTES", 4)
+    with pytest.raises(ValueError, match=r"over the 4 B a content part may carry"):
+        to_content([Ref(str(picture(tmp_path, "five.png", b"12345").location), "image/png")])  # size unknown
+    monkeypatch.undo()
+
+    # one request through the same path: the same keys in the same order, then call_kwargs; the record shows markers
+    log = CallLog(capture_text=True)
+    llm, sent = recording_llm(monkeypatch, [answer("seen")], call_kwargs={"temperature": 0.2}, call_log=log)
+    text, meta = llm.generate_parts_with_meta(parts, system_prompt="Judge.")
+    assert (text, meta.served_model) == ("seen", "m")
+    assert list(sent[0]) == ["model", "messages", "max_tokens", "temperature"]
+    assert sent[0]["messages"] == [
+        {"role": "system", "content": "Judge."},
+        {"role": "user", "content": to_content(parts)},
+    ]
+    assert [part["type"] for part in sent[0]["messages"][1]["content"]] == ["text", "image_url"] * 3 + ["text"]
+    (record,) = log.records
+    assert (record.prompt, record.system_prompt, record.response) == (shown, "Judge.", "seen")
+    assert "base64," not in json.dumps(record.to_dict())
+    assert content_text(sent[0]["messages"][1]["content"]) == "".join(part for part in parts if isinstance(part, str))
+
+
+B1_BYTES = (
+    b'{"model":"m","messages":[{"role":"system","content":"You are a helpful assistant."},'
+    b'{"role":"user","content":"Look: {png}"}],"max_tokens":4096}'
+)
+"""A text-only request as promptolution sends it, byte for byte."""
+
+
+def wired_llm(**kwargs: Any) -> tuple[APILLM, list[bytes]]:
+    """An APILLM whose HTTP transport keeps each request body's bytes and answers "ok"."""
+    sent: list[bytes] = []
+
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request.content)
+        return httpx2.Response(200, json=answer("ok").model_dump(mode="json"))
+
+    client = {"http_client": httpx2.AsyncClient(transport=httpx2.MockTransport(reply))}
+    return APILLM(model="m", base_url=BASE_URL, api_key="k", client_kwargs=client, **kwargs), sent
+
+
+def test_text_only_requests_keep_their_bytes() -> None:
+    assert hashlib.sha256(B1_BYTES).hexdigest().startswith("2d432b7b068dd094")
+    llm, sent = wired_llm()
+    assert llm.generate_with_meta("Look: {png}")[0] == "ok"
+    assert llm.generate_parts_with_meta(["Look: ", "{png}"])[0] == "ok"
+    assert sent == [B1_BYTES, B1_BYTES]
+
+    # a model that sees, serving an agent that reads text and one with a tool: text requests, as before
+    seeing, sent = wired_llm(accepts=("text", "image"))
+    assert (seeing.accepts, seeing.produces) == (("text", "image"), ("text",))
+    plain = Agent("looker", "Look: {query}", output="answer")
+    assert MAS([plain], llm=seeing).run("{png}").output == "ok"
+    with_tool = Agent("looker", "Look: {query}", output="answer", tools=["add"])
+    assert MAS([with_tool], llm=seeing, tools=[add]).run("{png}").output == "ok"
+    tools = json.dumps([add.to_openai()], separators=(",", ":")).encode()
+    assert sent == [B1_BYTES, B1_BYTES[:-1] + b',"tools":' + tools + b"}"]
+
+
+def painted(content: str | None, *urls: str, **kwargs: Any) -> ChatCompletion:
+    """A chat completion whose message carries OpenRouter's ``images`` list."""
+    body = answer(content, **kwargs).model_dump()
+    body["choices"][0]["message"]["images"] = [{"type": "image_url", "image_url": {"url": url}} for url in urls]
+    return ChatCompletion.model_validate(body)
+
+
+PNG_URI = "data:image/png;base64," + base64.b64encode(b"\x89PNG-o").decode()
+
+
+def test_image_answers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    usage = {**USAGE, "cost": 0.0002}
+    log = CallLog(capture_text=True)
+    llm, sent = recording_llm(monkeypatch, [painted("ok", PNG_URI, usage=usage, model="m-served")], call_log=log)
+    text, images, meta = llm.generate_image_with_meta("Paint a house")
+    assert (text, images) == ("ok", [(b"\x89PNG-o", "image/png")])
+    assert (meta.cost_usd, meta.served_model, meta.finish_reason) == (0.0002, "m-served", "stop")
+    assert list(sent[0]) == ["model", "messages", "max_tokens", "modalities"]
+    assert sent[0]["modalities"] == ["image", "text"]
+    assert sent[0]["messages"][1] == {"role": "user", "content": "Paint a house"}
+    assert log.records[0].params == {"max_tokens": 4096, "modalities": ["image", "text"]}
+
+    # modalities only on the image path
+    llm, sent = recording_llm(monkeypatch, [answer("words")])
+    llm.generate_with_meta("Paint a house")
+    assert "modalities" not in sent[0]
+
+    # images without text are an answer, asked once; a picture in the prompt goes as a part
+    ref = picture(tmp_path, "sketch.png", b"sketch")
+    llm, sent = recording_llm(monkeypatch, [painted(None, PNG_URI, PNG_URI)])
+    text, images, _ = llm.generate_image_with_meta(["Finish ", ref])
+    assert (text, len(images), len(sent)) == ("", 2, 1)
+    assert sent[0]["messages"][1]["content"] == to_content(["Finish ", ref])
+
+    # neither text nor images is empty, as for text; an image xmas would have to fetch is refused
+    llm, sent = recording_llm(monkeypatch, [painted(None), answer("ok")])
+    assert llm.generate_image_with_meta("Paint")[:2] == ("ok", [])
+    assert len(sent) == 2
+    llm, _ = recording_llm(monkeypatch, [painted("ok", "https://cdn.example/p.png")])
+    with pytest.raises(XmasError, match="not a base64 data URI"):
+        llm.generate_image_with_meta("Paint")
+    llm, _ = recording_llm(monkeypatch, [painted("ok", "data:image/png;base64,!!")])
+    with pytest.raises(XmasError, match="base64 is invalid"):
+        llm.generate_image_with_meta("Paint")
+
+
+def test_a_hooked_subclass_cannot_send_parts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class Hooked(APILLM):
+        async def _ainvoke_once(self, prompt: str, system_prompt: str) -> ChatCompletion:
+            return await super()._ainvoke_once(prompt, system_prompt)
+
+    hooked, _ = recording_llm(monkeypatch, [], cls=Hooked, accepts=("text", "image"))
+    assert (supports_parts(hooked), supports_images(hooked)) == (False, False)
+    plain, _ = recording_llm(monkeypatch, [])
+    assert (supports_parts(plain), supports_images(plain)) == (True, True)
+    assert not supports_parts(object())
+
+    # the tool loop sends the parts in the first user message, and counts their text only
+    ref = picture(tmp_path, "slide.png", b"x" * 3000)
+    parts: list[Part] = ["Check ", ref]
+    llm, sent = recording_llm(monkeypatch, [answer("", calls=[ADD_CALL]), answer("42")])
+    text, calls, usage, meta = run_tool_loop(
+        llm, parts, index_tools([add]), 2, "System.", approximate_tokens, RunMeter()
+    )
+    assert (text, [call.result for call in calls]) == ("42", ["42"])
+    assert meta is not None and meta.served_model == "m"
+    assert sent[0]["messages"][1] == {"role": "user", "content": to_content(parts)}
+    assert sent[1]["messages"][1] == sent[0]["messages"][1]
+    assert [message["role"] for message in sent[1]["messages"]] == ["system", "user", "assistant", "tool"]
+    assert usage.input_tokens < 20
+    llm, sent = recording_llm(monkeypatch, [answer("done")])
+    run_tool_loop(llm, ["Check ", "this"], index_tools([add]), 2, "System.", approximate_tokens, RunMeter())
+    assert sent[0]["messages"][1] == {"role": "user", "content": "Check this"}
