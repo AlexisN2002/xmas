@@ -12,6 +12,7 @@ Note:
 
 from xmas.agent import Agent
 from xmas.budget import Budget
+from xmas.chains import ForEach
 from xmas.edges import Edge, EdgeKind
 from xmas.errors import BadFormat, BudgetExceeded, ErrorKind, RunStatus
 from xmas.graph import END, START
@@ -20,7 +21,7 @@ from xmas.llms import APILLM, ScoredSequence
 from xmas.mas import MAS
 from xmas.nodes import Box, Step
 from xmas.tasks import GSM8KTask, MASTask
-from xmas.trace import AgentRecord, TokenUsage, ToolCall, Trace
+from xmas.trace import AgentRecord, Event, TokenUsage, ToolCall, Trace
 from xmas.values import JSON, TEXT, ValueType
 
 __version__ = "0.0.0"
@@ -41,6 +42,8 @@ __all__ = [
     "Edge",
     "EdgeKind",
     "ErrorKind",
+    "Event",
+    "ForEach",
     "GSM8KTask",
     "Health",
     "HealthSettings",
