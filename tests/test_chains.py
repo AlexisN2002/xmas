@@ -1,0 +1,308 @@
+"""``for each`` chains in the engine: one inner run per item behind ``Send``, gathered in item order.
+
+The models are scripted doubles. Systems are built through ``conftest.build``
+and run through ``conftest.run_values``, which call ``MAS(..., each=...)`` and
+``MAS.run_state`` once ``MAS`` takes them.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, cast
+
+import pytest
+
+from xmas import MAS, Agent, Box, Budget, ErrorKind, RunStatus
+from xmas.edges import Edge, EdgeKind
+from xmas.nodes import Step
+from xmas.tools import tool
+
+from .conftest import (
+    DECK,
+    HAS_EACH,
+    LONG_PAGE,
+    PLAN,
+    MockLLM,
+    assemble_deck,
+    build,
+    deck,
+    deck_llms,
+    needs_fields,
+    render_page,
+    run_values,
+)
+
+pytestmark = needs_fields
+
+
+class OutOfMoneyError(Exception):
+    """The key is out of money."""
+
+    kind = ErrorKind.MONEY
+
+
+def most_in_flight(events: list[Any], head: str) -> int:
+    """Return the most items of a chain that ran at once, from its item events."""
+    now = most = 0
+    for event in events:
+        if event.node == head and event.kind in ("item_start", "item_end"):
+            now += 1 if event.kind == "item_start" else -1
+            most = max(most, now)
+    return most
+
+
+def test_the_deck_runs_per_item_and_gathers_in_order() -> None:
+    mas = deck()
+    events: list[Any] = []
+    trace = run_values(mas, {"plan": PLAN, "house": "plain"}, on_event=events.append)
+    assert trace.error is None
+
+    # every write comes back as a list aligned to the items
+    built = trace.outputs["deck"]
+    assert built == {
+        "pages": ["Short page.", "Short page.", "Short page.", LONG_PAGE, "Short page."],
+        "captions": ["A caption.", "A caption."],
+        "fits": [True, True, True, False, True],
+    }
+    assert trace.outputs["notes"] == "Notes."
+    assert trace.output == json.dumps(built, ensure_ascii=False)
+
+    # one redraw per page, the visits counted per item; "limits" still does not fit, so its loop is capped
+    pages = [slide["id"] for slide in PLAN["slides"]]
+    drawn = [r for r in trace.records if r.agent in ("drafter", "render", "checker")]
+    assert [(r.item_key, r.agent, r.visit) for r in drawn] == [
+        (page, node, visit) for page in pages for visit in (1, 2) for node in ("drafter", "render", "checker")
+    ]
+    assert [r.item for r in drawn] == [index for index in range(5) for _ in range(6)]
+    assert [r.capped for r in trace["checker"] if r.visit == 2] == [False, False, False, True, False]
+    assert [r.route for r in trace["checker"]][:2] == [("drafter",), ("__end__",)]
+    figures = [(r.item, r.item_key, r.agent) for r in trace.records if r.agent in ("captioner", "figure_checker")]
+    assert figures == [
+        (0, "f1", "captioner"),
+        (0, "f1", "figure_checker"),
+        (1, "f2", "captioner"),
+        (1, "f2", "figure_checker"),
+    ]
+
+    # "intro" finished last, yet its records come first: records keep the items' order
+    finished = [event.item_key for event in events if event.kind == "item_end" and event.node == "drafter"]
+    assert finished[-1] == "intro" and sorted(finished) == sorted(pages)
+
+    # assemble runs once, after both chains; noter runs beside them; neither is an item
+    names = [r.agent for r in trace.records]
+    assert names.count("assemble") == 1 and names.count("noter") == 1
+    assert names.index("assemble") > max(i for i, name in enumerate(names) if name in ("checker", "figure_checker"))
+    assert (trace["assemble"][0].item, trace["assemble"][0].visit) == (None, 1)
+    assert trace["noter"][0].item is None
+
+    # at most four pages at once
+    assert 1 < most_in_flight(events, "drafter") <= 4
+    assert trace.cost_usd == pytest.approx(0.01 * (5 * 4 + 2 * 2 + 1))
+    health = trace.health
+    if hasattr(health, "items"):  # P1: Health.items
+        assert health.items["drafter"]["items"] == 5 and health.items["drafter"]["failed"] == 0
+
+
+def pages(
+    responder: Any = None, *, budget: Budget | None = None, loop: bool = False, key: bool = True
+) -> tuple[MAS, MockLLM]:
+    """A writer and a word count per page, then ``fin`` adds the counts up.
+
+    A page whose draft says "broken" cannot be counted. With ``loop``, ``trim``
+    drops the last page and goes back to the writer while pages are left, at
+    most two passes, then on to ``fin``.
+    """
+
+    @tool(writes={"words": "json"})
+    def count(draft: str) -> int:
+        """Count a draft's words."""
+        if "broken" in draft:
+            raise ValueError("cannot count a broken page")
+        return len(draft.split())
+
+    @tool(writes={"total": "json"})
+    def add_up(words: list[Any]) -> dict[str, Any]:
+        """Add the counts up, and say how many are missing."""
+        return {"words": sum(w for w in words if w is not None), "missing": words.count(None)}
+
+    @tool(writes={"plan": "json"})
+    def trim(plan: dict[str, Any]) -> dict[str, Any]:
+        """Drop the plan's last page."""
+        return {**plan, "slides": plan["slides"][:-1]}
+
+    llm = MockLLM(responder or (lambda p: f"Page {json.loads(p.split(' ', 2)[2])['id']} in words"), meta=True)
+    edges: list[tuple[str, str] | Edge] = [("writer", "count")]
+    steps = [Step("count", "count"), Step("fin", "add_up")]
+    if loop:
+        steps.append(Step("trim", "trim"))
+        edges += [
+            ("count", "trim"),
+            Edge("trim", "writer", EdgeKind.WHILE, when="len(plan.slides) > 0", max_visits=2),
+            Edge("trim", "fin", EdgeKind.ELSE),
+        ]
+    else:
+        edges.append(("count", "fin"))
+    head = {"item": "page", "in": "plan.slides", "key": "id"} if key else "page in plan.slides"
+    mas = build(
+        [Agent("writer", "Write page {page}", "draft", ["page"])],
+        edges,
+        each={"writer": head, "count": "page in plan.slides"},
+        outputs={"words": "list of json", "total": "json"},
+        steps=steps,
+        inputs={"plan": "json"},
+        state={"plan": {"merge": "last"}} if loop else None,
+        llm=llm,
+        tools=[count, add_up, trim],
+        budget=budget,
+    )
+    return mas, llm
+
+
+def plan_of(*ids: str) -> dict[str, Any]:
+    return {"plan": {"slides": [{"id": name} for name in ids]}}
+
+
+def test_a_failed_item_keeps_the_others() -> None:
+    def writer(prompt: str) -> str:
+        page = json.loads(prompt.split(" ", 2)[2])["id"]
+        if page == "d" and "money" in prompt:
+            raise OutOfMoneyError("Key limit exceeded")
+        return "a broken page" if page == "c" else f"Page {page} in words"
+
+    mas, _ = pages(writer)
+    trace = run_values(mas, plan_of("a", "b", "c", "d"))
+    assert trace.error is None and trace.status is RunStatus.OK
+    assert trace.outputs == {"words": [4, 4, None, 4], "total": {"words": 12, "missing": 1}}
+    assert trace["fin"][0].inputs == {"words": "[4, 4, null, 4]"}
+    (failed,) = [r for r in trace["count"] if r.error is not None]
+    assert (failed.item, failed.item_key, failed.error) == (2, "c", "ValueError: cannot count a broken page")
+    assert failed.error_kind is ErrorKind.UNKNOWN and failed.route is None
+    assert [(r.agent, r.item) for r in trace.records][:8] == [(n, i) for i in range(4) for n in ("writer", "count")]
+    health = trace.health
+    if hasattr(health, "items"):  # P1: Health.items, item_failed
+        assert health.items["writer"]["failed"] == 1
+
+    # money in one item ends the run: the siblings finished and were paid, and keep their records
+    money = {"plan": {"slides": [{"id": n, "say": "money"} for n in "abd"]}}
+    broke = run_values(pages(writer)[0], money)
+    assert broke.error == "OutOfMoneyError: Key limit exceeded" and broke.error_kind is ErrorKind.MONEY
+    kept = sorted((r.item, r.agent, r.error is None) for r in broke.records)
+    assert kept == [
+        (0, "count", True),
+        (0, "writer", True),
+        (1, "count", True),
+        (1, "writer", True),
+        (2, "writer", False),
+    ]
+    assert "fin" not in broke.agents
+
+    # so does a budget refusal: three calls for four pages
+    over = run_values(pages(budget=Budget(max_calls=3))[0], plan_of("a", "b", "c", "d"))
+    assert over.status is RunStatus.OVER_BUDGET
+    assert (
+        sorted(r.item for r in over["writer"]) == sorted({r.item for r in over["writer"]}) and len(over["writer"]) == 3
+    )
+    assert all(r.item is not None and r.error is None for r in over.records)
+
+
+@pytest.mark.parametrize("case", ["zero items", "outer loop", "bad keys", "a dict at the path"])
+def test_zero_items_outer_loop_and_key_problems(case: str) -> None:
+    if case == "zero items":
+        empty: list[dict[str, Any]] = [plan_of(), {"plan": {"slides": None}}, {"plan": {}}]
+        for values in empty:
+            mas, llm = pages()
+            trace = run_values(mas, values)
+            assert trace.error is None and llm.calls == []
+            assert [r.agent for r in trace.records] == ["fin"]
+            assert trace["fin"][0].inputs == {"words": "[]"}
+            assert trace.outputs == {"words": [], "total": {"words": 0, "missing": 0}}
+        keyless = run_values(pages(key=False)[0], plan_of("a", "b"))  # without a key, an item is its index
+        assert [(r.item, r.item_key) for r in keyless["writer"]] == [(0, None), (1, None)]
+    elif case == "outer loop":
+        mas, llm = pages(loop=True)
+        trace = run_values(mas, plan_of("a", "b", "c"))
+        assert trace.error is None
+        # pass 1 writes three pages, pass 2 the two left; the loop into the head is capped on its passes
+        assert [(r.item_key, r.visit) for r in trace["writer"]] == [("a", 1), ("b", 1), ("c", 1), ("a", 1), ("b", 1)]
+        assert [(r.route, r.capped) for r in trace["trim"]] == [(("writer",), False), (("fin",), True)]
+        assert [r.visit for r in trace["trim"]] == [1, 2]
+        assert trace.outputs["words"] == [4, 4]  # no stale third page
+        assert len(llm.calls) == 5
+    else:
+        bad = {
+            "bad keys": [
+                (plan_of("a", "a"), "plan.slides repeats the key 'id': ['a']"),
+                ({"plan": {"slides": [{"id": "a"}, {"name": "b"}]}}, "item 1 of plan.slides has no key 'id'"),
+                ({"plan": {"slides": [{"id": "a"}, {"id": True}]}}, "item 1 of plan.slides has no key 'id'"),
+            ],
+            "a dict at the path": [({"plan": {"slides": {"id": "a"}}}, "plan.slides holds dict, not a list")],
+        }[case]
+        for values, problem in bad:
+            mas, llm = pages()
+            trace = run_values(mas, values)
+            assert trace.error.startswith("ValueError: for each page in plan.slides: ") and problem in trace.error
+            assert llm.calls == [] and trace.records == ()
+
+
+def test_a_box_and_shared_prompts_in_a_chain() -> None:
+    llm = MockLLM(lambda p: p.split(": ", 1)[1].upper() if p.startswith("Cut") else f"draft {json.loads(p[6:])['id']}")
+    cutter = Agent("cutter", "Cut: {page}", output="short", inputs=["page"])
+    inner = MAS([cutter], inputs={"page": "text"}, llm=llm)
+    mas = build(
+        [Agent("writer", "Write {page}", "draft", ["page"])],
+        [("writer", "shorten")],
+        each={"writer": {"item": "page", "in": "plan.slides", "key": "id"}, "shorten": "page in plan.slides"},
+        outputs={"short": "list of text"},
+        boxes=[Box("shorten", inner, reads={"page": "draft"}, writes={"short": "short"})],
+        inputs={"plan": "json"},
+        llm=llm,
+    )
+    trace = run_values(mas, plan_of("one", "two"))
+    assert trace.error is None
+    assert trace.outputs == {"short": ["DRAFT ONE", "DRAFT TWO"]}
+    # the box's record and the records nested in it carry the item
+    boxes = trace["shorten"]
+    assert [(r.item, r.item_key, r.kind) for r in boxes] == [(0, "one", "box"), (1, "two", "box")]
+    assert [[(r.agent, r.item, r.item_key) for r in cast("Any", b.inner).records] for b in boxes] == [
+        [("cutter", 0, "one")],
+        [("cutter", 1, "two")],
+    ]
+    assert [(path, r.agent, r.item) for path, r in trace.walk()] == [
+        ((), "writer", 0),
+        ((), "shorten", 0),
+        (("shorten",), "cutter", 0),
+        ((), "writer", 1),
+        ((), "shorten", 1),
+        (("shorten",), "cutter", 1),
+    ]
+
+    # a chain inside a box keeps its items' records in the box's inner trace
+    boxed = build(
+        [], boxes=[Box("all", mas, reads={"plan": "plan"}, writes={"short": "short"})], inputs={"plan": "json"}
+    )
+    (whole,) = run_values(boxed, plan_of("one", "two"))["all"]
+    assert whole.outputs == {"short": '["DRAFT ONE", "DRAFT TWO"]'}
+    assert [(r.agent, r.item_key) for r in whole.inner.records] == [
+        ("writer", "one"),
+        ("shorten", "one"),
+        ("writer", "two"),
+        ("shorten", "two"),
+    ]
+
+    if HAS_EACH:  # P2: shared prompts and the chain system resolving through the outer one
+        import yaml
+
+        shared = deck().copy(prompts={"checker": "Judge {planned} as {shown}"})
+        judged = run_values(shared, {"plan": PLAN, "house": "plain"})
+        assert all(r.rendered_prompt.startswith("Judge") for r in [*judged["checker"], *judged["figure_checker"]])
+
+        asked: list[str] = []
+
+        class Metered(MAS):
+            def resolve_llm(self, agent: Agent) -> Any:
+                asked.append(agent.name)
+                return super().resolve_llm(agent)
+
+        metered = Metered.from_dict(yaml.safe_load(DECK), llms=dict(deck_llms()), tools=[render_page, assemble_deck])
+        assert run_values(metered, {"plan": PLAN, "house": "plain"}).error is None
+        assert {"drafter", "checker", "captioner", "figure_checker", "noter"} <= set(asked)
