@@ -57,12 +57,13 @@ RUN_ENDS = frozenset({ErrorKind.BUDGET, ErrorKind.STOPPED})
 
 
 class RunStatus(enum.StrEnum):
-    """How a run ended."""
+    """How a run ended, or ``paused`` while it waits for a person."""
 
     OK = "ok"
     FAILED = "failed"
     STOPPED = "stopped"
     OVER_BUDGET = "over_budget"
+    PAUSED = "paused"
 
 
 class XmasError(RuntimeError):
@@ -132,9 +133,33 @@ class BudgetExceeded(XmasError):
 
 
 class Stopped(XmasError):
-    """A run was stopped on request; a caller's model wrapper raises it to end the run with status ``stopped``."""
+    """A run was stopped on request; a caller's model wrapper raises it to end the run with status ``stopped``.
+
+    Attributes:
+        reason: Why the run was stopped, the error's message.
+        meta: What the cut call had used, or ``None`` when not known.
+        text: The answer received before the cut, ``""`` when none was.
+    """
 
     kind = ErrorKind.STOPPED
+
+    def __init__(self, reason: str = "stopped", meta: CallMeta | None = None, text: str = "") -> None:
+        """Keep the reason as the message, and the cut call's meta and partial answer."""
+        super().__init__(reason)
+        self.reason = reason
+        self.meta = meta
+        self.text = text
+
+    def __reduce__(self) -> tuple[type[Stopped], tuple[str, CallMeta | None, str]]:
+        """Pickle with the meta and the partial answer, which the message alone would lose."""
+        return type(self), (self.reason, self.meta, self.text)
+
+
+class RaceLost(Stopped):
+    """A ``first of`` contestant's call was cut because another contestant finished first.
+
+    The engine keeps the contestant's record as lost, not failed; the run goes on.
+    """
 
 
 class EmptyResponse(XmasError):
