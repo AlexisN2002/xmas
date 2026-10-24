@@ -19,6 +19,7 @@ import re
 # doubled braces alone, so `{{literal}}` survives untouched, and the identifier
 # class means a JSON body like {"k": 1} is never mistaken for a placeholder.
 _PLACEHOLDER = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
+_HEADER = "<<<xmas:agent "
 
 
 def extract_placeholders(template: str) -> set[str]:
@@ -34,13 +35,6 @@ def safe_format(template: str, values: dict[str, str]) -> str:
     user-supplied text and will contain JSON, code and Markdown; refusing to
     render it because of an unrelated brace would make the framework hostile to
     exactly the prompts people write.
-
-    Args:
-        template: The prompt template.
-        values: Substitutions, keyed by placeholder name.
-
-    Returns:
-        The rendered string.
     """
     return _PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), template)
 
@@ -52,12 +46,6 @@ def encode_prompts(prompts: dict[str, str]) -> str:
     a single-agent MAS is indistinguishable from a promptolution predictor and
     promptolution's optimizers mutate it directly.
 
-    Args:
-        prompts: Prompt text keyed by agent name.
-
-    Returns:
-        The encoded prompt set.
-
     Raises:
         ValueError: If ``prompts`` is empty, or a name or prompt would collide
             with the header syntax.
@@ -66,9 +54,9 @@ def encode_prompts(prompts: dict[str, str]) -> str:
         raise ValueError("Cannot encode an empty prompt set.")
 
     for name, text in prompts.items():
-        if "<<<xmas:agent " in text:
+        if _HEADER in text:
             raise ValueError(
-                f"The prompt for {name!r} contains the reserved marker '<<<xmas:agent ', "
+                f"The prompt for {name!r} contains the reserved marker {_HEADER!r}, "
                 "which would be read back as an agent header."
             )
         if ">>>" in name or "\n" in name:
@@ -77,20 +65,13 @@ def encode_prompts(prompts: dict[str, str]) -> str:
     if len(prompts) == 1:
         return next(iter(prompts.values()))
 
-    sections = [f"<<<xmas:agent {name}>>>\n{text}" for name, text in prompts.items()]
-    return "\n".join(sections)
+    return "\n".join(f"{_HEADER}{name}>>>\n{text}" for name, text in prompts.items())
 
 
 def decode_prompts(encoded: str, agents: list[str]) -> dict[str, str]:
-    """Decode a prompt set produced by :func:`encode_prompts`.
+    """Decode a prompt set produced by :func:`encode_prompts` for a MAS of ``agents``.
 
-    Args:
-        encoded: The encoded prompt set.
-        agents: Agent names of the MAS this prompt set belongs to. A bare string
-            with no headers is assigned to the single agent named here.
-
-    Returns:
-        Prompt text keyed by agent name.
+    A bare string with no headers is assigned to the single agent named in ``agents``.
 
     Raises:
         ValueError: If the encoding is headerless and ``agents`` has more than
@@ -102,8 +83,8 @@ def decode_prompts(encoded: str, agents: list[str]) -> dict[str, str]:
     decoded: dict[str, list[str]] = {}
     current: list[str] | None = None
     for line in encoded.split("\n"):
-        if line.startswith("<<<xmas:agent ") and line.endswith(">>>"):
-            name = line.removeprefix("<<<xmas:agent ").removesuffix(">>>")
+        if line.startswith(_HEADER) and line.endswith(">>>"):
+            name = line.removeprefix(_HEADER).removesuffix(">>>")
             if name not in agents:
                 raise ValueError(f"Prompt set names unknown agent {name!r}; expected one of {sorted(agents)}.")
             current = []

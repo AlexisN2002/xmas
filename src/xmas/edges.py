@@ -175,8 +175,7 @@ def parse_edges(items: Iterable[Any]) -> list[Edge]:
 
     The items are chain strings such as ``"a -> b -> c"`` and one-key mappings
     such as ``{"a -> b": {"when": "..."}}``, ``{"a -> b": "else"}`` or
-    ``{"a -> b": "first of"}``; anything
-    else raises ValueError.
+    ``{"a -> b": "first of"}``; anything else raises ValueError.
     """
     if isinstance(items, (str, dict)):
         raise ValueError("Edges are a list of chains and one-key mappings.")
@@ -208,18 +207,15 @@ def dump_edges(edges: Sequence[Edge]) -> list[str | dict[str, Any]]:
     items: list[str | dict[str, Any]] = []
     chain: list[str] = []
     for edge in edges:
-        if edge.kind is EdgeKind.PLAIN:
-            if chain and chain[-1] == edge.source:
-                chain.append(edge.target)
-                continue
-            if chain:
-                items.append(f" {ARROW} ".join(chain))
-            chain = [edge.source, edge.target]
+        plain = edge.kind is EdgeKind.PLAIN
+        if plain and chain and chain[-1] == edge.source:
+            chain.append(edge.target)
             continue
         if chain:
             items.append(f" {ARROW} ".join(chain))
-            chain = []
-        items.append({edge.label: edge.spec()})
+        chain = [edge.source, edge.target] if plain else []
+        if not plain:
+            items.append({edge.label: edge.spec()})
     if chain:
         items.append(f" {ARROW} ".join(chain))
     return items
