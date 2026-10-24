@@ -545,7 +545,7 @@ def build_llms(names: Iterable[str], models: Mapping[str, Capabilities], config:
         built[name] = APILLM(
             model=ident,
             base_url=config.base_url,
-            api_key=config.api_key,
+            api_key=config.api_key or "none",  # the client needs a key; an endpoint without one ignores it
             price=config.prices.get(ident),
             stream=config.stream_of(ident),
             accepts=entry.accepts or ("text",),

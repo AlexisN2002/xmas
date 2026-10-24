@@ -28,7 +28,15 @@ from xmas import MAS, Agent
 from xmas import bundle as mas_bundle
 from xmas.bundle import LOCK, Lock, compare, dump_prompt, lock_of, parse_prompt, read
 from xmas.cli import main
-from xmas.config import Config, ModelEntry, ModelNameWarning, ToolServer, Unconfigured, read_catalogue
+from xmas.config import (
+    Config,
+    ModelEntry,
+    ModelNameWarning,
+    ToolServer,
+    Unconfigured,
+    build_llms,
+    read_catalogue,
+)
 from xmas.llms.api_llm import APILLM
 from xmas.llms.meta import TokenPrice
 from xmas.media import Capabilities
@@ -801,6 +809,9 @@ def test_models_entries_and_the_overlay(tmp_path: Path, clean_env: pytest.Monkey
         write({"judge-model": entry})
         with pytest.raises(ValueError, match=re.escape(f"models entry 'judge-model' {message}"[:60])):
             MAS.load(path, tools=tools, config=config)
+
+    keyless = build_llms(["local-model"], {}, Config(base_url="http://localhost:8080/v1"))["local-model"]
+    assert isinstance(keyless, APILLM) and keyless.model_id == "local-model"  # an endpoint that needs no key
 
     write({"judge-model": {"model": "judge-x"}})
     unconfigured = MAS.load(path, tools=tools, config=Config(catalogue=("judge-x", "writer-model")))
