@@ -25,10 +25,16 @@ from typing import Any
 
 __all__ = [
     "V2_KEYS",
+    "VERSION_2",
     "validate_spec",
     "validate_spec_v2",
 ]
 
+
+VERSION_2 = 2
+"""The ``version`` value of a version 2 spec."""
+EDGE_LENGTH = 2  # a version 1 edge is [source, target]
+CALLABLE_KINDS = ("python", "mcp")  # code imported by path, or a tool server named in the configuration
 
 V2_KEYS: dict[str, Any] = {
     "version": int,
@@ -132,7 +138,7 @@ def validate_spec(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(edges, list):
         raise ValueError("Spec needs 'edges' to be a list.")
     for edge in edges:
-        if not isinstance(edge, list) or len(edge) != 2 or not all(isinstance(node, str) for node in edge):
+        if not isinstance(edge, list) or len(edge) != EDGE_LENGTH or not all(isinstance(node, str) for node in edge):
             raise ValueError(f"Edge {edge!r} must be a two-element list of strings.")
     if not isinstance(data.get("default_model", ""), str | None):
         raise ValueError("Spec needs 'default_model' to be a string or null.")
@@ -162,22 +168,47 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
     :func:`xmas.check.check_system`, both when the MAS is built.
     """
     check_fields(data, "Spec", V2_KEYS)
-    if data.get("version") != 2:
+    check_version_is_2(data)
+    check_boxes_hold_specs(data)
+    check_entries(data)
+    check_callables(data)
+    check_fields(data.get("health", {}), "Spec 'health'", HEALTH)
+    check_models(data)
+    check_agent_prompts(data)
+    check_no_stray_prompts(data)
+    return data
+
+
+def check_version_is_2(data: dict[str, Any]) -> None:
+    """Refuse a spec whose ``version`` is not 2."""
+    if data.get("version") != VERSION_2:
         raise ValueError(f"A version 2 spec needs 'version: 2', not {data.get('version')!r}.")
+
+
+def check_boxes_hold_specs(data: dict[str, Any]) -> None:
+    """Refuse a box that names its system by path: from_dict needs the system's spec itself."""
     for entry in data.get("boxes", []):
         if isinstance(entry, dict) and isinstance(entry.get("system"), str):
             raise ValueError(
                 f"Box {entry.get('name')!r} names its system {entry['system']!r}: MAS.load reads a bundle's boxes; "
                 "from_dict needs the system's spec."
             )
+
+
+def check_entries(data: dict[str, Any]) -> None:
+    """Check the keys and value types of each agent, step, box and human."""
     for section, (label, required, fields) in ENTRIES.items():
         for index, entry in enumerate(data.get(section, [])):
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 raise ValueError(f"{label} {index} must be a mapping with a string 'name'.")
             check_fields(entry, f"{label} {entry['name']!r}", fields, required)
+
+
+def check_callables(data: dict[str, Any]) -> None:
+    """Check each callable's keys, its kind, that only python takes params, and that a server is a name."""
     for name, entry in data.get("callables", {}).items():
         check_fields(entry, f"Callable {name!r}", CALLABLE, frozenset({"kind"}), " (use a YAML comment for a note)")
-        if entry["kind"] not in ("python", "mcp"):
+        if entry["kind"] not in CALLABLE_KINDS:
             raise ValueError(f"Callable {name!r} needs 'kind' to be 'python' or 'mcp', not {entry['kind']!r}.")
         if "params" in entry and entry["kind"] != "python":
             raise ValueError(f"Callable {name!r} binds params, which only a python callable takes.")
@@ -186,8 +217,14 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
                 f"Callable {name!r} names the server {entry['server']!r}: a callable names its server, and its "
                 "address goes to the configuration ([tools.<name>] url)."
             )
-    check_fields(data.get("health", {}), "Spec 'health'", HEALTH)
-    for name, entry in data.get("models", {}).items():  # other keys are refused, with why, where the MAS reads them
+
+
+def check_models(data: dict[str, Any]) -> None:
+    """Check that each models entry maps accepts and produces to lists and names a string catalogue id.
+
+    Other keys are refused, with why, where the MAS reads them.
+    """
+    for name, entry in data.get("models", {}).items():
         if not isinstance(entry, dict) or any(not isinstance(entry.get(key, []), list) for key in MODEL_KEYS):
             raise ValueError(f"Spec 'models' entry {name!r} must map accepts and produces to lists, got {entry!r}.")
         if not isinstance(entry.get("model", name), str):
@@ -195,6 +232,9 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
                 f"Spec 'models' entry {name!r} needs 'model' to be a catalogue id, not {entry['model']!r}."
             )
 
+
+def check_agent_prompts(data: dict[str, Any]) -> None:
+    """Check that the prompts are text and each agent writes one value and has a prompt in the section."""
     prompts = data.get("prompts", {})
     if not all(isinstance(text, str) for text in prompts.values()):
         raise ValueError("Spec 'prompts' must map agent and prompt names to prompt text.")
@@ -207,7 +247,11 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Agent {agent['name']!r}: prompt {agent['prompt']!r} names no entry of 'prompts'.")
         if agent["name"] not in prompts and "prompt" not in agent:
             raise ValueError(f"Agent {agent['name']!r} has no prompt in the 'prompts' section.")
-    stray = sorted(set(prompts) - {agent.get("prompt", agent["name"]) for agent in data.get("agents", [])})
+
+
+def check_no_stray_prompts(data: dict[str, Any]) -> None:
+    """Refuse a prompt that no agent uses, under its own name or a shared ``prompt`` name."""
+    used = {agent.get("prompt", agent["name"]) for agent in data.get("agents", [])}
+    stray = sorted(set(data.get("prompts", {})) - used)
     if stray:
         raise ValueError(f"Spec 'prompts' has entries no agent uses: {stray}.")
-    return data

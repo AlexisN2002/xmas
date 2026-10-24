@@ -163,9 +163,9 @@ def test_the_worked_example_round_trips() -> None:
     assert mas.edges[3] == Edge("judge", "publish", EdgeKind.SWITCH, switch="verdict.action", case="publish")
     assert mas.edges[-1] == Edge("count", "apology", EdgeKind.ERROR, errors=("timeout", "outage"))
     assert (mas.merges, {k: str(v) for k, v in mas.inputs.items()}) == ({"draft": "last"}, {"query": "text"})
-    assert (
-        mas.info is not None and mas.info.writers["counts"] == ("count",) and str(mas.info.types["verdict"]) == "json"
-    )
+    assert mas.info is not None
+    assert mas.info.writers["counts"] == ("count",)
+    assert str(mas.info.types["verdict"]) == "json"
     assert mas.info.writers["published"] == ("publish", "apology")  # alternatives
     assert mas.info.joins == {
         "publish": Join("merge", (("judge", "shorten"),)),
@@ -180,7 +180,8 @@ def test_the_worked_example_round_trips() -> None:
         "version", "agents", "steps", "boxes", "edges", "state", "frozen", "health", "callables", "prompts"
     ]  # fmt: skip
     again = load(json.loads(json.dumps(spec)))
-    assert again.to_dict() == spec and again.structure == mas.structure  # idempotent
+    assert again.to_dict() == spec
+    assert again.structure == mas.structure  # idempotent
     copied = mas.copy()
     assert (copied.to_dict(), copied.frozen, copied.health, copied.boxes) == (spec, mas.frozen, mas.health, mas.boxes)
     assert copied.structure == mas.structure
@@ -221,8 +222,10 @@ def test_the_edge_grammar_parses_and_dumps_back_as_written() -> None:
     written = example()["edges"]
     edges = parse_edges(written)
     assert edges[2] == Edge("judge", "writer", EdgeKind.WHILE, when="not verdict.fits", max_visits=3)
-    assert edges[3].case == "publish" and edges[8].errors == ("timeout", "outage")
-    assert dump_edges(edges) == written and dump_edges(parse_edges(dump_edges(edges))) == written
+    assert edges[3].case == "publish"
+    assert edges[8].errors == ("timeout", "outage")
+    assert dump_edges(edges) == written
+    assert dump_edges(parse_edges(dump_edges(edges))) == written
 
     other_forms = [
         {"a -> b": {"switch": "v.k", "case": "go"}},
@@ -244,7 +247,8 @@ def test_a_version_1_system_has_no_version_2_parts() -> None:
     assert v1.copy().structure == v1.structure
 
     described = v1.describe()  # its marker loop is a loop edge
-    assert json.loads(json.dumps(described)) == described and described["version"] == 1
+    assert json.loads(json.dumps(described)) == described
+    assert described["version"] == 1
     loop = {"from": "checker", "to": "solver", "kind": "loop", "when": "<continue> in output", "max_visits": 3}
     assert loop in described["edges"]
     assert [node["kind"] for node in described["nodes"]] == ["agent", "agent"]
@@ -337,7 +341,7 @@ COUNT, PUBLISH, APOLOGY = STEPS
     ],
 )
 def test_check_names_every_dataflow_problem(change: dict[str, Any], phrases: list[str]) -> None:
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError, match=phrases[0]) as info:
         load({**EXAMPLE_DATA, **change})
     for phrase in phrases:
         assert re.search(phrase, str(info.value)), (phrase, str(info.value))
@@ -430,7 +434,7 @@ def edge(index: int, replacement: Any) -> dict[str, list[Any]]:
     ],
 )
 def test_check_names_every_operator_problem(change: dict[str, Any], message: str) -> None:
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError, match=message) as info:
         load({**EXAMPLE_DATA, **change})
     assert len(re.findall(message, str(info.value))) == 1, str(info.value)
 
@@ -492,7 +496,7 @@ def test_check_names_every_operator_problem_of_a_small_system(
     edges: list[Any], agents: list[tuple[str, str, list[str]]], message: str
 ) -> None:
     """Agents are ``(name, write, reads)``, and each prompt uses every read."""
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError, match=message) as info:
         MAS(
             [Agent(name, " ".join(f"{{{r}}}" for r in reads), write, inputs=reads) for name, write, reads in agents],
             edges=edges,
@@ -509,7 +513,8 @@ def test_describe_is_plain_data_that_names_every_node_and_edge() -> None:
     assert set(described) == {"version", "inputs", "nodes", "edges", "joins", "id"}
     assert (described["version"], described["inputs"]) == (2, {"query": "text"})
     assert described["joins"] == {"publish": "merge", "apology": "merge", END: "merge"}
-    assert described["id"].startswith("sha256:") and len(described["id"]) == 71
+    assert described["id"].startswith("sha256:")
+    assert len(described["id"]) == 71
 
     writer, count, judge, box, publish, apology = described["nodes"]
     assert writer == {
@@ -541,7 +546,8 @@ def test_describe_is_plain_data_that_names_every_node_and_edge() -> None:
     assert (box["name"], box["kind"]) == ("shorten", "box")
     assert (box["reads"], box["writes"]) == ({"draft": "text"}, {"draft": "text"})
     assert box["system"] == mas.boxes["shorten"].system.describe()
-    assert box["system"]["inputs"] == {"page": "text"} and box["system"]["nodes"][0]["name"] == "cutter"
+    assert box["system"]["inputs"] == {"page": "text"}
+    assert box["system"]["nodes"][0]["name"] == "cutter"
     assert [(node["name"], node["kind"]) for node in (publish, apology)] == [("publish", "step"), ("apology", "step")]
 
     edges = described["edges"]
@@ -562,7 +568,8 @@ def test_the_describe_id_follows_wiring_and_frozen_but_not_prompts() -> None:
     rewired = mas.copy(edges=mas.edges[:-1])  # count's on error edge gone
     assert rewired.describe()["id"] != described["id"]
     unfrozen = load({**example(), "frozen": []}).describe()
-    assert unfrozen["id"] != described["id"] and unfrozen["nodes"][2]["frozen"] is False
+    assert unfrozen["id"] != described["id"]
+    assert unfrozen["nodes"][2]["frozen"] is False
 
 
 def test_a_box_maps_its_inner_inputs_and_never_contains_itself() -> None:
@@ -614,7 +621,8 @@ def test_the_deck_example_round_trips() -> None:
         ("captioner", "figure_checker"),
     )
     words = {name: str(vtype) for name, vtype in drafter.inputs.items()}
-    assert words == {"page": "json", "house": "text"} and set(captioner.inputs) == {"figure", "house"}
+    assert words == {"page": "json", "house": "text"}
+    assert set(captioner.inputs) == {"figure", "house"}
     assert {name: str(vtype) for name, vtype in drafter.writes.items()} == {
         "draft": "text",
         "verdict": "json",
@@ -642,18 +650,26 @@ def test_the_deck_example_round_trips() -> None:
     assert list(spec["agents"][1]) == ["name", "model", "prompt", "for each", "reads", "writes", "schema"]
     assert list(spec["steps"][0]) == ["name", "uses", "for each", "retry"]
     again = load_deck(json.loads(json.dumps(spec)))
-    assert again.to_dict() == spec and again.structure == mas.structure  # idempotent
+    assert again.to_dict() == spec
+    assert again.structure == mas.structure  # idempotent
 
-    # A prompt given to one agent of a shared prompt reaches the others; a split made by hand does not dump.
+
+def test_a_prompt_given_to_one_sharer_reaches_the_others() -> None:
+    """A prompt given to one agent of a shared prompt reaches the others; a split made by hand does not dump."""
+    mas = load_deck()
     shared = "Is this claim made? {planned} {shown}"
     copied = mas.copy(prompts={"checker": shared})
-    assert copied.agents["figure_checker"].prompt == shared and copied.to_dict()["prompts"]["judge"] == shared
+    assert copied.agents["figure_checker"].prompt == shared
+    assert copied.to_dict()["prompts"]["judge"] == shared
     copied.agents["checker"].prompt = "Split {planned} {shown}"
     with pytest.raises(ValueError, match="sharing the prompt 'judge' hold different texts"):
         copied.to_dict()
 
-    described = mas.describe()
-    assert json.loads(json.dumps(described)) == described and described["outputs"] == {"deck": "json", "notes": "text"}
+
+def test_the_deck_example_describes_its_chains_and_nodes() -> None:
+    described = load_deck().describe()
+    assert json.loads(json.dumps(described)) == described
+    assert described["outputs"] == {"deck": "json", "notes": "text"}
     assert described["groups"] == [
         {
             "name": "drafter",
@@ -671,14 +687,18 @@ def test_the_deck_example_round_trips() -> None:
         },
     ]
     nodes = {node["name"]: node for node in described["nodes"]}
-    assert nodes["drafter"]["for each"] == "page in plan.slides" and "for each" not in nodes["noter"]
-    assert (
-        nodes["checker"]["placeholders"] == {"planned": "page", "shown": "measure"}
-        and "placeholders" not in nodes["noter"]
-    )
+    assert nodes["drafter"]["for each"] == "page in plan.slides"
+    assert "for each" not in nodes["noter"]
+    assert nodes["checker"]["placeholders"] == {"planned": "page", "shown": "measure"}
+    assert "placeholders" not in nodes["noter"]
     assert nodes["checker"]["reads"] == {"page": "json", "measure": "json"}  # one item's types
     assert nodes["assemble"]["reads"] == {"draft": "list of text", "verdict": "list of json", "caption": "list of text"}
-    assert nodes["render"]["retry"] == {"outage": 1} and described["joins"] == {"assemble": "join", END: "join"}
+    assert nodes["render"]["retry"] == {"outage": 1}
+    assert described["joins"] == {"assemble": "join", END: "join"}
+
+
+def test_the_structure_follows_chain_reads_and_retry_settings() -> None:
+    mas = load_deck()
 
     def variant(name: str, **fields: Any) -> MAS:
         data = copy.deepcopy(DECK_DATA)
@@ -734,8 +754,11 @@ def test_for_each_grammar(form: Any, want: ForEach | str) -> None:
             chain_of(form)
         return
     each = ForEach.parse(form)
-    assert each == want and (each.root, each.fields) == ("plan", ("slides",)) and str(each) == "page in plan.slides"
-    assert ForEach.parse(each.to_spec()) == each and chain_of(each).each["writer"] == each
+    assert each == want
+    assert (each.root, each.fields) == ("plan", ("slides",))
+    assert str(each) == "page in plan.slides"
+    assert ForEach.parse(each.to_spec()) == each
+    assert chain_of(each).each["writer"] == each
     assert each.to_spec() == (form if each.options else "page in plan.slides")
     if each.options:  # the round trip of a dumped long form, the options left out when none is set
         assert chain_of(form).to_dict()["agents"][0]["for each"] == form
@@ -755,9 +778,8 @@ def entries(section: str, name: str, **fields: Any) -> dict[str, list[dict[str, 
     """The deck's ``section`` with the fields of entry ``name`` replaced, ``None`` dropping one."""
     changed = []
     for entry in copy.deepcopy(DECK_DATA[section]):
-        if entry["name"] == name:
-            entry = {key: value for key, value in {**entry, **fields}.items() if value is not None}
-        changed.append(entry)
+        replaced = {key: value for key, value in {**entry, **fields}.items() if value is not None}
+        changed.append(replaced if entry["name"] == name else entry)
     return {section: changed}
 
 
@@ -907,9 +929,8 @@ def small(**settings: Any) -> MAS:
     ],
 )
 def test_check_names_every_chain_problem(build: Any, phrase: str) -> None:
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError, match=phrase):
         build()
-    assert re.search(phrase, str(info.value)), str(info.value)
 
 
 def test_agent_read_maps_and_dicts() -> None:
@@ -920,7 +941,8 @@ def test_agent_read_maps_and_dicts() -> None:
         True,
     )
     data = drafter.to_dict()
-    assert data["inputs"] == {"slide": "page", "rules": "house"} and Agent.from_dict(data) == drafter
+    assert data["inputs"] == {"slide": "page", "rules": "house"}
+    assert Agent.from_dict(data) == drafter
     assert drafter.copy(inputs=["page"]).reads == {"page": "page"}
     assert drafter.copy(inputs={"slide": "page"}).to_dict()["inputs"] == {"slide": "page"}
     assert Agent("a", "{v} {w}", "x", inputs={"v": "v", "w": "v"}).inputs == ["v"]  # values once each, in order
@@ -932,7 +954,8 @@ def test_agent_read_maps_and_dicts() -> None:
     v1 = Agent("solver", "Solve {query}", "answer")
     assert list(v1.to_dict()) == ["name", "prompt", "inputs", "output", "tools", "model"]
     v1.inputs = ["query", "hint"]
-    assert v1.reads == {"query": "query", "hint": "hint"} and not v1.renamed
+    assert v1.reads == {"query": "query", "hint": "hint"}
+    assert not v1.renamed
 
     # A renamed read makes a system version 2; a placeholder outside the map is a problem.
     reader = Agent("reader", "Read {text}", "said", inputs={"text": "query"})
@@ -945,7 +968,8 @@ def test_agent_read_maps_and_dicts() -> None:
 
     llm = MockLLM(lambda prompt: prompt.upper())
     trace = MAS([reader], llm=llm).run("cats")
-    assert trace["reader"][0].inputs == {"text": "cats"} and llm.calls == ["Read cats"]  # keyed by placeholder
+    assert trace["reader"][0].inputs == {"text": "cats"}
+    assert llm.calls == ["Read cats"]  # keyed by placeholder
 
 
 # ------------------------------------------------------------------- media
@@ -978,7 +1002,8 @@ def test_the_media_example_round_trips(png: Path) -> None:
     assert spec == MEDIA_DATA
     assert list(spec) == ["version", "inputs", "outputs", "agents", "steps", "edges", "models", "callables", "prompts"]
     again = load_media(json.loads(json.dumps(spec)))
-    assert again.to_dict() == spec and again.structure == mas.structure  # idempotent
+    assert again.to_dict() == spec
+    assert again.structure == mas.structure  # idempotent
 
     described = mas.describe()
     assert json.loads(json.dumps(described)) == described
@@ -986,7 +1011,8 @@ def test_the_media_example_round_trips(png: Path) -> None:
     assert described["nodes"][-1]["reads"] == {"slide_png": "list of image", "house_rules": "text", "plan": "json"}
     bare = load_media(BARE_MEDIA)  # its model states accepts itself
     assert (bare.models, bare.to_dict(), bare.structure) == ({}, BARE_MEDIA, mas.structure)
-    assert "models" not in bare.describe() and bare.describe()["id"] == described["id"]  # no compiled graph changes
+    assert "models" not in bare.describe()
+    assert bare.describe()["id"] == described["id"]  # no compiled graph changes
     with pytest.raises(ValueError, match="'models' entry 'vision-model' must map accepts and produces to lists"):
         load_media({**MEDIA_DATA, "models": {"vision-model": {"accepts": "image"}}})
 
@@ -995,7 +1021,8 @@ def test_the_media_example_round_trips(png: Path) -> None:
     house = png.with_name("house.md")
     house.write_text("# House\nOne claim per page.", encoding="utf-8")
     trace = load_media(llm=seer).run_state({"plan": PLAN, "house": house})
-    assert trace.error is None and trace.outputs == {"review": "The deck keeps its plan."}
+    assert trace.error is None
+    assert trace.outputs == {"review": "The deck keeps its plan."}
     (parts,) = seer.parts
     assert [type(part).__name__ for part in parts] == ["str", "Ref", "str", "Ref", "str", "Ref"]
     assert parts[0].endswith("Rules: # House\nOne claim per page.\nPages: \n[pages 0] ")
@@ -1025,10 +1052,14 @@ def shout(text: str) -> str:
                 outputs={"verdict": "text", "note": "text"},
             ),
             [
-                "agent 'judge' reads image 'png', but model 'text-model' accepts only text; bind a model that accepts "
-                "image (models: {text-model: {accepts: [image]}}) or convert it first with a step",
-                "agent 'glance' reads image 'png', but the default model accepts only text; give it accepts = "
-                '("text", "image") or convert it first with a step',
+                (
+                    "agent 'judge' reads image 'png', but model 'text-model' accepts only text; bind a model that "
+                    "accepts image (models: {text-model: {accepts: [image]}}) or convert it first with a step"
+                ),
+                (
+                    "agent 'glance' reads image 'png', but the default model accepts only text; give it accepts = "
+                    '("text", "image") or convert it first with a step'
+                ),
             ],
             id="image read on a text model",
         ),
@@ -1046,18 +1077,25 @@ def shout(text: str) -> str:
                 outputs={"draft": "text"},
             ),
             [
-                "agent 'writer' reads document 'house'; a model reads a document through a conversion step, such as "
-                "one using xmas.convert.document_text",
-                "step 'loud' passes document 'house' to parameter 'text' (string); text goes into a string parameter "
-                "only, document into a document parameter (xmas.media.Document) or a file, json into any other",
+                (
+                    "agent 'writer' reads document 'house'; a model reads a document through a conversion step, "
+                    "such as one using xmas.convert.document_text"
+                ),
+                (
+                    "step 'loud' passes document 'house' to parameter 'text' (string); text goes into a string "
+                    "parameter only, document into a document parameter (xmas.media.Document) or a file, json into "
+                    "any other"
+                ),
             ],
             id="document read",
         ),
         pytest.param(
             lambda: media_system(Agent("reader", "Sum up {sheet}", "summary", ["sheet"]), inputs={"sheet": "table"}),
             [
-                "agent 'reader' reads table 'sheet'; a model reads a table through a conversion step, such as one "
-                "using xmas.convert.table_rows"
+                (
+                    "agent 'reader' reads table 'sheet'; a model reads a table through a conversion step, such as one "
+                    "using xmas.convert.table_rows"
+                )
             ],
             id="table read",
         ),
@@ -1068,8 +1106,10 @@ def shout(text: str) -> str:
                 outputs={"picture": "image", "sound": "audio"},
             ),
             [
-                "agent 'painter' writes image 'picture', but model 'text-model' produces only text; bind a model "
-                "that produces image (models: {text-model: {produces: [image]}})",
+                (
+                    "agent 'painter' writes image 'picture', but model 'text-model' produces only text; bind a model "
+                    "that produces image (models: {text-model: {produces: [image]}})"
+                ),
                 "agent 'singer' writes audio 'sound'; a model answers with text, json or image",
             ],
             id="image write on a text model",
@@ -1101,10 +1141,14 @@ def shout(text: str) -> str:
                 models={"text-model": {"accepts": ["image"], "produces": ["image"]}},
             ),
             [
-                "model 'text-model' accepts image but cannot send content parts; use APILLM, or give it "
-                "generate_parts_with_meta and full_response = True",
-                "model 'text-model' produces image but cannot answer with images; use APILLM, or give it "
-                "generate_image_with_meta and full_response = True",
+                (
+                    "model 'text-model' accepts image but cannot send content parts; use APILLM, or give it "
+                    "generate_parts_with_meta and full_response = True"
+                ),
+                (
+                    "model 'text-model' produces image but cannot answer with images; use APILLM, or give it "
+                    "generate_image_with_meta and full_response = True"
+                ),
                 "step 'post' passes image 'png' to remote tool 'web_fetch'; remote tools read no media",
             ],
             id="a media model without parts",
@@ -1117,15 +1161,17 @@ def shout(text: str) -> str:
         pytest.param(
             lambda: load_media({**MEDIA_DATA, "models": {"vision-model": {"accepts": ["image"], "colour": "red"}}}),
             [
-                "models entry 'vision-model' has key 'colour'; it takes model, accepts, produces and the parameters "
-                "max_tokens, timeout_s, temperature, top_p, seed, reasoning_effort"
+                (
+                    "models entry 'vision-model' has key 'colour'; it takes model, accepts, produces and the "
+                    "parameters max_tokens, timeout_s, temperature, top_p, seed, reasoning_effort"
+                )
             ],
             id="an unknown key in models",
         ),
     ],
 )
 def test_check_names_every_capability_problem(build: Any, phrases: list[str]) -> None:
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError, match=re.escape(phrases[0])) as info:
         build()
     for phrase in phrases:
         assert phrase in str(info.value), (phrase, str(info.value))
@@ -1153,7 +1199,8 @@ def test_capabilities_resolve_in_order(png: Path) -> None:
     # the models entry over the model's own attributes over text only
     assert judged().capabilities(judge) == Capabilities(("text", "image"))
     declared = judged(models={"seer": {"accepts": ["image", "audio"]}})
-    assert declared.capabilities(judge) == Capabilities(("image", "audio")) and declared.version == 2
+    assert declared.capabilities(judge) == Capabilities(("image", "audio"))
+    assert declared.version == 2
     with pytest.raises(ValueError, match="model 'seer' accepts only text; bind a model that accepts image"):
         judged(models={"seer": {}})
     plain = Agent("plain", "Read {query}", "note")
@@ -1186,9 +1233,8 @@ def test_capabilities_resolve_in_order(png: Path) -> None:
             )
 
     # copy, rebuild and a chain's system keep the models
-    assert declared.copy().models == declared.models and declared.copy().to_dict()["models"] == {
-        "seer": {"accepts": ["image", "audio"]}
-    }
+    assert declared.copy().models == declared.models
+    assert declared.copy().to_dict()["models"] == {"seer": {"accepts": ["image", "audio"]}}
     updater = GraphUpdater(MechanicalSynthesizer(), TopologyBudget(max_agents=2, max_edges=2), seed=0)
     assert updater.rebuild(declared, updater.names_of(declared), updater.edges_of(declared)).models == declared.models
     each: dict[str, Any] = {
@@ -1207,7 +1253,8 @@ def test_capabilities_resolve_in_order(png: Path) -> None:
     weighed = MAS([], steps=[Step("weigh", "weigh", {"upload": "png"})], inputs={"png": "image"}, tools=[weigh])
     assert weighed.describe()["nodes"][0]["reads"] == {"png": "image"}
     trace = weighed.run_state({"png": png})
-    assert trace.error is None and trace.output == "6"
+    assert trace.error is None
+    assert trace.output == "6"
 
 
 @tool(writes={"deck": "json"})
@@ -1291,7 +1338,8 @@ def test_humans_and_races_round_trip() -> None:
         "name", "form", "reads", "writes", "question", "labels", "timeout_s", "default"
     ]  # fmt: skip
     again = load_humans(json.loads(json.dumps(spec)))
-    assert again.to_dict() == spec and again.structure == mas.structure  # idempotent
+    assert again.to_dict() == spec
+    assert again.structure == mas.structure  # idempotent
     unquoted = yaml.safe_load(HUMANS.replace("'yes'", "yes").replace("'no'", "no"))  # YAML reads them as booleans
     assert load_humans(unquoted).humans["approve"] == approve
     assert dump_edges(parse_edges(spec["edges"])) == spec["edges"]
@@ -1320,7 +1368,8 @@ def test_humans_and_races_round_trip() -> None:
     assert [edge["kind"] for edge in described["edges"] if edge["from"] == "outline"] == ["first of", "first of"]
     asked = copy.deepcopy(HUMANS_DATA)
     asked["humans"][1]["question"] = "Ship it?"
-    assert load_humans(asked).structure == mas.structure and load_humans(asked).describe()["id"] == described["id"]
+    assert load_humans(asked).structure == mas.structure
+    assert load_humans(asked).describe()["id"] == described["id"]
     relabelled = copy.deepcopy(HUMANS_DATA)
     relabelled["humans"][1]["labels"]["no"] = "Redraw"
     assert load_humans(relabelled).structure != mas.structure
@@ -1334,8 +1383,11 @@ def test_humans_and_races_round_trip() -> None:
     held.asker, held.store = asker, store
     copied = held.copy()
     assert (copied.asker, copied.store, copied.humans) == (asker, store, held.humans)
-    assert copied.to_dict() == spec and held.v2_kwargs()["humans"] == tuple(held.humans.values())
-    assert held.runs() is store and isinstance(mas.runs(), Store) and mas.runs() is mas.runs()
+    assert copied.to_dict() == spec
+    assert held.v2_kwargs()["humans"] == tuple(held.humans.values())
+    assert held.runs() is store
+    assert isinstance(mas.runs(), Store)
+    assert mas.runs() is mas.runs()
     assert held.checked().chains["drafter"].system.runs() is store  # a chain's items keep the outer runs
 
 
@@ -1351,7 +1403,8 @@ def test_a_human_makes_a_system_version_2() -> None:
         MAS([writer], humans=[gate], edges=[("writer", "approve")], llm=MockLLM(), version=1)
     with pytest.raises(ValueError, match=r"Node names must be unique: \['writer'\]"):
         MAS([writer], humans=[Human("writer", "approve", ["query"])], llm=MockLLM())
-    assert mas.copy().structure == mas.structure and "human approve" in mas.structure
+    assert mas.copy().structure == mas.structure
+    assert "human approve" in mas.structure
     assert Human("r", "judge", {"left": "a", "right": "b"}, pair=["left", "right"]).to_dict()["reads"] == {
         "left": "a",
         "right": "b",
@@ -1361,7 +1414,8 @@ def test_a_human_makes_a_system_version_2() -> None:
     retitled = MAS([], humans=[fix], inputs={"title": "text"}, outputs={"final": "text"})
     per_item = MAS([], humans=[fix], inputs={"titles": "list of text"}, each={"fix": "title in titles"},
                    outputs={"final": "list of text"})  # fmt: skip
-    assert str(retitled.checked().types["final"]) == "text" and per_item.checked().humans == ("fix",)
+    assert str(retitled.checked().types["final"]) == "text"
+    assert per_item.checked().humans == ("fix",)
     assert per_item.checked().chains["fix"].writes == {"fix": ValueType("json"), "final": ValueType("text")}
     refused: list[tuple[dict[str, Any], str]] = [
         ({"name": ""}, "needs a name"),
@@ -1422,7 +1476,8 @@ def test_the_gate_checks() -> None:
 
 def test_a_mapping_write_names_the_answer() -> None:
     typed = gate(writes={"approval": "json"})  # {name: type}, as an agent writes
-    assert typed.humans["approve"] == gate().humans["approve"] and typed.checked().humans == ("approve",)
+    assert typed.humans["approve"] == gate().humans["approve"]
+    assert typed.checked().humans == ("approve",)
     with pytest.raises(ValueError, match=r"writes is a value name, \{name: json\}"):
         gate(writes={"approval": "text"})
 
@@ -1567,9 +1622,8 @@ def test_a_mapping_write_names_the_answer() -> None:
     ],
 )
 def test_check_names_every_human_problem(build: Any, phrase: str) -> None:
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError, match=phrase):
         build()
-    assert re.search(phrase, str(info.value)), str(info.value)
 
 
 RACE = """\
@@ -1601,7 +1655,8 @@ FIRST = [{"outline -> quick": "first of"}, {"outline -> careful": "first of"}]
 
 def test_a_race_checks() -> None:
     info = race().checked()
-    assert info.races == {"outline": ("quick", "careful")} and info.writers["notes"] == ("quick", "careful")
+    assert info.races == {"outline": ("quick", "careful")}
+    assert info.writers["notes"] == ("quick", "careful")
     assert info.joins[END].kind == "merge"  # the winner's writes arrive
     polish = {"name": "polish", "reads": ["notes"], "writes": {"final": "text"}}
     joined = race(polish, edges=[*FIRST, "quick -> polish", "careful -> polish"], outputs={"final": "text"})
@@ -1739,65 +1794,89 @@ def test_a_race_checks() -> None:
     ],
 )
 def test_check_names_every_race_problem(build: Any, phrase: str) -> None:
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError, match=phrase):
         build()
-    assert re.search(phrase, str(info.value)), str(info.value)
 
 
 NOW = datetime(2026, 10, 24, 9, 0, tzinfo=UTC)
 GATE_PLAN = {"title": "Deck", "choices": ["short", {"label": "long"}]}
 
 
-def test_questions_and_answers_without_a_run() -> None:
-    approve = Human(
+LATER = NOW + timedelta(seconds=30)
+"""When the approval gate's question is answered, half way to its timeout."""
+GATE_TYPES = {"deck": ValueType("json"), "plan": ValueType("json")}
+
+
+def approval_human() -> Human:
+    """A gate that asks to ship the deck, times out after a minute and then rejects."""
+    return Human(
         "approve", "approve", ["deck", "plan"], "approval", question="Ship '{plan.title}'?",
         labels={"yes": "Ship {plan.title}"}, timeout_s=60, default={"approved": False},
     )  # fmt: skip
-    types = {"deck": ValueType("json"), "plan": ValueType("json")}
-    question = approve.ask({"deck": {"pages": 2}, "plan": GATE_PLAN}, types, run_id="r1", visit=1, now=NOW)
+
+
+def approval_question() -> Question:
+    """The gate's first question of run ``r1``."""
+    return approval_human().ask({"deck": {"pages": 2}, "plan": GATE_PLAN}, GATE_TYPES, run_id="r1", visit=1, now=NOW)
+
+
+def pick_question() -> Question:
+    """A question whose options come from the plan's choices, for item ``intro`` of a chain."""
+    pick = Human("pick", "ask", ["plan"], options="plan.choices", question="Which?")
+    return pick.ask({"plan": GATE_PLAN}, GATE_TYPES, run_id="r1", visit=1, now=NOW, item=0, item_key="intro")
+
+
+def test_a_human_asks_a_question_without_a_run() -> None:
+    types = GATE_TYPES
+    question = approval_question()
     assert (question.id, question.text, question.options) == ("r1/approve/1", "Ship 'Deck'?", ("Ship Deck", "Reject"))
     assert question.shown == {"deck": '{"pages": 2}', "plan": json.dumps(GATE_PLAN)}
-    assert question.deadline == (NOW + timedelta(seconds=60)).isoformat() and not question.due(NOW)
+    assert question.deadline == (NOW + timedelta(seconds=60)).isoformat()
+    assert not question.due(NOW)
     assert question.due(NOW + timedelta(seconds=60))
     assert Question.from_dict(json.loads(json.dumps(question.to_dict()))) == question
     assert Pause("r1", (question,)).to_dict() == {"run_id": "r1", "questions": [question.to_dict()]}
-    assert (
-        question_id("r1", "fix", 2, item=3) == "r1/fix/3/2"
-        and question_id("r1", "fix", 1, 0, "intro") == "r1/fix/intro/1"
-    )
+    assert question_id("r1", "fix", 2, item=3) == "r1/fix/3/2"
+    assert question_id("r1", "fix", 1, 0, "intro") == "r1/fix/intro/1"
     assert fill("{plan.title} {plan.missing} {other} {{plan}}", {"plan": GATE_PLAN}, types) == "Deck  {other} {{plan}}"
 
-    later = NOW + timedelta(seconds=30)
-    answer = answer_value(question, {"approved": True, "who": "tom"}, now=later)
+
+def test_an_answer_is_checked_and_completed() -> None:
+    approve, question = approval_human(), approval_question()
+    answer = answer_value(question, {"approved": True, "who": "tom"}, now=LATER)
     assert answer == {
         "approved": True,
         "option": "Ship Deck",
         "who": "tom",
         "asked_at": NOW.isoformat(),
-        "answered_at": later.isoformat(),
+        "answered_at": LATER.isoformat(),
         "comment": None,
         "timed_out": False,
     }
-    assert answer_value(question, {"option": "Reject", "who": "tom"}, now=later)["approved"] is False
-    timed_out = answer_value(question, question.default or {}, now=later, timed_out=True)
+    assert answer_value(question, {"option": "Reject", "who": "tom"}, now=LATER)["approved"] is False
+    timed_out = answer_value(question, question.default or {}, now=LATER, timed_out=True)
     assert (timed_out["approved"], timed_out["option"], timed_out["who"], timed_out["timed_out"]) == (
         False, "Reject", None, True
     )  # fmt: skip
     assert approve.state_writes(answer) == {"approval": answer}
-    with pytest.raises(ValueError) as info:
-        answer_value(question, {"approved": "yes", "option": "Ship", "extra": 1}, now=later)
+    with pytest.raises(ValueError, match="'extra' is not a field") as info:
+        answer_value(question, {"approved": "yes", "option": "Ship", "extra": 1}, now=LATER)
     for phrase in ("'extra' is not a field", "approved is true or false", "who answered is missing"):
         assert phrase in str(info.value)
 
     with pytest.raises(
         ValueError, match="comment is a text, got 3; option 'Reject' is not the label of the choice, 'Ship Deck'"
     ):
-        answer_value(question, {"approved": True, "option": "Reject", "who": "tom", "comment": 3}, now=later)
+        answer_value(question, {"approved": True, "option": "Reject", "who": "tom", "comment": 3}, now=LATER)
+
+
+def test_options_come_from_the_labels_or_from_state() -> None:
+    types = GATE_TYPES
     literal = Human("pick", "ask", ["plan"], options=["{plan.title} as it is", "redo"], question="{plan}")
     shown = literal.ask({"plan": GATE_PLAN}, types, run_id="r1", visit=1, now=NOW)
     assert (shown.text, shown.options) == (json.dumps(GATE_PLAN), ("Deck as it is", "redo"))
     pick = Human("pick", "ask", ["plan"], options="plan.choices", question="Which?")
-    asked = pick.ask({"plan": GATE_PLAN}, types, run_id="r1", visit=1, now=NOW, item=0, item_key="intro")
+    asked = pick_question()
     assert (asked.id, asked.options, asked.deadline) == ("r1/pick/intro/1", ("short", "long"), None)
     assert answer_value(asked, {"option": "long", "who": "ann"}, now=NOW)["option"] == "long"
     with pytest.raises(ValueError, match=r"option 'medium' is not one of \['short', 'long'\]"):
@@ -1807,9 +1886,12 @@ def test_questions_and_answers_without_a_run() -> None:
     with pytest.raises(ValueError, match="must be a list of text"):
         pick.ask({"plan": {"choices": "short"}}, types, run_id="r1", visit=1, now=NOW)
 
+
+def test_a_judge_and_an_edit_node_answer() -> None:
     judge = Human("judge", "judge", {"left": "a", "right": "b"}, pair=["left", "right"])
     duel = judge.ask({"a": "one", "b": "two"}, {}, run_id="r1", visit=2, now=NOW)
-    assert duel.options == ("left", "right", "tie") and duel.shown == {"left": "one", "right": "two"}
+    assert duel.options == ("left", "right", "tie")
+    assert duel.shown == {"left": "one", "right": "two"}
     assert answer_value(duel, {"pick": "tie", "who": "tom", "comment": "both fine"}, now=NOW)["comment"] == "both fine"
 
     edit = Human("fix", "edit", ["draft"], {"answer": "fix", "value": "final"}, edits="draft")
@@ -1831,9 +1913,12 @@ def test_questions_and_answers_without_a_run() -> None:
     with pytest.raises(ValueError, match="the edited value is not text: expected text, got dict"):
         answer_value(typed, {"value": {"title": "New"}, "who": "tom"}, now=NOW)
 
-    # a host's answered_at is an ISO time with its zone, not before the question
-    given_at = {"approved": True, "who": "tom", "answered_at": later.isoformat()}
-    assert answer_value(question, given_at, now=NOW)["answered_at"] == later.isoformat()
+
+def test_a_host_answered_at_is_a_zoned_time_not_before_the_question() -> None:
+    """A host's answered_at is an ISO time with its zone, not before the question."""
+    question = approval_question()
+    given_at = {"approved": True, "who": "tom", "answered_at": LATER.isoformat()}
+    assert answer_value(question, given_at, now=NOW)["answered_at"] == LATER.isoformat()
     for stamp, problem in (
         ("yesterday", "answered_at is an ISO time with its zone"),
         ("2026-10-24T09:00:30", "answered_at is an ISO time with its zone"),
@@ -1841,10 +1926,14 @@ def test_questions_and_answers_without_a_run() -> None:
         ((NOW - timedelta(seconds=1)).isoformat(), "comes before the question was asked"),
     ):
         with pytest.raises(ValueError, match=problem):
-            answer_value(question, {"approved": True, "who": "tom", "answered_at": stamp}, now=later)
+            answer_value(question, {"approved": True, "who": "tom", "answered_at": stamp}, now=LATER)
     assert set(ANSWER_FIELDS) == set(FORMS)
 
-    # an optimizer replays recorded answers and asks nobody
+
+def test_an_optimizer_replays_recorded_answers_and_asks_nobody() -> None:
+    question, asked = approval_question(), pick_question()
+    answer = answer_value(question, {"approved": True, "who": "tom"}, now=LATER)
+    timed_out = answer_value(question, question.default or {}, now=LATER, timed_out=True)
     record = AgentRecord(
         "approve", 0, "", "", {}, {}, kind="human", raw_response=json.dumps(answer), visit=1, wait_s=30.0
     )
@@ -1854,11 +1943,17 @@ def test_questions_and_answers_without_a_run() -> None:
     assert replay.ask(question) == given  # answered when asked again: the recorded time stays behind
     assert replay.ask(Question(**{**question.to_dict(), "visit": 2, "options": ("a", "b")})) is None  # a default
     assert replay.ask(asked) is None
-    assert answer_value(question, replay.ask(question) or {}, now=later) == answer
+    assert answer_value(question, replay.ask(question) or {}, now=LATER) == answer
 
-    # records, events and health carry the waits
+
+def test_records_events_and_health_carry_the_waits() -> None:
+    answer = answer_value(approval_question(), {"approved": True, "who": "tom"}, now=LATER)
+    record = AgentRecord(
+        "approve", 0, "", "", {}, {}, kind="human", raw_response=json.dumps(answer), visit=1, wait_s=30.0
+    )
     assert record == AgentRecord("approve", 0, "", "", {}, {}, kind="human", raw_response=json.dumps(answer), visit=1)
-    assert record.to_dict()["wait_s"] == 30.0 and "lost" not in record.to_dict()
+    assert record.to_dict()["wait_s"] == 30.0
+    assert "lost" not in record.to_dict()
     lost = AgentRecord("quick", 2, "p", "p", {}, {}, lost=True)
     assert lost.to_dict()["lost"] is True
     assert summarize([record, lost]).budget == {"waited_s": {"spent": 30.0}}
@@ -1871,11 +1966,14 @@ def test_questions_and_answers_without_a_run() -> None:
     ]
     assert [event.to_dict() for event in events][2] == {"kind": "stop", "node": "", "run_id": "r1", "at_s": 31.0,
                                                         "reason": "stopped"}  # fmt: skip
-    assert Trace("q", "").pause is None and "pause" not in Trace("q", "").to_dict()
+    assert Trace("q", "").pause is None
+    assert "pause" not in Trace("q", "").to_dict()
 
 
 def test_a_paused_trace_says_so() -> None:
     question = Human("a", "approve", ["query"]).ask({"query": "q"}, {}, run_id="r", visit=1, now=NOW)
     paused = Trace("q", "", pause=Pause("r", (question,)))
-    assert paused.status is RunStatus.PAUSED and paused == Trace("q", "")
-    assert paused.to_dict()["status"] == "paused" and paused.to_dict()["pause"]["questions"][0]["id"] == "r/a/1"
+    assert paused.status is RunStatus.PAUSED
+    assert paused == Trace("q", "")
+    assert paused.to_dict()["status"] == "paused"
+    assert paused.to_dict()["pause"]["questions"][0]["id"] == "r/a/1"

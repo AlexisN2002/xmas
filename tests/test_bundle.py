@@ -94,13 +94,15 @@ def test_the_deck_saves_and_loads_as_a_bundle(tmp_path: Path) -> None:
     assert sorted(read(path)) == DECK_FILES
     wiring = yaml.safe_load((path / "xmas.yaml").read_text(encoding="utf-8"))
     spec = made.to_dict()
-    assert "prompts" not in wiring and "callables" not in wiring
+    assert "prompts" not in wiring
+    assert "callables" not in wiring
     assert wiring == {key: value for key, value in spec.items() if key not in ("prompts", "callables")}
     assert yaml.safe_load((path / "callables.yaml").read_text(encoding="utf-8")) == spec["callables"]
     assert (path / "prompts/judge.md").read_text(encoding="utf-8") == spec["prompts"]["judge"] + "\n"  # no header
 
     loaded = MAS.load(path, llms=deck_llms(), config=NO_CATALOGUE)  # callables imported by their paths
-    assert loaded.bundle == path and loaded.unresolved == {}
+    assert loaded.bundle == path
+    assert loaded.unresolved == {}
     assert loaded.to_dict() == spec
     assert loaded.describe()["id"] == made.describe()["id"]
     assert records(loaded) == records(deck())
@@ -247,7 +249,8 @@ def test_a_shared_schema_moves_into_the_prompt_file_only_when_every_sharer_agree
     agreeing = shared_judges({})
     path = agreeing.save(tmp_path / "agree.mas")
     text, schema = parse_prompt((path / "prompts/judge.md").read_text(encoding="utf-8"), "judge")
-    assert schema == agreeing.agents["checker"].schema and text == agreeing.prompts()["checker"]
+    assert schema == agreeing.agents["checker"].schema
+    assert text == agreeing.prompts()["checker"]
     wiring = yaml.safe_load((path / "xmas.yaml").read_text(encoding="utf-8"))
     assert all("schema" not in agent for agent in wiring["agents"])
     assert MAS.load(path, llms=deck_llms(), config=NO_CATALOGUE).to_dict() == agreeing.to_dict()
@@ -304,7 +307,7 @@ class Offered(ToolSource):
         return "page"
 
 
-def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path) -> None:
     made = example_mas()
     path = made.save(tmp_path / "example.mas")
     names = sorted(read(path))
@@ -321,8 +324,15 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     }
     llms: dict[str, BaseLLM] = {"text-model": MockLLM(turns=[])}
     loaded = MAS.load(path, llms=llms, tools=[RemoteTools()], config=NO_CATALOGUE)
-    assert loaded.to_dict() == made.to_dict() and loaded.describe()["id"] == made.describe()["id"]
+    assert loaded.to_dict() == made.to_dict()
+    assert loaded.describe()["id"] == made.describe()["id"]
 
+
+def test_a_named_server_is_built_from_the_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    made = example_mas()
+    path = made.save(tmp_path / "example.mas")
+    callables = yaml.safe_load((path / "callables.yaml").read_text(encoding="utf-8"))
+    llms: dict[str, BaseLLM] = {"text-model": MockLLM(turns=[])}
     made_servers: list[tuple[str, str | None, str | None, dict[str, Any]]] = []
 
     class Served(Offered):
@@ -346,6 +356,12 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     with pytest.raises(ValueError, match=r"remote tool with no server: pass tools=.*configure \[tools.<name>\] url"):
         MAS.load(path, llms=llms, config=NO_CATALOGUE)
 
+
+def test_box_paths_and_server_addresses_are_refused(tmp_path: Path) -> None:
+    made = example_mas()
+    path = made.save(tmp_path / "example.mas")
+    wiring = yaml.safe_load((path / "xmas.yaml").read_text(encoding="utf-8"))
+    llms: dict[str, BaseLLM] = {"text-model": MockLLM(turns=[])}
     wiring["boxes"][0]["system"] = "../shorten.mas"
     (path / "xmas.yaml").write_text(yaml.safe_dump(wiring), encoding="utf-8")
     with pytest.raises(ValueError, match=r"'../shorten.mas' is outside the bundle"):
@@ -359,6 +375,9 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     with pytest.raises(ValueError, match=r"its address goes to the configuration"):
         MAS.from_dict(spec, llms=llms, tools=[*conftest_tools(), RemoteTools()])
 
+
+def test_mcp_tools_have_a_name_and_not_an_address() -> None:
+    llms: dict[str, BaseLLM] = {"text-model": MockLLM(turns=[])}
     plain = MAS.from_dict(yaml.safe_load(EXAMPLE) | {"callables": {}}, llms=llms, tools=[*conftest_tools(), Offered()])
     assert plain.to_dict()["callables"]["web_fetch"] == {
         "kind": "mcp",
@@ -367,7 +386,13 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     }
     named = MCPTools("https://tools.example.com/mcp", "k", name="web")
     assert (named.name, repr(named)) == ("web", "MCPTools('https://tools.example.com/mcp', name='web')")
+    with pytest.raises(ValueError, match=r"is a name such as 'web'"):
+        MCPTools("https://tools.example.com/mcp", "k", name="https://tools.example.com")
 
+
+def test_a_box_runs_on_its_own_default_model(tmp_path: Path) -> None:
+    made = example_mas()
+    llms: dict[str, BaseLLM] = {"text-model": MockLLM(turns=[])}
     spec = made.to_dict() | {"default_model": "text-model"}
     spec["boxes"][0]["system"]["default_model"] = "cut-model"
     two = MAS.from_dict(spec, llms=llms, tools=[*conftest_tools(), RemoteTools()])
@@ -376,8 +401,6 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     built = {name: llm.model for name, llm in boxed.llms.items() if isinstance(llm, Unconfigured)}
     assert built == {"text-model": "text-model", "cut-model": "cut-model"}  # the box's own default is built
     assert inner.resolve_llm(inner.agents["cutter"]) is boxed.llms["cut-model"]  # and the box runs on it
-    with pytest.raises(ValueError, match=r"is a name such as 'web'"):
-        MCPTools("https://tools.example.com/mcp", "k", name="https://tools.example.com")
 
 
 class OfflineMCP(MCPTools):
@@ -458,14 +481,16 @@ def test_save_rewrites_only_what_changed(tmp_path: Path) -> None:
     spec["agents"] = [agent for agent in spec["agents"] if agent["name"] != "noter"]
     del spec["prompts"]["noter"], spec["outputs"]["notes"]
     MAS.from_dict(spec, llms=dict(deck_llms()), tools=[render_page, assemble_deck]).save(path)
-    assert not (path / "prompts/noter.md").exists() and (path / "examples/warmup.yaml").exists()
+    assert not (path / "prompts/noter.md").exists()
+    assert (path / "examples/warmup.yaml").exists()
 
     (path / "callables.yaml").write_text("render_page: [unclosed\n", encoding="utf-8")
     example_mas().save(path)  # another system: the deck's files go, a box comes
     assert {"boxes/shorten.mas/xmas.yaml", "callables.yaml"} <= set(read(path))
     assert not (path / "prompts/drafter.md").exists()
     deck().save(path)
-    assert not (path / "boxes").exists() and "render_page:" in (path / "callables.yaml").read_text(encoding="utf-8")
+    assert not (path / "boxes").exists()
+    assert "render_page:" in (path / "callables.yaml").read_text(encoding="utf-8")
     with pytest.raises(ValueError, match=r"Prompt name '\.\./evil' cannot be a file name in a bundle"):
         MAS([Agent("noter", "Notes on {query}", "notes")], llm=MockLLM(), prompt_names={"noter": "../evil"}).save(path)
 
@@ -647,7 +672,8 @@ def test_lock_compare_and_code_hashes(tmp_path: Path, monkeypatch: pytest.Monkey
     mas = MAS.load(steps, config=NO_CATALOGUE, trust=True)
     mas.save(steps)
     saved = Lock.from_yaml((steps / LOCK).read_text(encoding="utf-8"))
-    assert sorted(saved.code) == ["pad", "shout"] and all(saved.code.values())
+    assert sorted(saved.code) == ["pad", "shout"]
+    assert all(saved.code.values())
     module = tmp_path / "stepsmod.py"
     module.write_text(
         module.read_text(encoding="utf-8").replace("text.upper()", "text.upper() + '!'"), encoding="utf-8"
@@ -699,7 +725,8 @@ def test_model_names_warn_and_refuse_runs(tmp_path: Path) -> None:
     wiring["models"] = {"judge-model": {"model": "judge-models", "accepts": []}}
     (path / "xmas.yaml").write_text(yaml.safe_dump(wiring, sort_keys=False), encoding="utf-8")
     entry = MAS.load(path, llms=deck_llms(), config=near)
-    assert entry.unresolved == {} and entry.models == {"judge-model": ModelEntry(model="judge-models")}
+    assert entry.unresolved == {}
+    assert entry.models == {"judge-model": ModelEntry(model="judge-models")}
     assert entry.to_dict()["models"] == {"judge-model": {"model": "judge-models"}}
     assert records(entry) == records(deck())
 
@@ -754,7 +781,8 @@ def test_configuration_order(tmp_path: Path, clean_env: pytest.MonkeyPatch) -> N
 
     from_file = MAS.load(path, tools=tools)
     judge, writer = from_file.llms["judge-model"], from_file.llms["writer-model"]
-    assert isinstance(judge, APILLM) and isinstance(writer, APILLM)
+    assert isinstance(judge, APILLM)
+    assert isinstance(writer, APILLM)
     assert (judge.api_url, judge.api_key, judge.stream, judge.price) == (
         "http://file.example/v1",
         "sk-file",
@@ -793,7 +821,8 @@ def test_model_names_resolve_with_suggestions(tmp_path: Path, clean_env: pytest.
     with warnings.catch_warnings():
         warnings.simplefilter("error", ModelNameWarning)
         offline = MAS.load(path, llms=deck_llms())
-    assert offline.unresolved == {} and records(offline) == records(deck())
+    assert offline.unresolved == {}
+    assert records(offline) == records(deck())
 
     listed = httpx.MockTransport(lambda request: httpx.Response(200, json={"data": [{"id": "writer-model"}]}))
     first = Config(base_url="http://127.0.0.1:9/v1", api_key="sk-first")
@@ -805,7 +834,8 @@ def test_model_names_resolve_with_suggestions(tmp_path: Path, clean_env: pytest.
         warnings.simplefilter("error", ModelNameWarning)
         assert MAS.load(path, llms=deck_llms(), config=second).unresolved == {}
     kept = [item.read_text(encoding="utf-8") for item in (tmp_path / "cache").rglob("*.json")]
-    assert len(kept) == 1 and "sk-first" not in kept[0]
+    assert len(kept) == 1
+    assert "sk-first" not in kept[0]
 
 
 def test_models_entries_and_the_overlay(tmp_path: Path, clean_env: pytest.MonkeyPatch) -> None:
@@ -825,7 +855,9 @@ def test_models_entries_and_the_overlay(tmp_path: Path, clean_env: pytest.Monkey
     tools = [render_page, assemble_deck]
     mas = MAS.load(path, tools=tools, config=config, overlay={"noter": "editor"})
     judge, writer, editor = (mas.llms[name] for name in ("judge-model", "writer-model", "editor"))
-    assert isinstance(judge, APILLM) and isinstance(writer, APILLM) and isinstance(editor, APILLM)
+    assert isinstance(judge, APILLM)
+    assert isinstance(writer, APILLM)
+    assert isinstance(editor, APILLM)
     assert (judge.model_id, judge.call_timeout_s, judge.call_params()) == (
         "judge-x",
         30,
@@ -851,29 +883,50 @@ def test_models_entries_and_the_overlay(tmp_path: Path, clean_env: pytest.Monkey
             MAS.load(path, tools=tools, config=config)
 
     keyless = build_llms(["local-model"], {}, Config(base_url="http://localhost:8080/v1"))["local-model"]
-    assert isinstance(keyless, APILLM) and keyless.model_id == "local-model"  # an endpoint that needs no key
+    assert isinstance(keyless, APILLM)
+    assert keyless.model_id == "local-model"  # an endpoint that needs no key
 
     write({"judge-model": {"model": "judge-x"}})
     unconfigured = MAS.load(path, tools=tools, config=Config(catalogue=("judge-x", "writer-model")))
     offline = unconfigured.llms["judge-model"]
-    assert isinstance(offline, Unconfigured) and offline.model == "judge-x"
+    assert isinstance(offline, Unconfigured)
+    assert offline.model == "judge-x"
     with pytest.raises(ValueError, match=r"model 'judge-x' has no endpoint: set XMAS_BASE_URL, or base_url"):
         offline.get_response("x")
     trace = unconfigured.run_state({"plan": PLAN, "house": "plain"})
-    assert trace.failed and "has no endpoint" in str(trace.error)
+    assert trace.failed
+    assert "has no endpoint" in str(trace.error)
 
 
-def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    clean_env.chdir(tmp_path)
-    clean_env.setenv("XMAS_API_KEY", "sk-secret")
-    seen: list[str] = []
+class CommandLine:
+    """Runs the xmas command, checks its exit code and keeps all it printed."""
 
-    def out(code: int, *args: str) -> str:
+    def __init__(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Read the output through ``capsys``."""
+        self.capsys = capsys
+        self.printed: list[str] = []
+
+    def __call__(self, code: int, *args: str) -> str:
+        """Run ``xmas args``, expect exit ``code`` and return what it printed."""
         assert main(list(args)) == code, args
-        captured = capsys.readouterr()
-        seen.append(captured.out + captured.err)
+        captured = self.capsys.readouterr()
+        self.printed.append(captured.out + captured.err)
         return captured.out + captured.err
 
+    def leaked(self, secret: str) -> bool:
+        """Whether any command printed ``secret``."""
+        return any(secret in text for text in self.printed)
+
+
+@pytest.fixture
+def out(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> CommandLine:
+    """The command line, run in ``tmp_path`` with a key set that it must never print."""
+    clean_env.chdir(tmp_path)
+    clean_env.setenv("XMAS_API_KEY", "sk-secret")
+    return CommandLine(capsys)
+
+
+def test_the_command_line_inits_checks_and_shows(tmp_path: Path, out: CommandLine) -> None:
     hello = tmp_path / "hello.mas"
     assert "wrote" in out(0, "init", str(hello))
     assert sorted(read(hello)) == ["examples/warmup.yaml", "optimize.yaml", "prompts/assistant.md", LOCK, "xmas.yaml"]
@@ -895,8 +948,12 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     (path / "examples").mkdir()
     (path / "examples" / "warmup.yaml").write_text("version: 1\nexamples: [{name: a, nodes: x}]\n", "utf-8")
     assert "unknown: nodes" in out(1, "check", str(path))
-    (path / "examples" / "warmup.yaml").unlink()
+    assert not out.leaked("sk-secret")
 
+
+def test_the_command_line_imports_code_beside_a_bundle_only_when_trusted(
+    tmp_path: Path, clean_env: pytest.MonkeyPatch, out: CommandLine
+) -> None:
     (tmp_path / "cwdtools.py").write_text(STEPS_MODULE, encoding="utf-8")  # code beside the bundle
     local = tmp_path / "local.mas"
     local.mkdir()
@@ -904,16 +961,26 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     (local / "callables.yaml").write_text(STEPS_BUNDLE["callables.yaml"].replace("stepsmod", "cwdtools"), "utf-8")
     before = list(sys.path)
     assert "'cwdtools:shout' is in a module not imported yet" in out(1, "check", str(local))
-    assert "cwdtools" not in sys.modules and sys.path == before
+    assert "cwdtools" not in sys.modules
+    assert sys.path == before
     assert out(0, "check", "--trust", str(local)) == "ok: 2 nodes, 1 edge, 0 chains\n"
     assert sys.path == before  # the current folder joined it for that command only
     clean_env.delitem(sys.modules, "cwdtools")
+    assert not out.leaked("sk-secret")
 
+
+def test_the_command_line_diffs_bundles(tmp_path: Path, out: CommandLine) -> None:
+    hello = tmp_path / "hello.mas"
+    out(0, "init", str(hello))
+    pair = tmp_path / "pair.mas"
+    out(0, "init", str(pair), "--agents", "writer,editor", "--model", "small-model")
+    path = deck().save(tmp_path / "deck.mas")
     other = tmp_path / "other.mas"
     shutil.copytree(path, other)
     (other / "prompts" / "noter.md").write_text("Notes, by hand: {plan}\n", encoding="utf-8")
     changed = out(1, "diff", str(path), str(other))
-    assert "-Write" in changed and "+Notes, by hand: {plan}" in changed
+    assert "-Write" in changed
+    assert "+Notes, by hand: {plan}" in changed
     assert out(0, "diff", str(path), str(path)) == "same files\n"
     assert out(1, "diff", str(other)) == "changed: prompts/noter.md\n"
     assert json.loads(out(1, "diff", "--json", str(other))) == {
@@ -926,7 +993,13 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     assert "no bundle at" in out(2, "diff", str(tmp_path / "none.mas"))
     (pair / LOCK).unlink()
     assert "has no xmas.lock; give a second bundle" in out(1, "diff", str(pair))
+    assert not out.leaked("sk-secret")
 
+
+def test_the_command_line_runs(tmp_path: Path, clean_env: pytest.MonkeyPatch, out: CommandLine) -> None:
+    hello = tmp_path / "hello.mas"
+    out(0, "init", str(hello))
+    path = deck().save(tmp_path / "deck.mas")
     assert "no endpoint: set XMAS_BASE_URL" in out(1, "run", str(hello), "--query", "Why?")
     clean_env.setenv("XMAS_BASE_URL", "http://127.0.0.1:9/v1")
     clean_env.setenv("XMAS_MODELS", "text-model,writer-model,judge-model")
@@ -942,10 +1015,15 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     assert "IndexError" in out(1, "run", str(hello), "--query", "Why?").splitlines()[-1]
     clean_env.setenv("XMAS_MODELS", "writer-model")
     refused = out(1, "run", str(hello), "--query", "Why?")
-    assert "warning: model 'text-model' (agent assistant)" in refused and "Model names not in the catalogue" in refused
+    assert "warning: model 'text-model' (agent assistant)" in refused
+    assert "Model names not in the catalogue" in refused
+    assert not out.leaked("sk-secret")
 
-    clean_env.delenv("XMAS_BASE_URL")
-    clean_env.delenv("XMAS_MODELS")
+
+def test_the_command_line_verifies(tmp_path: Path, clean_env: pytest.MonkeyPatch, out: CommandLine) -> None:
+    hello = tmp_path / "hello.mas"
+    out(0, "init", str(hello))
+    scripted = {**deck_llms(), "text-model": MockLLM(lambda p: "Rayleigh.", meta=True)}
     clean_env.setattr(xmas.mas, "build_llms", lambda names, models, config: scripted)
     assert out(0, "verify", str(hello)).splitlines()[-1] == "ok: level 1"
     assert (
@@ -955,7 +1033,10 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     (hello / "prompts" / "assistant.md").write_text("Answer briefly: {query}\n", encoding="utf-8")
     assert "level 0: changed: prompts/assistant.md" in out(0, "verify", str(hello), "--level", "0")
     assert out(1, "verify", str(hello), "--level", "0", "--strict").splitlines()[-1] == "not ok: level 0 differs"
-    assert not any("sk-secret" in text for text in seen)
+    assert not out.leaked("sk-secret")
+
+
+def test_the_command_is_installed_as_xmas() -> None:
     scripts = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert scripts["scripts"] == {"xmas": "xmas.cli:main"}
 
@@ -966,19 +1047,25 @@ def test_the_run_log_commands(capsys: pytest.CaptureFixture[str]) -> None:
         captured = capsys.readouterr()
         return captured.out + captured.err
 
-    assert "no runs in Store(" in out(0, "runs") and json.loads(out(0, "runs", "--json")) == []
+    assert "no runs in Store(" in out(0, "runs")
+    assert json.loads(out(0, "runs", "--json")) == []
     mas = deck()
     first = mas.run_state({"plan": PLAN, "house": "plain"})
     broken = MAS([Agent("b", "Answer {query}", "answer")], llm=MockLLM(answers=[RuntimeError("boom")]))
     broken.run("q")
     MAS([Agent("a", "Answer {query}", "answer")], llm=MockLLM()).run("q")  # a model that reports no cost
     lines = out(0, "runs").splitlines()
-    assert len(lines) == 3 and lines[0].startswith(f"{first.run_id}  ok  ") and lines[0].endswith("  0.2500 USD")
-    assert f"  {mas.describe()['id']}  " in lines[0] and lines[2].endswith("cost unknown")
+    assert len(lines) == 3
+    assert lines[0].startswith(f"{first.run_id}  ok  ")
+    assert lines[0].endswith("  0.2500 USD")
+    assert f"  {mas.describe()['id']}  " in lines[0]
+    assert lines[2].endswith("cost unknown")
     failed = json.loads(out(0, "runs", "--json", "--status", "failed"))
-    assert [row["status"] for row in failed] == ["failed"] and failed[0]["cost_usd"] == 0.0
+    assert [row["status"] for row in failed] == ["failed"]
+    assert failed[0]["cost_usd"] == 0.0
     mine = json.loads(out(0, "runs", "--json", "--system", mas.describe()["id"]))
-    assert [row["run_id"] for row in mine] == [first.run_id] and mine[0]["cost_usd"] == pytest.approx(0.25)
+    assert [row["run_id"] for row in mine] == [first.run_id]
+    assert mine[0]["cost_usd"] == pytest.approx(0.25)
     assert out(0, "runs", "--limit", "2").startswith(failed[0]["run_id"])
 
     table = out(0, "trace", str(first.run_id)).splitlines()
@@ -986,7 +1073,8 @@ def test_the_run_log_commands(capsys: pytest.CaptureFixture[str]) -> None:
     assert table[-1] == f"ok: {len(first.records)} records, 0.2500 USD"
     assert table[6].split()[:5] == ["5", "drafter", "agent", "intro", "0.0100"]
     whole = json.loads(out(0, "trace", "--json", str(first.run_id)))
-    assert whole["records"] == first.to_dict()["records"] and whole["outputs"] == first.to_dict()["outputs"]
+    assert whole["records"] == first.to_dict()["records"]
+    assert whole["outputs"] == first.to_dict()["outputs"]
     assert out(0, "trace", failed[0]["run_id"]).splitlines()[1:] == [
         "failed: 0 records, cost unknown",
         "unknown: RuntimeError: boom",

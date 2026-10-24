@@ -45,7 +45,7 @@ BASE: dict[str, Any] = {"text": str, "bool": bool, "int": int, "number": float, 
 WORDS = {"text": "text", "bool": "true or false", "int": "integer", "number": "number", "json": "any JSON"}
 OBJECT = "object"
 KEYS = frozenset({"type", "means", "optional", "one of", "fields"})
-FENCE = re.compile(r"\A```[\w-]*[ \t]*\n(.*)\n[ \t]*```\Z", re.S)
+FENCE = re.compile(r"\A```[\w-]*[ \t]*\n(.*)\n[ \t]*```\Z", re.DOTALL)
 ANY_JSON: TypeAdapter[Any] = TypeAdapter(Any)
 
 
@@ -142,41 +142,49 @@ def plain(fields: Mapping[Any, Any], where: str) -> dict[str, dict[str, Any]]:
     """Check one level of a form and return a plain copy of it."""
     if not isinstance(fields, Mapping):
         raise ValueError(f"Answer form{where}: fields must be a mapping, got {type(fields).__name__}.")
-    out: dict[str, dict[str, Any]] = {}
-    for name, spec in fields.items():
-        path = f"{where}.{name}" if where else str(name)
-        if not isinstance(name, str) or not name:
-            raise ValueError(f"Answer form: field name {name!r} is not a non-empty string.")
-        if not isinstance(spec, Mapping):
-            raise ValueError(f"Answer form field {path!r}: expected a mapping such as {{type: text}}, got {spec!r}.")
-        unknown = set(spec) - KEYS
-        if unknown:
-            raise ValueError(f"Answer form field {path!r}: unknown keys {sorted(unknown)}; known: {sorted(KEYS)}.")
-        kind = spec.get("type")
-        base = item_kind(kind)
-        if base is None:
-            raise ValueError(
-                f"Answer form field {path!r}: unknown type {kind!r}; "
-                "known: text, bool, int, number, json, object, list of <type>."
-            )
-        copy: dict[str, Any] = {"type": kind}
-        if "means" in spec:
-            copy["means"] = str(spec["means"])
-        if "optional" in spec:
-            if not isinstance(spec["optional"], bool):
-                raise ValueError(f"Answer form field {path!r}: optional must be true or false.")
-            copy["optional"] = spec["optional"]
-        if "one of" in spec:
-            choices = spec["one of"]
-            if not isinstance(choices, list) or not choices or base in (OBJECT, "json"):
-                raise ValueError(f"Answer form field {path!r}: one of needs a non-empty list on a plain type.")
-            copy["one of"] = list(choices)
-        if "fields" in spec:
-            if base != OBJECT:
-                raise ValueError(f"Answer form field {path!r}: only an object has fields, not {kind!r}.")
-            copy["fields"] = plain(spec["fields"], path)
-        out[name] = copy
-    return out
+    return {name: plain_field(name, spec, f"{where}.{name}" if where else str(name)) for name, spec in fields.items()}
+
+
+def plain_field(name: Any, spec: Any, path: str) -> dict[str, Any]:
+    """Check one field at ``path`` and return a plain copy of it, nested fields included."""
+    base = field_base(name, spec, path)
+    kind = spec["type"]
+    copy: dict[str, Any] = {"type": kind}
+    if "means" in spec:
+        copy["means"] = str(spec["means"])
+    if "optional" in spec:
+        if not isinstance(spec["optional"], bool):
+            raise ValueError(f"Answer form field {path!r}: optional must be true or false.")
+        copy["optional"] = spec["optional"]
+    if "one of" in spec:
+        choices = spec["one of"]
+        if not isinstance(choices, list) or not choices or base in (OBJECT, "json"):
+            raise ValueError(f"Answer form field {path!r}: one of needs a non-empty list on a plain type.")
+        copy["one of"] = list(choices)
+    if "fields" in spec:
+        if base != OBJECT:
+            raise ValueError(f"Answer form field {path!r}: only an object has fields, not {kind!r}.")
+        copy["fields"] = plain(spec["fields"], path)
+    return copy
+
+
+def field_base(name: Any, spec: Any, path: str) -> str:
+    """Check a field's name, keys and type, and return the base type under any ``list of`` words."""
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Answer form: field name {name!r} is not a non-empty string.")
+    if not isinstance(spec, Mapping):
+        raise ValueError(f"Answer form field {path!r}: expected a mapping such as {{type: text}}, got {spec!r}.")
+    unknown = set(spec) - KEYS
+    if unknown:
+        raise ValueError(f"Answer form field {path!r}: unknown keys {sorted(unknown)}; known: {sorted(KEYS)}.")
+    kind = spec.get("type")
+    base = item_kind(kind)
+    if base is None:
+        raise ValueError(
+            f"Answer form field {path!r}: unknown type {kind!r}; "
+            "known: text, bool, int, number, json, object, list of <type>."
+        )
+    return base
 
 
 def item_kind(kind: Any) -> str | None:

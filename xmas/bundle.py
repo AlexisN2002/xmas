@@ -30,7 +30,6 @@ import stat
 import tempfile
 import zipfile
 import zlib
-from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -38,9 +37,11 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from xmas.prompts import extract_placeholders
-from xmas.spec import V2_KEYS
+from xmas.spec import V2_KEYS, VERSION_2
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Iterator, Mapping
+
     from xmas.mas import MAS
 
 __all__ = [
@@ -179,7 +180,7 @@ def files_of(mas: MAS) -> dict[str, bytes]:
 def bundle_files(spec: dict[str, Any], prefix: str) -> dict[str, bytes]:
     spec = copy.deepcopy(spec)
     files: dict[str, bytes] = {}
-    if spec.get("version") == 2:
+    if spec.get("version") == VERSION_2:
         agents = spec.get("agents", [])
         for key, text in spec.pop("prompts", {}).items():
             sharers = [agent for agent in agents if agent.get("prompt", agent["name"]) == key]
@@ -214,6 +215,35 @@ def spec_of(files: Mapping[str, bytes], prefix: str = "") -> dict[str, Any]:
             that is not a read, or a box path outside the bundle.
     """
     where = prefix + WIRING
+    spec = wiring_of(files, prefix)
+    start = prefix + PROMPTS
+    texts = prompt_files(files, start)
+    v2 = spec.get("version") == VERSION_2
+    agents = prompt_keys(spec, v2=v2)
+    stray = sorted(set(texts) - {key for _, key in agents})
+    if stray:
+        raise ValueError(f"{start}{stray[0]}.md belongs to no agent.")
+    for agent, key in agents:
+        path = f"{start}{key}.md"
+        if key not in texts:
+            raise ValueError(f"Agent {agent.get('name')!r} has no prompt file {path}.")
+        text, schema = texts[key]
+        if v2:
+            attach_v2_prompt(agent, schema, text, path, where)
+        else:
+            attach_v1_prompt(agent, schema, text, path)
+    if not v2:
+        return spec
+    spec["prompts"] = {key: text for key, (text, _) in texts.items()}
+    for box in spec.get("boxes") or []:
+        if isinstance(box, dict) and isinstance(box.get("system"), str):
+            box["system"] = spec_of(files, inner(prefix, box["system"]))
+    return {**{key: spec[key] for key in V2_KEYS if key in spec}, **{k: v for k, v in spec.items() if k not in V2_KEYS}}
+
+
+def wiring_of(files: Mapping[str, bytes], prefix: str) -> dict[str, Any]:
+    """Return ``xmas.yaml`` under ``prefix`` with the callables of ``callables.yaml`` put in; it holds no prompts."""
+    where = prefix + WIRING
     if where not in files:
         raise ValueError(f"The bundle has no {where}.")
     spec = mapping(files, where)
@@ -223,50 +253,48 @@ def spec_of(files: Mapping[str, bytes], prefix: str = "") -> dict[str, Any]:
         spec["callables"] = mapping(files, prefix + CALLABLES)
     if "prompts" in spec:
         raise ValueError(f"{where} holds prompts; each prompt is a file {prefix}{PROMPTS}<name>.md.")
-    start = prefix + PROMPTS
-    texts = {
-        path[len(start) : -3]: parse_prompt(file_text(files, path), path)
+    return spec
+
+
+def prompt_files(files: Mapping[str, bytes], start: str) -> dict[str, tuple[str, dict[str, Any] | None]]:
+    """Return the text and schema of each prompt file directly under ``start``, by its name without ``.md``."""
+    return {
+        path[len(start) : -len(".md")]: parse_prompt(file_text(files, path), path)
         for path in sorted(files)
         if path.startswith(start) and path.endswith(".md") and "/" not in path[len(start) :]
     }
-    v2 = spec.get("version") == 2
-    agents = [
+
+
+def prompt_keys(spec: dict[str, Any], *, v2: bool) -> list[tuple[dict[str, Any], Any]]:
+    """Pair each agent with the prompt file name it reads: its shared ``prompt`` name in version 2, else its name."""
+    return [
         (agent, agent.get("prompt", agent.get("name")) if v2 else agent.get("name"))
         for agent in spec.get("agents") or []
         if isinstance(agent, dict)
     ]
-    stray = sorted(set(texts) - {key for _, key in agents})
-    if stray:
-        raise ValueError(f"{start}{stray[0]}.md belongs to no agent.")
-    for agent, key in agents:
-        path = f"{start}{key}.md"
-        if key not in texts:
-            raise ValueError(f"Agent {agent.get('name')!r} has no prompt file {path}.")
-        text, schema = texts[key]
-        if not v2:
-            if schema is not None:
-                raise ValueError(f"{path}: a version 1 agent has no answer form, so its file has no schema.")
-            insert(agent, 1, "prompt", text)
-            continue
-        if schema is not None:
-            if "schema" in agent:
-                raise ValueError(f"Agent {agent.get('name')!r} has a schema in both {path} and {where}; keep one.")
-            insert(agent, len(agent) - ("retry" in agent), "schema", copy.deepcopy(schema))
-        reads = agent.get("reads", ["query"])
-        if isinstance(reads, list | dict):
-            missing = sorted(extract_placeholders(text) - set(reads))
-            if missing:
-                raise ValueError(
-                    f"{path}: prompt placeholders {missing} are not among the reads of agent "
-                    f"{agent.get('name')!r} {list(reads)}."
-                )
-    if not v2:
-        return spec
-    spec["prompts"] = {key: text for key, (text, _) in texts.items()}
-    for box in spec.get("boxes") or []:
-        if isinstance(box, dict) and isinstance(box.get("system"), str):
-            box["system"] = spec_of(files, inner(prefix, box["system"]))
-    return {**{key: spec[key] for key in V2_KEYS if key in spec}, **{k: v for k, v in spec.items() if k not in V2_KEYS}}
+
+
+def attach_v1_prompt(agent: dict[str, Any], schema: dict[str, Any] | None, text: str, path: str) -> None:
+    """Put a version 1 agent's prompt text in second place; its file may carry no schema."""
+    if schema is not None:
+        raise ValueError(f"{path}: a version 1 agent has no answer form, so its file has no schema.")
+    insert(agent, 1, "prompt", text)
+
+
+def attach_v2_prompt(agent: dict[str, Any], schema: dict[str, Any] | None, text: str, path: str, where: str) -> None:
+    """Put the file's schema into a version 2 agent (before ``retry``) and check its placeholders are reads."""
+    if schema is not None:
+        if "schema" in agent:
+            raise ValueError(f"Agent {agent.get('name')!r} has a schema in both {path} and {where}; keep one.")
+        insert(agent, len(agent) - ("retry" in agent), "schema", copy.deepcopy(schema))
+    reads = agent.get("reads", ["query"])
+    if isinstance(reads, list | dict):
+        missing = sorted(extract_placeholders(text) - set(reads))
+        if missing:
+            raise ValueError(
+                f"{path}: prompt placeholders {missing} are not among the reads of agent "
+                f"{agent.get('name')!r} {list(reads)}."
+            )
 
 
 def insert(entry: dict[str, Any], index: int, key: str, value: Any) -> None:
@@ -279,7 +307,12 @@ def insert(entry: dict[str, Any], index: int, key: str, value: Any) -> None:
 def outside(path: str) -> bool:
     """Whether a posix ``path`` leaves the folder it is relative to: absolute, with ``..``, a drive or a backslash."""
     parts = PurePosixPath(path).parts
-    return not parts or path.startswith("/") or "\\" in path or ".." in parts or ":" in parts[0]
+    if not parts:
+        return True
+    absolute = path.startswith("/") or ":" in parts[0]
+    climbs = ".." in parts
+    windows_separator = "\\" in path
+    return absolute or climbs or windows_separator
 
 
 def inner(prefix: str, path: str) -> str:
