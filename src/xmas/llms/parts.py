@@ -27,14 +27,14 @@ _AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mpeg": "mp3"}
 
 
 def render_parts(
-    template: str, text: Mapping[str, str], media: Mapping[str, Ref | Sequence[Ref | None] | None]
+    template: str, text: Mapping[str, str], media: Mapping[str, Ref | Sequence[Any] | None]
 ) -> tuple[list[Part], str]:
     r"""Substitute ``text`` and ``media`` into ``template``; return the parts and the record text.
 
     Text values substitute exactly as :func:`~xmas.prompts.safe_format` substitutes them. A single ref is one part;
-    a list gives ``\n[<placeholder> <i>] `` then the ref, or ``(none)`` for a ``None`` item; a missing value or an
-    empty list gives ``""``. Adjacent text merges and empty text is dropped. The record text is the parts with
-    :func:`marker` in place of each ref.
+    a list gives ``\n[<placeholder> <i>] `` then the ref, or ``(none)`` for a ``None`` item, and a list of lists
+    labels its items ``<i>.<j>``; a missing value or an empty list gives ``""``. Adjacent text merges and empty
+    text is dropped. The record text is the parts with :func:`marker` in place of each ref.
     """
     nonce = uuid.uuid4().hex
     names = list(media)
@@ -51,13 +51,22 @@ def render_parts(
         if isinstance(value, Ref):
             parts.append(value)
         elif value is not None:
-            for index, item in enumerate(value):
-                _append(parts, f"\n[{name} {index}] ")
-                if item is None:
-                    _append(parts, "(none)")
-                else:
-                    parts.append(item)
+            _items(parts, name, "", value)
     return parts, record_text(parts)
+
+
+def _items(parts: list[Part], name: str, label: str, items: Sequence[Any]) -> None:
+    """Add a list's refs, each after its label; a nested list labels its items ``1.0``, ``1.1``."""
+    for index, item in enumerate(items):
+        here = f"{label}.{index}" if label else str(index)
+        if isinstance(item, list):
+            _items(parts, name, here, item)
+            continue
+        _append(parts, f"\n[{name} {here}] ")
+        if item is None:
+            _append(parts, "(none)")
+        else:
+            parts.append(item)
 
 
 def _append(parts: list[Part], piece: str) -> None:

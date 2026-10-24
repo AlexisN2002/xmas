@@ -258,6 +258,12 @@ def test_run_state_with_pictures(png: Path) -> None:
     assert record.inputs == {"png": json.dumps([ref.to_dict()])}  # the model sees bytes, the record a reference
     assert json.loads(looked.query)["png"] == [ref.to_dict()]
 
+    # a list of lists, such as each slide's pages gathered by a chain, labels a picture by its place
+    nested = SeeingLLM()
+    pages = MAS([judge], inputs={"png": "list of list of image"}, llm=nested).run_state({"png": [[png, None], [png]]})
+    assert pages.error is None
+    assert nested.parts == [["Look: \n[png 0.0] ", ref, "\n[png 0.1] (none)\n[png 1.0] ", ref]]
+
     # one picture is one part; a json judge's format block and retry note follow it as text
     form = {"fits": {"type": "bool"}}
     strict = Agent("judge", "Look: {png}", "verdict", ["png"], output_type="json", schema=form)

@@ -421,6 +421,7 @@ def _capability_problems(mas: MAS, types: Mapping[str, ValueType], members: set[
             continue
         capabilities = mas.capabilities(agent)
         model, called = _model_words(mas, agent)
+        llm = mas.llms.get(agent.model) if agent.model is not None else mas.llm
         for value in agent.inputs:
             kind = media_kind(types[value]) if value in types else None
             if kind in _CONVERSIONS:
@@ -429,7 +430,8 @@ def _capability_problems(mas: MAS, types: Mapping[str, ValueType], members: set[
                     f"such as one using xmas.convert.{_CONVERSIONS[kind]}"
                 )
             elif kind in SENT and capabilities.takes(kind):
-                sends.setdefault(called, set()).add(kind)
+                if llm is not None and not supports_parts(llm):
+                    sends.setdefault(called, set()).add(kind)
             elif kind in SENT:
                 fix = (
                     f"give it accepts = {_tuple(capabilities.accepts, kind)}"
@@ -457,24 +459,18 @@ def _capability_problems(mas: MAS, types: Mapping[str, ValueType], members: set[
                 f"agent {name!r} writes image {agent.output!r}, but {called} produces only "
                 f"{_only(capabilities.produces)}; {fix}"
             )
-        else:
+        elif llm is not None and not supports_images(llm):
             paints.add(called)
-    llms = {
-        _model_words(mas, agent)[1]: mas.llms.get(agent.model) if agent.model is not None else mas.llm
-        for agent in mas.agents.values()
-    }
     for called, kinds in sends.items():
-        if llms[called] is not None and not supports_parts(llms[called]):
-            yield (
-                f"{called} accepts {' and '.join(sorted(kinds))} but cannot send content parts; "
-                "use APILLM, or give it generate_parts_with_meta and full_response = True"
-            )
+        yield (
+            f"{called} accepts {' and '.join(sorted(kinds))} but cannot send content parts; "
+            "use APILLM, or give it generate_parts_with_meta and full_response = True"
+        )
     for called in sorted(paints):
-        if llms[called] is not None and not supports_images(llms[called]):
-            yield (
-                f"{called} produces image but cannot answer with images; "
-                "use APILLM, or give it generate_image_with_meta and full_response = True"
-            )
+        yield (
+            f"{called} produces image but cannot answer with images; "
+            "use APILLM, or give it generate_image_with_meta and full_response = True"
+        )
     yield from _remote_media_problems(mas, types, members)
 
 

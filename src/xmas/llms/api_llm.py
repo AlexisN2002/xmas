@@ -19,11 +19,12 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from promptolution.llms import api_llm as promptolution
 from promptolution.utils.templates import DEFAULT_SYS_PROMPT
 
-from xmas.errors import MONEY_WORDS, EmptyResponse, XmasError
+from xmas.errors import MONEY_WORDS, EmptyResponse, ErrorKind, XmasError
 from xmas.llms.call_log import CallLog, CallRecord
 from xmas.llms.meta import CallMeta, TokenPrice, meta_from_completion
 from xmas.llms.parts import Part, has_media, record_text, to_content
 from xmas.llms.scoring import ScoredSequence
+from xmas.media import Capabilities
 from xmas.tools import Tool, ToolCallRequest, _turn_usage
 from xmas.trace import TokenUsage
 from xmas.utils import approximate_tokens, error_message, retry_after_seconds, timestamp
@@ -110,7 +111,8 @@ class APILLM(promptolution.APILLM):
             **kwargs: Forwarded to promptolution's ``APILLM``.
 
         Raises:
-            ValueError: If no model is given, or no base URL can be resolved.
+            ValueError: If no model is given, no base URL can be resolved, or ``accepts`` or ``produces`` is not
+                a list of kinds a model may take or give.
         """
         base_url = base_url or os.environ.get("XMAS_BASE_URL")
         if not model:
@@ -121,8 +123,8 @@ class APILLM(promptolution.APILLM):
         self.backend_tag = backend_tag
         self.full_response: bool = not _overrides_call_path(type(self)) if full_response is None else full_response
         self.price = price
-        self.accepts = tuple(accepts)
-        self.produces = tuple(produces)
+        stated = Capabilities.parse({"accepts": accepts, "produces": produces}, "APILLM")
+        self.accepts, self.produces = stated.accepts, stated.produces
         api_key = api_key or os.environ.get("XMAS_API_KEY")
         super().__init__(model_id=model, api_url=base_url.rstrip("/"), api_key=api_key, **kwargs)
 
@@ -366,9 +368,9 @@ class APILLM(promptolution.APILLM):
             ``(bytes, media type)`` in order, and the call's metadata.
 
         Raises:
-            XmasError: If an image is not a base64 ``data:`` URI.
+            EmptyResponse: Of kind ``bad_format``, with the paid call's meta, if an image is not a base64
+                ``data:`` URI; and if the answer has neither text nor images, as :meth:`generate_with_meta`.
             ValueError: If a part cannot be sent (see :func:`~xmas.llms.parts.to_content`).
-            EmptyResponse: If the answer has neither text nor images, as :meth:`generate_with_meta`.
             TimeoutError: As :meth:`generate_with_meta`.
         """
         request = self._request(prompt, system_prompt, modalities=list(_IMAGE_MODALITIES))
@@ -377,7 +379,11 @@ class APILLM(promptolution.APILLM):
         completion, text, meta = self._generate(
             lambda: self.tool_turn_once(request), prompt, system_prompt, images=True, params=params
         )
-        return text, [_decode_image(url) for url in _image_urls(completion.choices[0].message)], meta
+        try:
+            images = [_decode_image(url) for url in _image_urls(completion.choices[0].message)]
+        except XmasError as error:  # the call was paid: the meta goes with the error to the meter
+            raise EmptyResponse(str(error), kind=ErrorKind.BAD_FORMAT, meta=meta) from None
+        return text, images, meta
 
     def _request(self, prompt: str | Sequence[Part], system_prompt: str, **extra: Any) -> dict[str, Any]:
         """Return promptolution's request for ``prompt``, with ``extra`` keys before ``call_kwargs``."""

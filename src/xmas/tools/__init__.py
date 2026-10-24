@@ -341,10 +341,24 @@ def index_tools(items: Sequence[ToolSource | Tool]) -> ToolIndex:
 
 
 def select_tools(index: ToolIndex, agent: Agent, llm: BaseLLM | None) -> ToolIndex:
-    """Return the tools one agent may call, in its order; ``ValueError`` for an unknown name or a tool-less model."""
+    """Return the tools one agent may call, in its order.
+
+    A tool that reads media is refused: a model would pass a made-up ref, and
+    the tool would read whatever file it names.
+
+    Raises:
+        ValueError: For an unknown name, a tool that reads media, or a model that cannot call tools.
+    """
     unknown = [name for name in agent.tools if name not in index]
     if unknown:
         raise ValueError(f"Agent {agent.name!r} uses unknown tools {unknown}; available: {sorted(index)}.")
+    for name in agent.tools:
+        for parameter, vtype in index[name][0].reads.items():
+            if media_kind(vtype) is not None:
+                raise ValueError(
+                    f"Agent {agent.name!r} uses tool {name!r}, which reads {vtype} {parameter!r}; a model passes "
+                    "no media to a tool, so run it as a step."
+                )
     if llm is not None and not hasattr(llm, "get_tool_response"):
         raise ValueError(
             f"Agent {agent.name!r} uses tools, but its model {type(llm).__name__} has no get_tool_response."
@@ -395,7 +409,13 @@ def run_step(spec: Tool, source: ToolSource, arguments: dict[str, Any]) -> dict[
         raise BadFormat(spec.name, (f"expected a mapping with keys {sorted(writes)}, got {got}",))
     if any(media_kind(vtype) is not None for vtype in writes.values()):
         media = store()
-        produced = {name: coerce_media(value, writes[name], store=media) for name, value in produced.items()}
+        coerced: dict[str, Any] = {}
+        for name, value in produced.items():
+            try:
+                coerced[name] = coerce_media(value, writes[name], store=media)
+            except ValueError as error:  # a returned Path that is no file
+                raise BadFormat(spec.name, (f"{name}: {error}",)) from error
+        produced = coerced
     problems = [
         f"{name}: {problem}"
         for name, value in produced.items()

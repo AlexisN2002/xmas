@@ -132,8 +132,8 @@ def _media_of_schema(schema: dict[str, Any]) -> ValueType | None:
         return ValueType(kind)
     items = schema.get("items")
     if schema.get("type") == "array" and isinstance(items, dict):
-        item = _media_of_schema(items)
-        return None if item is None else ValueType(_LIST, item)
+        item = _type_of_schema(items)  # items may be null too, as a gathered list's failed ones are
+        return ValueType(_LIST, item) if media_kind(item) is not None else None
     return None
 
 

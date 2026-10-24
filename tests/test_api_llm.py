@@ -510,11 +510,28 @@ def test_image_answers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert llm.generate_image_with_meta("Paint")[:2] == ("ok", [])
     assert len(sent) == 2
     llm, _ = recording_llm(monkeypatch, [painted("ok", "https://cdn.example/p.png")])
-    with pytest.raises(XmasError, match="not a base64 data URI"):
+    with pytest.raises(EmptyResponse, match="not a base64 data URI") as refused:
         llm.generate_image_with_meta("Paint")
+    assert refused.value.kind is ErrorKind.BAD_FORMAT and refused.value.meta is not None
     llm, _ = recording_llm(monkeypatch, [painted("ok", "data:image/png;base64,!!")])
     with pytest.raises(XmasError, match="base64 is invalid"):
         llm.generate_image_with_meta("Paint")
+
+    # that refused picture was paid for: a run's meter counts its cost
+    fetched = painted("ok", "https://cdn.example/p.png", usage={**USAGE, "cost": 0.04})
+    llm, _ = recording_llm(monkeypatch, [fetched], produces=("text", "image"))
+    painter = Agent("painter", "Paint {query}", "picture", output_type="image")
+    trace = MAS([painter], llm=llm, budget=Budget(max_cost_usd=1.0), version=2).run("a house")
+    assert trace.error_kind is ErrorKind.BAD_FORMAT and trace.health is not None
+    assert trace.health.budget["cost_usd"]["spent"] == pytest.approx(0.04)
+
+    # what a model takes and gives are words a model may state
+    for wrong, words in (
+        ("image", r"APILLM accepts is a list of words such as \[image\], not 'image'"),
+        (("text", "video"), "APILLM accepts 'video'; a model may accept image, audio"),
+    ):
+        with pytest.raises(ValueError, match=words):
+            APILLM(model="m", base_url=BASE_URL, api_key="k", accepts=wrong)
 
 
 def test_a_hooked_subclass_cannot_send_parts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import os
-import tempfile
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path, PurePosixPath
@@ -246,8 +246,8 @@ class FileStore:
     """
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
-        """Keep bytes under ``root``, created on the first put."""
-        self.root = Path(root).expanduser()
+        """Keep bytes under ``root``, created on the first put; a relative root is taken from the working directory."""
+        self.root = Path(root).expanduser().resolve()
 
     def put(self, data: bytes, media_type: str, name: str = "") -> Ref:
         """Store ``data`` unless its file is already there, and return its ref."""
@@ -258,13 +258,13 @@ class FileStore:
         target = self.root / sha256[:2] / f"{sha256}{extension}"
         if not target.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
-            handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{sha256}.", suffix=".part")
-            try:
-                with os.fdopen(handle, "wb") as out:
+            temporary = target.parent / f".{sha256}.{uuid.uuid4().hex}.part"
+            try:  # created as open() creates a file, so the umask sets its mode
+                with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666), "wb") as out:
                     out.write(data)
-                Path(temporary).replace(target)
+                temporary.replace(target)
             except BaseException:
-                Path(temporary).unlink(missing_ok=True)
+                temporary.unlink(missing_ok=True)
                 raise
         return Ref(str(target), media_type, len(data), sha256)
 

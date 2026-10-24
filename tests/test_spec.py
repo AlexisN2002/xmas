@@ -1147,6 +1147,20 @@ def test_capabilities_resolve_in_order(png: Path) -> None:
     ):
         MAS([looker], llm=seer, default_model="eye", inputs={"png": "image"}, models={"eye": {"accepts": []}})
 
+    # each agent's own model must send parts, in any order, also when two models share the name
+    other = Agent("other", "Look again: {png}", "second", ["png"], model="eye")
+    sees = {"eye": {"accepts": ["image"]}}
+    for agents in ([looker, other], [other, looker]):
+        with pytest.raises(ValueError, match="model 'eye' accepts image but cannot send content parts"):
+            MAS(
+                agents,
+                llm=seer,
+                llms={"eye": MockLLM(meta=True)},
+                default_model="eye",
+                inputs={"png": "image"},
+                models=sees,
+            )
+
     # copy, rebuild and a chain's system keep the models
     assert declared.copy().models == declared.models and declared.copy().to_dict()["models"] == {
         "seer": {"accepts": ["image", "audio"]}

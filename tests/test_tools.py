@@ -6,6 +6,7 @@ No network: the model is a scripted double and the tool source a recording one.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -16,6 +17,7 @@ from langgraph.errors import GraphBubbleUp, GraphInterrupt
 from pydantic import Field
 
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
+from xmas.convert import document_text
 from xmas.errors import BadFormat, Stopped, XmasError
 from xmas.llms.call_log import CallLog
 from xmas.media import Ref
@@ -586,6 +588,24 @@ def test_a_step_writes_media_as_stored_refs(monkeypatch: pytest.MonkeyPatch, tmp
     remote = Tool("paint", "Paint remotely.", page, writes={"png": "image"})
     with pytest.raises(XmasError, match="returns text only, so 'paint' cannot write media"):
         run_step(remote, FakeToolSource(["paint"]), {"page": "1"})
+
+    lost = Tool(
+        "lost", "Return a path to nothing.", page, fn=lambda page: tmp_path / "gone.png", writes={"png": "image"}
+    )
+    with pytest.raises(BadFormat, match=r"'lost': png: .*gone\.png is not a file"):
+        run_step(lost, LocalTools([lost]), {"page": "1"})
+
+
+def test_an_agent_never_gets_a_tool_that_reads_media(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("a key")
+    made_up = json.dumps({"source": {"location": str(secret), "media_type": "text/plain"}})
+    reader = Agent("reader", "Summarize {query}", output="answer", tools=["document_text"])
+    for version in (1, 2):
+        llm = MockLLM(turns=[("", [req("document_text", made_up)])])
+        with pytest.raises(ValueError, match="tool 'document_text', which reads document 'source'; a model passes no"):
+            MAS([reader], llm=llm, tools=[document_text], version=version)
+        assert llm.seen == []
 
 
 def test_api_llm_tool_turn_records_carry_provenance(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -110,6 +112,14 @@ def test_refs_and_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         FileStore(tmp_path / "full").put(PNG, "image/png")
     assert stored(tmp_path / "full") == []
 
+    # a relative root is taken from the working directory; a stored file gets the mode open() gives it
+    monkeypatch.chdir(tmp_path)
+    near = FileStore("near").put(PNG, "image/png")
+    assert near.location == str(tmp_path.resolve() / "near" / sha[:2] / f"{sha}.png")
+    umask = os.umask(0)
+    os.umask(umask)
+    assert stat.S_IMODE(Path(near.location).stat().st_mode) == 0o666 & ~umask
+
     monkeypatch.delenv("XMAS_STORE")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     assert repr(store()) == f"FileStore({str(tmp_path / 'home' / '.cache' / 'xmas' / 'store')!r})"
@@ -195,7 +205,13 @@ def _hints(tmp_path: Path) -> None:
     ]
 
     @tool
-    def paint(slide: Image, pages: list[Table], maybe: Document | None = None, note: str | None = None) -> str:
+    def paint(
+        slide: Image,
+        pages: list[Table],
+        maybe: Document | None = None,
+        note: str | None = None,
+        drafts: list[Image | None] | None = None,
+    ) -> str:
         """Paint a slide.
 
         Args:
@@ -203,6 +219,7 @@ def _hints(tmp_path: Path) -> None:
             pages: The tables.
             maybe: A document, if any.
             note: A remark.
+            drafts: Earlier pictures, ``None`` where one failed.
         """
         return slide.name
 
@@ -211,6 +228,7 @@ def _hints(tmp_path: Path) -> None:
         "pages": "list of table",
         "maybe": "document",
         "note": "text",
+        "drafts": "list of image",
     }
     assert paint.parameters["properties"]["slide"]["x-xmas-kind"] == "image"
     assert "$defs" not in paint.parameters
