@@ -347,6 +347,8 @@ class _Media:
         if "://" in given.location or location.is_absolute() or ".." in location.parts:
             raise ValueError(f"{self.where}: media location {given.location!r} is not a path inside the bundle")
         on_disk = None if self.root is None else self.root / location
+        if self.root is not None and self.root.joinpath(location).resolve() != self.root.resolve() / location:
+            raise ValueError(f"{self.where}: media {given.location} is or sits in a symlink; media are plain files")
         if on_disk is not None and on_disk.is_file():
             ref = Ref.from_path(on_disk, given.media_type)
         elif given.location in self.files:
@@ -664,5 +666,8 @@ def save_examples(
 def _unchanged(mas: MAS, folder: Path) -> bool:
     """Whether a bundle folder still matches its lock, code included."""
     files = read(folder)
-    lock = Lock.from_yaml(files.pop(LOCK).decode("utf-8"))
+    try:
+        lock = Lock.from_yaml(files.pop(LOCK).decode("utf-8"))
+    except ValueError:  # a lock edited by hand stays, so verify(0) shows it
+        return False
     return compare(lock, files, code_hashes(mas)).clean

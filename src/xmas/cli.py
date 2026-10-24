@@ -4,8 +4,9 @@
 bundle, a folder or a zip. Exit status 0 means ok, 1 a problem (or, with
 ``--strict``, a failed verify), 2 a usage error or a bundle that is not there.
 Model endpoints and keys come from the configuration (:mod:`xmas.config`) and
-are never printed. As with ``python -m``, the current folder joins
-``sys.path``, so a bundle's python callables import from it.
+are never printed. A bundle's python callables are imported only with
+``--trust``; then, as with ``python -m``, the current folder joins
+``sys.path`` for the command, so they import from it too.
 """
 
 from __future__ import annotations
@@ -81,14 +82,18 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--budget", type=float, metavar="USD", help="the most level 2 may spend")
     verify.add_argument("--only", action="append", default=[], metavar="NAME", help="an example or node to run")
     verify.add_argument("--json", action="store_true")
+    for command in (check, show, run, verify):
+        command.add_argument("--trust", action="store_true", help="import the code the bundle names")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one ``xmas`` command and return its exit status."""
     args = _parser().parse_args(argv)
-    if str(Path.cwd()) not in sys.path:
-        sys.path.insert(0, str(Path.cwd()))
+    here = str(Path.cwd())
+    joined = getattr(args, "trust", False) and here not in sys.path
+    if joined:
+        sys.path.insert(0, here)
     try:
         with _warnings_as_lines():
             return int(globals()[f"_{args.command}"](args))
@@ -98,6 +103,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as error:
         print(f"xmas {args.command}: {error}", file=sys.stderr)
         return 1
+    finally:
+        if joined:
+            sys.path.remove(here)
 
 
 @contextmanager
@@ -113,16 +121,18 @@ def _warnings_as_lines() -> Iterator[None]:
                     print(f"warning: {item.message}", file=sys.stderr)
 
 
-def _load(path: str, **options: Any) -> MAS:
-    if not Path(path).exists():
-        raise _UsageError(f"no bundle at {path}")
-    return MAS.load(path, **options)
+def _load(args: argparse.Namespace, **options: Any) -> MAS:
+    if not Path(args.bundle).exists():
+        raise _UsageError(f"no bundle at {args.bundle}")
+    return MAS.load(args.bundle, trust=args.trust, **options)
 
 
 def _init(args: argparse.Namespace) -> int:
     path = Path(args.bundle)
     if path.exists():
         raise _UsageError(f"{path} exists; init writes a new bundle")
+    if path.suffix != ".mas":
+        raise _UsageError(f"a bundle is named name.mas, not {path.name!r}")
     names = [name.strip() for name in args.agents.split(",") if name.strip()]
     if not names:
         raise _UsageError("--agents names at least one agent")
@@ -159,7 +169,7 @@ def _summary(description: Mapping[str, Any]) -> str:
 
 
 def _check(args: argparse.Namespace) -> int:
-    mas = _load(args.bundle, resolve=False)
+    mas = _load(args, resolve=False)
     problems: list[str] = []
     examples = {path: data for path, data in read(args.bundle).items() if path.startswith(f"{FOLDER}/")}
     parse_examples(examples, Path(args.bundle) if Path(args.bundle).is_dir() else None, problems=problems)
@@ -174,7 +184,7 @@ def _words(values: Mapping[str, str]) -> str:
 
 
 def _show(args: argparse.Namespace) -> int:
-    description = _load(args.bundle, resolve=False).describe()
+    description = _load(args, resolve=False).describe()
     if args.json:
         print(json.dumps(description, indent=2))
         return 0
@@ -222,7 +232,7 @@ def _run(args: argparse.Namespace) -> int:
     config = Config.load()
     if not config.base_url:
         raise ValueError(f"no endpoint: set XMAS_BASE_URL, or base_url under [endpoint] in {config_path()}")
-    mas = _load(args.bundle, config=config)
+    mas = _load(args, config=config)
     values: dict[str, Any] = {} if args.query is None else {"query": args.query}
     for pair in args.input:
         name, sep, text = pair.partition("=")
@@ -289,7 +299,7 @@ def _diff(args: argparse.Namespace) -> int:
 
 
 def _verify(args: argparse.Namespace) -> int:
-    mas = _load(args.bundle, resolve=False)
+    mas = _load(args, resolve=False)
     report = mas.verify(args.level, budget=args.budget, only=args.only)
     print(json.dumps(report.to_dict(), indent=2) if args.json else str(report))
     return 1 if args.strict and not report.ok else 0

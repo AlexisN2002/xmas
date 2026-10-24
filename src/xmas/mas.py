@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import os
+import sys
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
@@ -506,8 +507,10 @@ class MAS(BasePredictor):
         Raises:
             ValueError: If the store has no such run, the run is not paused,
                 this system is not the one that paused, an answer does not fit,
-                or no open question is answered or due.
+                no open question is answered or due, or a model name is
+                :attr:`unresolved`.
         """
+        self._check_resolved()
         return runtime.resume(self, run_id, answers, on_event)
 
     def answer(self, run_id: str, answers: Mapping[str, Mapping[str, Any]]) -> None:
@@ -845,7 +848,14 @@ class MAS(BasePredictor):
             state=spec.get("state"),
             version=2,
             boxes=[
-                Box(item["name"], cls._from_v2(item["system"], llm, llms, tools), item["reads"], item["writes"])
+                Box(
+                    item["name"],
+                    cls._from_v2(
+                        item["system"], (llms or {}).get(item["system"].get("default_model"), llm), llms, tools
+                    ),
+                    item["reads"],
+                    item["writes"],
+                )
                 for item in spec.get("boxes", [])
             ],
             frozen=spec.get("frozen", ()),
@@ -974,13 +984,16 @@ class MAS(BasePredictor):
         overlay: Mapping[str, str] | None = None,
         resolve: bool = True,
         verify: int | None = None,
+        trust: bool = False,
     ) -> MAS:
         """Load a ``.mas`` bundle, a folder or a zip, and build the system it holds.
 
         A callable offered by ``tools`` is used as given; otherwise a python
-        callable is imported by its path and bound to its ``params``, and a
-        remote one reaches the tool server its ``server`` names in the
-        configuration. ``overlay`` (``{agent: model name}``) rebinds agents
+        callable is found by its ``import`` path and bound to its ``params``,
+        and a remote one reaches the tool server its ``server`` names in the
+        configuration. A bundle may name any code, so without ``trust`` load
+        imports nothing: a python callable must be a :class:`~xmas.tools.Tool`
+        in a module already imported. ``overlay`` (``{agent: model name}``) rebinds agents
         before anything is built. With ``resolve``, every bound model id is
         checked against the configured catalogue: a miss is a
         :class:`~xmas.config.ModelNameWarning` naming the closest ids, and the
@@ -997,6 +1010,7 @@ class MAS(BasePredictor):
             overlay: Model names by agent, replacing the bundle's.
             resolve: Whether model names are checked against the catalogue.
             verify: A level to :meth:`verify` the loaded system at before it is returned.
+            trust: Import the modules the callables name and wrap plain functions, for a bundle you trust.
 
         Raises:
             ValueError: If the bundle is malformed or names what cannot be found,
@@ -1023,12 +1037,12 @@ class MAS(BasePredictor):
                 raise ValueError(f"The overlay names unknown agents {unknown}; the agents are {sorted(agents)}.")
             for name, model in overlay.items():
                 agents[name]["model"] = model
-        sources = [*tools, *_callable_sources(systems, tools, configured)]
+        sources = [*tools, *_callable_sources(systems, tools, configured, trust)]
         given = dict(llms or {})
         bound = {agent["model"] for system in systems for agent in system.get("agents", []) if agent.get("model")}
         default_model = spec.get("default_model")
-        if llm is None and default_model is not None:
-            bound.add(default_model)
+        if llm is None:  # each system's default, a box's too, is built unless llm= stands for them all
+            bound |= {system["default_model"] for system in systems if system.get("default_model")}
         missing = sorted(bound - set(given))
         if missing:
             models: dict[str, Capabilities] = {}
@@ -1291,12 +1305,15 @@ def _built_systems(mas: MAS) -> Iterator[MAS]:
 
 
 def _callable_sources(
-    systems: Sequence[Mapping[str, Any]], supplied: Sequence[ToolSource | Tool], configured: Callable[[], Config]
+    systems: Sequence[Mapping[str, Any]],
+    supplied: Sequence[ToolSource | Tool],
+    configured: Callable[[], Config],
+    trust: bool,
 ) -> list[ToolSource | Tool]:
     """Return the tools and tool sources a bundle's callables need, besides those ``supplied``.
 
-    A python callable is imported (a :class:`Tool` as it is, a function made
-    one) and bound to its ``params``; the remote ones of each named server
+    A python callable is found (a :class:`Tool` as it is, a function made one
+    when trusted) and bound to its ``params``; the remote ones of each named server
     share one :class:`~xmas.tools.mcp.MCPTools` on the configured address.
     """
     offered = set(index_tools(supplied)) if supplied else set()
@@ -1307,7 +1324,7 @@ def _callable_sources(
             if name in offered or name in built:
                 continue
             if entry.get("kind") == "python":
-                built[name] = _imported(name, entry)
+                built[name] = _imported(name, entry, trust)
             elif entry.get("kind") == "mcp":
                 server = entry.get("server")
                 if not isinstance(server, str):
@@ -1319,12 +1336,21 @@ def _callable_sources(
     return [*built.values(), *(tool_sources(servers, configured()) if servers else ())]
 
 
-def _imported(name: str, entry: Mapping[str, Any]) -> Tool:
-    """Import a python callable by its ``import`` path, as a tool named ``name`` bound to its ``params``."""
+def _imported(name: str, entry: Mapping[str, Any], trust: bool) -> Tool:
+    """Find a python callable by its ``import`` path, as a tool named ``name`` bound to its ``params``.
+
+    Untrusted, only a :class:`Tool` of a module already imported is taken: nothing is imported or wrapped.
+    """
     target = entry.get("import")
     if not isinstance(target, str) or ":" not in target:
         raise ValueError(f"Callable {name!r} needs import: 'package.module:function', not {target!r}.")
     module, _, attribute = target.partition(":")
+    refusal = (
+        f"Callable {name!r}: {target!r} {{}}; a bundle may name any code, so pass tools=[...] offering it, "
+        "or load(..., trust=True) (xmas --trust) for a bundle you trust."
+    )
+    if not trust and module not in sys.modules:
+        raise ValueError(refusal.format("is in a module not imported yet"))
     try:
         found: Any = importlib.import_module(module)
         for part in attribute.split("."):
@@ -1333,6 +1359,8 @@ def _imported(name: str, entry: Mapping[str, Any]) -> Tool:
         raise ValueError(f"Callable {name!r}: {target!r} cannot be imported ({error}); pass tools=[...].") from None
     if isinstance(found, Tool):
         item = found if found.name == name else found.renamed(name)
+    elif not trust:
+        raise ValueError(refusal.format("is not a tool made with @tool"))
     elif callable(found):
         item = tool(found, name=name, writes=entry.get("writes"))
     else:

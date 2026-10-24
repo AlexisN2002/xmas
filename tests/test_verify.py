@@ -32,7 +32,7 @@ from tests.conftest import (
     render_page,
     render_pages,
 )
-from xmas import MAS, Agent, Box, ErrorKind, Human
+from xmas import MAS, Agent, Box, Budget, ErrorKind, Human
 from xmas.bundle import Lock
 from xmas.config import Config
 from xmas.convert import document_text
@@ -186,6 +186,10 @@ def test_level_0_unchanged_since_saved(tmp_path: Path, monkeypatch: pytest.Monke
     with pytest.warns(VerifyWarning, match="not saved: no lock"):
         report = verify(deck(), 0)
     assert (report.lock, report.lines()) == (None, ["level 0: not saved: no lock", "not ok: level 0 differs"])
+    (tmp_path / "edited.mas" / "xmas.lock").write_text("files: [\n", encoding="utf-8")  # a lock edited by hand
+    with pytest.warns(VerifyWarning):
+        report = verify(edited, 0)
+    assert report.lines()[0] == "level 0: changed: xmas.lock" and not report.ok
     with pytest.raises(ValueError, match="levels are 0, 1 and 2, got 3"):
         verify(deck(), 3)
 
@@ -253,6 +257,18 @@ def test_level_1_is_dry(tmp_path: Path, png: Path) -> None:
     assert check(plain, 1).lines()[1] == "level 1: no problems; model names not checked (no model is named)"
     with pytest.raises(ValueError, match="no examples at"):
         verify(plain, 1, examples=tmp_path / "nowhere")
+    linked = tmp_path / "linked"
+    (linked / "examples" / "media").mkdir(parents=True)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not for a model", encoding="utf-8")
+    (linked / "examples" / "media" / "a.png").symlink_to(secret)
+    with pytest.raises(ValueError, match=r"a.png is or sits in a symlink; examples are plain files"):
+        verify(plain, 1, examples=linked)
+    case = (
+        "version: 1\nexamples:\n- {name: c, inputs: {query: {location: examples/media/a.png, media_type: image/png}}}\n"
+    )
+    with pytest.raises(ValueError, match=r"media examples/media/a.png is or sits in a symlink"):
+        parse_examples({"examples/warmup.yaml": case.encode()}, linked)
 
 
 def test_level_2_node_cases(tmp_path: Path) -> None:
@@ -340,6 +356,10 @@ def test_level_2_run_cases_and_budgets(tmp_path: Path) -> None:
     capped = examples_file(tmp_path, RUN, budget={"cost_usd": 0.5, "per example": {"cost_usd": 0.02, "wall_s": 60}})
     (row,) = check(deck(), 2, examples=capped).examples
     assert row.status == "fail" and row.failures[0].startswith("budget: BudgetExceeded: cost_usd")
+    walled = examples_file(tmp_path, RUN, budget={"cost_usd": 0.5})
+    for given in (None, Budget(max_wall_s=60)):  # a budget without money keeps the 0.02 USD per example
+        (row,) = check(deck(), 2, examples=walled, budget=given).examples
+        assert row.status == "fail" and row.failures[0].startswith("budget: BudgetExceeded: cost_usd"), given
 
     d = deck()
     report = check(d, 2, examples=examples_file(tmp_path, RENDER, CHECKER), budget=0)
@@ -511,6 +531,9 @@ def test_save_examples_from_a_trace(tmp_path: Path, png: Path) -> None:
     save_examples(d, trace, nodes=["noter"])
     with pytest.warns(VerifyWarning):
         assert verify(d, 0).lines()[0] == "level 0: changed: prompts/noter.md"  # a changed bundle keeps its lock
+    (folder / "xmas.lock").write_text("files: [\n", encoding="utf-8")
+    save_examples(d, trace, nodes=["noter"])
+    assert (folder / "xmas.lock").read_text(encoding="utf-8") == "files: [\n"  # a lock edited by hand stays
     with pytest.raises(ValueError, match="save the system first, or give path="):
         save_examples(deck(), trace)
     with pytest.raises(ValueError, match="node 'nobody' finished no first visit in the trace"):

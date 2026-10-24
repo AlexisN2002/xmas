@@ -29,6 +29,7 @@ import os
 import stat
 import tempfile
 import zipfile
+import zlib
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -109,7 +110,7 @@ def dump_prompt(text: str, schema: Mapping[str, Any] | None) -> str:
     """
     if schema is not None:
         head = "---\n" + yaml.safe_dump({"schema": dict(schema)}, sort_keys=False, allow_unicode=True) + "---\n"
-    elif text.split("\n", 1)[0] == "---":
+    elif text.split("\n", 1)[0] in ("---", "---\r"):
         head = "---\n---\n"
     else:
         head = ""
@@ -119,11 +120,14 @@ def dump_prompt(text: str, schema: Mapping[str, Any] | None) -> str:
 def parse_prompt(raw: str, where: str) -> tuple[str, dict[str, Any] | None]:
     """Return a prompt file's text and its front matter's schema, ``None`` when it has none.
 
-    One final newline is the file's and is dropped; ``where`` names the file in errors.
+    One final newline is the file's and is dropped; ``where`` names the file in errors. A file
+    whose front matter has Windows line ends is read with plain newlines throughout.
 
     Raises:
         ValueError: For front matter that is never closed, is not YAML, or holds anything but a ``schema`` mapping.
     """
+    if raw.startswith("---\r\n"):
+        raw = raw.replace("\r\n", "\n")
     text, schema = raw, None
     lines = raw.split("\n")
     if lines[0] == "---":
@@ -308,7 +312,7 @@ class Lock:
         """Read a lock file's text.
 
         Raises:
-            ValueError: If it is not a lock :meth:`to_yaml` wrote.
+            ValueError: If it is not a lock :meth:`to_yaml` wrote, or its bundle digest is not that of its files.
         """
         try:
             data = yaml.safe_load(text)
@@ -320,6 +324,7 @@ class Lock:
             or not isinstance(data.get("bundle"), str)
             or not isinstance(data.get("files"), dict)
             or not isinstance(data.get("code") or {}, dict)
+            or data["bundle"] != _digest(data["files"])
         ):
             raise ValueError(f"{LOCK} is not a lock written by MAS.save.")
         return cls(data["bundle"], dict(data["files"]), dict(data.get("code") or {}))
@@ -329,11 +334,15 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _digest(digests: Mapping[str, Any]) -> str:
+    """Return the bundle digest: the sha256 over the sorted ``"path sha256"`` lines."""
+    return _sha("".join(f"{path} {sha}\n" for path, sha in sorted(digests.items())).encode("utf-8"))
+
+
 def lock_of(files: Mapping[str, bytes], code: Mapping[str, str | None]) -> Lock:
     """Return the lock of a bundle's files (the lock itself left out) and its callables' source hashes."""
     digests = {path: _sha(data) for path, data in sorted(files.items()) if path != LOCK}
-    whole = _sha("".join(f"{path} {sha}\n" for path, sha in digests.items()).encode("utf-8"))
-    return Lock(whole, digests, dict(sorted(code.items())))
+    return Lock(_digest(digests), digests, dict(sorted(code.items())))
 
 
 def _systems(mas: MAS, prefix: str = "") -> Iterator[tuple[str, MAS]]:
@@ -404,8 +413,9 @@ def read(path: str | os.PathLike[str]) -> dict[str, bytes]:
 
     Raises:
         FileNotFoundError: If nothing is at ``path``.
-        ValueError: For a symlink, an entry that leaves the bundle, more than
-            :data:`MAX_BYTES`, or a file that is no zip.
+        ValueError: For a symlink, an entry that leaves the bundle or is there
+            twice, more than :data:`MAX_BYTES`, or a file that is no zip or a
+            broken one.
     """
     source = Path(path)
     if source.is_dir():
@@ -439,8 +449,12 @@ def _read_zip(source: Path) -> dict[str, bytes]:
         raise ValueError(f"{source} is neither a bundle folder nor a zipped bundle.") from None
     with archive:
         infos = [info for info in archive.infolist() if not info.is_dir()]
+        seen: set[str] = set()
         for info in infos:
             name = info.filename
+            if name in seen:
+                raise ValueError(f"{source}: the entry {name!r} is there twice.")
+            seen.add(name)
             parts = PurePosixPath(name).parts
             if name.startswith("/") or "\\" in name or ".." in parts or (parts and ":" in parts[0]):
                 raise ValueError(f"{source}: the entry {name!r} points outside the bundle.")
@@ -448,7 +462,10 @@ def _read_zip(source: Path) -> dict[str, bytes]:
                 raise ValueError(f"{source}: the entry {name!r} is a symlink; a bundle holds plain files.")
         if sum(info.file_size for info in infos) > MAX_BYTES:
             raise ValueError(f"{source} holds more than {MAX_BYTES} bytes.")
-        files = {info.filename: archive.read(info) for info in infos}
+        try:
+            files = {info.filename: archive.read(info) for info in infos}
+        except (zipfile.BadZipFile, zlib.error, EOFError, RuntimeError, NotImplementedError) as error:
+            raise ValueError(f"{source} is a broken zip: {error}") from None
     tops = {name.split("/", 1)[0] for name in files}
     if WIRING not in files and len(tops) == 1 and all("/" in name for name in files):
         (top,) = tops

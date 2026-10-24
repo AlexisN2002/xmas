@@ -102,7 +102,7 @@ def config_path(environ: Mapping[str, str] | None = None) -> Path:
 
 @dataclass(frozen=True)
 class ToolServer:
-    """A tool server a callable names by ``server:``; its key never shows in a ``repr``.
+    """A tool server a callable names by ``server:``; its key and the credentials in its address never show.
 
     Attributes:
         url: The server's address.
@@ -110,7 +110,11 @@ class ToolServer:
     """
 
     url: str
-    key: str | None = field(default=None, repr=False)
+    key: str | None = None
+
+    def __repr__(self) -> str:
+        """Show the address without credentials or query, never the key."""
+        return f"ToolServer(url={_shown(self.url)!r})"
 
 
 @dataclass(frozen=True)
@@ -131,7 +135,7 @@ class Config:
     """
 
     base_url: str | None = None
-    api_key: str | None = field(default=None, repr=False)
+    api_key: str | None = None
     catalogue: tuple[str, ...] | None = None
     stream: bool = False
     streams: Mapping[str, bool] = field(default_factory=dict)
@@ -177,6 +181,12 @@ class Config:
         if values.get("catalogue") is not None:
             values["catalogue"] = tuple(values["catalogue"])
         return cls(**values, source=file if file.is_file() else None)
+
+    def __repr__(self) -> str:
+        """Show every field but the key; the endpoint without credentials or query."""
+        shown = {item.name: getattr(self, item.name) for item in fields(self) if item.name != "api_key"}
+        shown["base_url"] = None if self.base_url is None else _shown(self.base_url)
+        return f"Config({', '.join(f'{name}={value!r}' for name, value in shown.items())})"
 
     def stream_of(self, model: str) -> bool:
         """Whether calls to ``model`` stream: its own setting, else :attr:`stream`."""
@@ -523,7 +533,7 @@ class Unconfigured(BaseLLM):
             f"model {self.model!r} has no endpoint: set XMAS_BASE_URL, or base_url under [endpoint] in {config_path()}"
         )
 
-    _get_response = generate_with_meta = get_tool_response_meta = _fail
+    _get_response = generate_with_meta = get_tool_response = get_tool_response_meta = _fail
     generate_parts_with_meta = generate_image_with_meta = _fail
 
 

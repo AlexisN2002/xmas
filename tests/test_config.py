@@ -189,6 +189,8 @@ def test_no_key_in_a_repr_or_a_message(tmp_path: Path) -> None:
     assert caught[0].filename == __file__
     assert (config.api_key, config.tools["web"].key) == (KEY, KEY)
     assert KEY not in repr(config) + repr(config.tools["web"]) + str(caught[0].message)
+    in_urls = Config(base_url=f"https://me:{KEY}@gw.example/v1?key={KEY}", tools={"web": ToolServer(f"u?token={KEY}")})
+    assert KEY not in repr(in_urls) and "base_url='https://gw.example/v1'" in repr(in_urls)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         Config.load(write(tmp_path, f'[endpoint]\napi_key = "{KEY}"\n', mode=0o600), environ={})

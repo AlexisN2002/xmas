@@ -12,6 +12,7 @@ import json
 import re
 import shutil
 import stat
+import sys
 import tomllib
 import warnings
 import zipfile
@@ -163,11 +164,25 @@ def _zip_with(path: Path, name: str, data: bytes = b"x", mode: int = stat.S_IFRE
         ("../escape.md", stat.S_IFREG | 0o644, "points outside the bundle"),
         ("/etc/passwd", stat.S_IFREG | 0o644, "points outside the bundle"),
         ("prompts/link.md", stat.S_IFLNK | 0o777, "is a symlink"),
+        ("xmas.yaml", stat.S_IFREG | 0o644, "the entry 'xmas.yaml' is there twice"),
     ],
 )
 def test_a_zip_entry_that_leaves_the_bundle_is_refused(tmp_path: Path, name: str, mode: int, message: str) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # zipfile warns of the duplicate name it writes
+        bad = _zip_with(tmp_path / "bad.mas", name, mode=mode)
     with pytest.raises(ValueError, match=message):
-        read(_zip_with(tmp_path / "bad.mas", name, mode=mode))
+        read(bad)
+
+
+def test_a_zip_that_understates_a_size_is_refused(tmp_path: Path) -> None:
+    data = bytearray(_zip_with(tmp_path / "bomb.mas", "examples/pad.txt", b"A" * 4096).read_bytes())
+    for header, offset in ((b"PK\x01\x02", 24), (b"PK\x03\x04", 22)):  # the stated size of the last entry
+        at = data.rfind(header) + offset
+        data[at : at + 4] = (10).to_bytes(4, "little")
+    (tmp_path / "bomb.mas").write_bytes(bytes(data))
+    with pytest.raises(ValueError, match=r"bomb.mas is a broken zip: Bad CRC-32"):
+        read(tmp_path / "bomb.mas")
 
 
 def test_too_big_and_symlinked_bundles_are_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,6 +207,7 @@ def test_too_big_and_symlinked_bundles_are_refused(tmp_path: Path, monkeypatch: 
         ("Answer {query}\n", None, "Answer {query}\n\n"),
         ("", None, "\n"),
         ("--- not a header", None, "--- not a header\n"),
+        ("---\r\nA rule line", None, "---\n---\n---\r\nA rule line\n"),
     ],
 )
 def test_a_prompt_file_is_its_text_and_one_newline(text: str, schema: dict[str, Any] | None, file: str) -> None:
@@ -201,6 +217,8 @@ def test_a_prompt_file_is_its_text_and_one_newline(text: str, schema: dict[str, 
 
 def test_a_prompt_file_without_a_final_newline_is_read_as_is() -> None:
     assert parse_prompt("Answer {query}", "prompts/p.md") == ("Answer {query}", None)
+    windows = "---\r\nschema:\r\n  fits: {type: bool}\r\n---\r\nJudge {draft}\r\n"  # saved by a Windows editor
+    assert parse_prompt(windows, "prompts/p.md") == ("Judge {draft}", {"fits": {"type": "bool"}})
 
 
 @pytest.mark.parametrize(
@@ -349,6 +367,15 @@ def test_boxes_nest_and_mcp_names_its_server(tmp_path: Path, monkeypatch: pytest
     }
     named = MCPTools("https://tools.example.com/mcp", "k", name="web")
     assert (named.name, repr(named)) == ("web", "MCPTools('https://tools.example.com/mcp', name='web')")
+
+    spec = made.to_dict() | {"default_model": "text-model"}
+    spec["boxes"][0]["system"]["default_model"] = "cut-model"
+    two = MAS.from_dict(spec, llms=llms, tools=[*_conftest_tools(), RemoteTools()])
+    boxed = MAS.load(two.save(tmp_path / "two.mas"), tools=[RemoteTools()], config=NO_CATALOGUE)
+    inner = boxed.boxes["shorten"].system
+    built = {name: llm.model for name, llm in boxed.llms.items() if isinstance(llm, Unconfigured)}
+    assert built == {"text-model": "text-model", "cut-model": "cut-model"}  # the box's own default is built
+    assert inner.resolve_llm(inner.agents["cutter"]) is boxed.llms["cut-model"]  # and the box runs on it
     with pytest.raises(ValueError, match=r"is a name such as 'web'"):
         MCPTools("https://tools.example.com/mcp", "k", name="https://tools.example.com")
 
@@ -518,8 +545,20 @@ def _steps_bundle(root: Path, monkeypatch: pytest.MonkeyPatch, callables: str | 
 
 def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _steps_bundle(tmp_path, monkeypatch)
-    mas = MAS.load(path, config=NO_CATALOGUE)
+    monkeypatch.delitem(sys.modules, "stepsmod", raising=False)
+    with pytest.raises(ValueError, match=r"'stepsmod:shout' is in a module not imported yet; .*trust=True"):
+        MAS.load(path, config=NO_CATALOGUE)  # an untrusted bundle imports nothing
+    assert "stepsmod" not in sys.modules
+    mas = MAS.load(path, config=NO_CATALOGUE, trust=True)
     assert mas.run_state({"query": "hi"}).outputs == {"padded": "HI........"}
+    with pytest.raises(ValueError, match=r"'stepsmod:pad' is not a tool made with @tool"):
+        MAS.load(path, config=NO_CATALOGUE)  # imported, but a plain function is wrapped only when trusted
+    shell = "shell: {kind: python, import: 'os:system', params: {command: 'echo hi'}, writes: {code: json}}\n"
+    (path / "callables.yaml").write_text(shell, encoding="utf-8")
+    (path / "xmas.yaml").write_text("version: 2\nsteps:\n- {name: go, uses: shell, reads: {}}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"'os:system' is not a tool made with @tool"):
+        MAS.load(path, config=NO_CATALOGUE)
+    path = _steps_bundle(tmp_path, monkeypatch)
     item, _ = mas.resolve_callable(mas.steps["wide"])
     assert (item.params, sorted(item.reads), item(text="a")) == ({"width": 10}, ["text"], "a.........")
     assert mas.to_dict()["callables"]["pad"]["params"] == {"width": 10}
@@ -530,7 +569,7 @@ def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.Monke
         """Say a text quietly."""
         return text.lower()
 
-    supplied = MAS.load(path, tools=[quiet], config=NO_CATALOGUE)
+    supplied = MAS.load(path, tools=[quiet], config=NO_CATALOGUE, trust=True)
     assert supplied.run_state({"query": "Hi"}).outputs == {"padded": "hi........"}
 
     mismatch = STEPS_BUNDLE["callables.yaml"].replace(
@@ -538,7 +577,7 @@ def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.Monke
     )
     _steps_bundle(tmp_path, monkeypatch, mismatch)
     with pytest.raises(ValueError, match=r"callable 'shout' reads {'text': 'json'} in the spec"):
-        MAS.load(path, config=NO_CATALOGUE)
+        MAS.load(path, config=NO_CATALOGUE, trust=True)
     for callables, message in [
         (
             STEPS_BUNDLE["callables.yaml"] + "  note: wraps the old pad\n",
@@ -562,7 +601,7 @@ def test_callables_load_by_import_path(tmp_path: Path, monkeypatch: pytest.Monke
     ]:
         _steps_bundle(tmp_path, monkeypatch, callables)
         with pytest.raises(ValueError, match=message):
-            MAS.load(path, config=NO_CATALOGUE)
+            MAS.load(path, config=NO_CATALOGUE, trust=True)
     (path / "xmas.yaml").write_text(STEPS_BUNDLE["xmas.yaml"] + "callables: {}\n", encoding="utf-8")
     with pytest.raises(ValueError, match=r"The callables are in both callables.yaml and xmas.yaml"):
         MAS.load(path, config=NO_CATALOGUE)
@@ -599,12 +638,13 @@ def test_lock_compare_and_code_hashes(tmp_path: Path, monkeypatch: pytest.Monkey
     )
     assert not diff.clean
     assert lock_of(read(path), {}).bundle != lock.bundle
-    for text in ("version: 2\n", "[unclosed\n", "version: 1\nbundle: x\nfiles: []\n"):
+    edited = lock.to_yaml().replace(lock.files["prompts/noter.md"], lock_of(read(path), {}).files["prompts/noter.md"])
+    for text in ("version: 2\n", "[unclosed\n", "version: 1\nbundle: x\nfiles: []\n", edited):
         with pytest.raises(ValueError, match=r"is not a lock written by MAS.save"):
-            Lock.from_yaml(text)
+            Lock.from_yaml(text)  # the last: a line changed to match an edited file, the digest left as it was
 
     steps = _steps_bundle(tmp_path, monkeypatch)
-    mas = MAS.load(steps, config=NO_CATALOGUE)
+    mas = MAS.load(steps, config=NO_CATALOGUE, trust=True)
     mas.save(steps)
     saved = Lock.from_yaml((steps / LOCK).read_text(encoding="utf-8"))
     assert sorted(saved.code) == ["pad", "shout"] and all(saved.code.values())
@@ -613,10 +653,9 @@ def test_lock_compare_and_code_hashes(tmp_path: Path, monkeypatch: pytest.Monkey
         module.read_text(encoding="utf-8").replace("text.upper()", "text.upper() + '!'"), encoding="utf-8"
     )
     import importlib
-    import sys
 
     importlib.reload(sys.modules["stepsmod"])
-    changed = MAS.load(steps, config=NO_CATALOGUE)
+    changed = MAS.load(steps, config=NO_CATALOGUE, trust=True)
     assert compare(saved, read(steps), mas_bundle.code_hashes(changed)).code_changed == ("shout",)
 
     namespace: dict[str, Any] = {}
@@ -646,6 +685,7 @@ def test_model_names_warn_and_refuse_runs(tmp_path: Path) -> None:
         lambda: mas.run_batch(["q"]),
         lambda: mas.predict("p", ["q"]),
         lambda: mas("q"),
+        lambda: mas.resume("r1", {}),
     ):
         with pytest.raises(
             ValueError, match=r"'judge-model' \(closest: judge-models, writer-model\)\. Set the name in models:"
@@ -839,6 +879,7 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     assert sorted(read(hello)) == ["examples/warmup.yaml", "optimize.yaml", "prompts/assistant.md", LOCK, "xmas.yaml"]
     assert "exists" in out(2, "init", str(hello))
     assert "names at least one agent" in out(2, "init", str(tmp_path / "none.mas"), "--agents", ",")
+    assert "a bundle is named name.mas, not 'hello'" in out(2, "init", str(tmp_path / "hello"))
     assert "no bundle at" in out(2, "check", str(tmp_path / "none.mas"))
     assert out(0, "check", str(hello)) == "ok: 1 node, 0 edges, 0 chains\n"
     pair = tmp_path / "pair.mas"
@@ -855,6 +896,18 @@ def test_the_command_line(tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys:
     (path / "examples" / "warmup.yaml").write_text("version: 1\nexamples: [{name: a, nodes: x}]\n", "utf-8")
     assert "unknown: nodes" in out(1, "check", str(path))
     (path / "examples" / "warmup.yaml").unlink()
+
+    (tmp_path / "cwdtools.py").write_text(STEPS_MODULE, encoding="utf-8")  # code beside the bundle
+    local = tmp_path / "local.mas"
+    local.mkdir()
+    (local / "xmas.yaml").write_text(STEPS_BUNDLE["xmas.yaml"], encoding="utf-8")
+    (local / "callables.yaml").write_text(STEPS_BUNDLE["callables.yaml"].replace("stepsmod", "cwdtools"), "utf-8")
+    before = list(sys.path)
+    assert "'cwdtools:shout' is in a module not imported yet" in out(1, "check", str(local))
+    assert "cwdtools" not in sys.modules and sys.path == before
+    assert out(0, "check", "--trust", str(local)) == "ok: 2 nodes, 1 edge, 0 chains\n"
+    assert sys.path == before  # the current folder joined it for that command only
+    clean_env.delitem(sys.modules, "cwdtools")
 
     other = tmp_path / "other.mas"
     shutil.copytree(path, other)

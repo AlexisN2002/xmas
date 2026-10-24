@@ -317,14 +317,17 @@ def _level0(mas: MAS, files: Mapping[str, bytes]) -> dict[str, Any]:
     """Compare the bundle's files with its lock, and the system in memory with the files."""
     if LOCK not in files:
         return {}
-    saved = Lock.from_yaml(files[LOCK].decode("utf-8"))
     disk = {path: data for path, data in files.items() if path != LOCK}
     owned = files_of(mas)
     on_disk = {path for path in disk if path in (WIRING, CALLABLES) or path.startswith(_OWNED)}
-    unsaved = [path for path in sorted({*owned, *on_disk}) if not _same(path, owned.get(path), disk.get(path))]
+    unsaved = tuple(path for path in sorted({*owned, *on_disk}) if not _same(path, owned.get(path), disk.get(path)))
+    try:
+        saved = Lock.from_yaml(files[LOCK].decode("utf-8", "replace"))
+    except ValueError:  # edited by hand: the lock itself changed since saved
+        return {"lock": LockDiff(changed=(LOCK,)), "unsaved": unsaved}
     return {
         "lock": compare(saved, disk, code_hashes(mas)),
-        "unsaved": tuple(unsaved),
+        "unsaved": unsaved,
         "digest": saved.bundle[:16],
         "files": len(saved.files),
     }
@@ -354,6 +357,9 @@ def _sources(
         raise ValueError(f"no examples at {path}: give an examples file, or a bundle folder or its examples folder")
     root = path.parent if path.name == FOLDER else path
     inside = sorted(item for item in (root / FOLDER).rglob("*") if item.is_file())
+    linked = [item for item in inside if item.resolve() != root.resolve() / item.relative_to(root)]
+    if linked:
+        raise ValueError(f"{linked[0]} is or sits in a symlink; examples are plain files")
     return {item.relative_to(root).as_posix(): item.read_bytes() for item in inside}, root
 
 
@@ -511,7 +517,7 @@ def _level2(
                 why = "an earlier example's cost is unknown" if left is None else f"nothing left of {total:.4f} USD"
                 results.append(ExampleResult(example.name, example.node, "skipped", notes=(f"budget: {why}",)))
                 continue
-            each = per.max_cost_usd if per.max_cost_usd is not None else left if budget is not None else PER_EXAMPLE_USD
+            each = per.max_cost_usd if per.max_cost_usd is not None else left if given is not None else PER_EXAMPLE_USD
             cap = Budget(
                 max_cost_usd=min(each, left),
                 max_wall_s=per.max_wall_s if per.max_wall_s is not None else limits.max_wall_s,
