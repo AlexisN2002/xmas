@@ -409,7 +409,7 @@ class SeeingLLM(MockLLM):
     ``answers``, as :class:`MockLLM` answers text.
     """
 
-    accepts = ("text", "image")
+    accepts: tuple[str, ...] = ("text", "image")
 
     def __init__(self, answer: str | Callable[[list[Any]], str] = "ok", *, answers: list[str] | None = None) -> None:
         """Answer every call with ``answer``, or with the next of ``answers``."""

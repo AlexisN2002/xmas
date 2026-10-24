@@ -21,6 +21,7 @@ from typing import Any
 import pandas as pd
 import pytest
 import yaml
+from promptolution.llms.base_llm import BaseLLM
 
 import xmas
 from xmas import (
@@ -35,13 +36,16 @@ from xmas import (
     ForEach,
     GSM8KTask,
     HealthSettings,
+    Image,
+    Ref,
     Step,
     TokenUsage,
 )
+from xmas.convert import document_text, table_rows
 from xmas.predicates import Context, parse_predicate
 from xmas.tools import Tool, ToolSource, tool
 
-from .conftest import MockLLM, req
+from .conftest import PNG, MockLLM, PaintingLLM, SeeingLLM, req
 
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -938,6 +942,174 @@ def test_run_state_claims_without_a_block() -> None:
     assert slide.reads == {"slide": "page"} and slide.inputs == ["page"]
 
 
+# ---------------------------------------------- Pictures, documents and other files
+
+
+@tool(writes={"cover": "image"})
+def keep_cover(pages: list[Image]) -> Path:
+    """Keep the first page as the deck's cover."""
+    return Path(pages[0].location)
+
+
+@pytest.fixture
+def slides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Two slides of 182 KB and 96 KB in the working folder, and a store beside them."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XMAS_STORE", str(tmp_path / "store"))
+    Path("slide-1.png").write_bytes(PNG.ljust(182 * 1024, b"1"))
+    Path("slide-2.png").write_bytes(PNG.ljust(96 * 1024, b"2"))
+    return tmp_path
+
+
+def test_a_judge_looks_at_the_pictures(slides: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    reviewer = Agent("reviewer", prompt="Review these slides.\n{pages}", inputs=["pages"], output="review")
+    vision = SeeingLLM("Clear slides. The second needs a title.")
+    deck = MAS(
+        [reviewer],
+        steps=[Step("cover", uses="keep_cover")],
+        inputs={"pages": "list of image"},
+        outputs={"review": "text", "cover": "image"},
+        tools=[keep_cover],
+        llm=vision,
+    )
+
+    trace = deck.run_state({"pages": [Path("slide-1.png"), Path("slide-2.png")]})
+    print(trace["reviewer"][0].rendered_prompt)
+    print(trace.outputs["cover"].location)  # a copy in the store, named by its checksum
+
+    cover = trace.outputs["cover"]
+    assert capsys.readouterr().out.splitlines() == [
+        "Review these slides.",
+        "",
+        "[pages 0] [image slide-1.png, image/png, 182 KB]",
+        "[pages 1] [image slide-2.png, image/png, 96 KB]",
+        cover.location,
+    ]
+    assert [type(part).__name__ for part in vision.parts[0]] == ["str", "Ref", "str", "Ref"]
+    assert Path(cover.location).parent.parent == slides / "store"
+    assert cover.read_bytes() == Path("slide-1.png").read_bytes()
+    assert trace.outputs["review"] == "Clear slides. The second needs a title."
+    dumped = json.dumps(trace.to_dict())
+    assert "base64," not in dumped and json.loads(dumped)["outputs"]["cover"] == cover.to_dict()
+
+    with pytest.raises(ValueError) as caught:
+        MAS([reviewer], inputs={"pages": "list of image"}, llm=quickstart_llm())
+    assert str(caught.value).splitlines() == [
+        "The system does not check (1 problem):",
+        "- agent 'reviewer' reads image 'pages', but the default model accepts only text; "
+        'give it accepts = ("text", "image") or convert it first with a step',
+    ]
+
+
+class Blind(SeeingLLM):
+    """A model that sends content parts but says of itself that it accepts only text."""
+
+    accepts = ("text",)
+
+
+def test_media_claims_without_a_block(slides: Path) -> None:
+    # a referenced file that changes is refused; a step's Path is copied; bytes are refused
+    page = Ref.from_path("slide-2.png")
+    Path("slide-2.png").write_bytes(PNG)
+    with pytest.raises(ValueError, match="changed"):
+        page.read_bytes()
+    assert Ref.from_bytes(PNG, "image/png") == Ref.from_bytes(PNG, "image/png")
+    assert len(list((slides / "store").rglob("*.png"))) == 1
+
+    @tool(writes={"cover": "image"})
+    def raw_cover(pages: list[Image]) -> bytes:
+        """Return the first page's bytes."""
+        return pages[0].read_bytes()
+
+    raw = MAS(
+        [Agent("reviewer", prompt="Review {pages}", inputs=["pages"], output="review")],
+        steps=[Step("cover", uses="raw_cover")],
+        inputs={"pages": "list of image"},
+        outputs={"review": "text", "cover": "image"},
+        tools=[raw_cover],
+        llm=SeeingLLM(),
+    ).run_state({"pages": [Path("slide-1.png")]})
+    assert raw.status == "failed" and "Ref.from_bytes stores bytes" in str(raw.error)
+
+    # the models section: the README's entries, models over the model's own word, nothing else
+    models = yaml.safe_load("models:" + README.split("```yaml\nmodels:", 1)[1].split("```", 1)[0])
+    assert models == {"models": {"vision-model": {"accepts": ["image"]}, "painter-model": {"produces": ["image"]}}}
+    spec = {
+        "version": 2,
+        "inputs": {"pages": "list of image", "title": "text"},
+        "outputs": {"review": "text", "picture": "image"},
+        "agents": [
+            {"name": "reviewer", "model": "vision-model", "reads": ["pages"], "writes": {"review": "text"}},
+            {"name": "painter", "model": "painter-model", "reads": ["title"], "writes": {"picture": "image"}},
+        ],
+        **models,
+        "prompts": {"reviewer": "Review {pages}", "painter": "Draw a cover for {title}"},
+    }
+    llms: dict[str, BaseLLM] = {"vision-model": Blind(), "painter-model": PaintingLLM()}
+    built = MAS.from_dict(spec, llms=llms)
+    assert built.to_dict()["models"] == models["models"]
+    painted = built.run_state({"pages": [Path("slide-1.png")], "title": "Light"})
+    assert painted.outputs["picture"].location.startswith(str(slides / "store"))
+    with pytest.raises(ValueError, match="accepts only text"):
+        MAS.from_dict({**spec, "models": {"painter-model": {"produces": ["image"]}}}, llms=llms)
+    with pytest.raises(ValueError, match="has key 'temperature'"):
+        MAS.from_dict({**spec, "models": {"vision-model": {"accepts": ["image"], "temperature": 0}}}, llms=llms)
+    with pytest.raises(ValueError, match="models names 'other', which no agent binds"):
+        MAS.from_dict({**spec, "models": {**models["models"], "other": {"accepts": ["image"]}}}, llms=llms)
+    reviewer = Agent("reviewer", prompt="Review {pages}", inputs=["pages"], output="review", model="vision-model")
+    vision_only = {"vision-model": models["models"]["vision-model"]}
+    seen = MAS([reviewer], inputs={"pages": "list of image"}, llms={"vision-model": Blind()}, models=vision_only)
+    assert seen.capabilities(reviewer).takes("image")
+    with pytest.raises(ValueError, match="accepts only text"):
+        MAS([reviewer], inputs={"pages": "list of image"}, llms={"vision-model": Blind()})
+    with pytest.raises(ValueError, match="cannot send content parts"):
+        MAS([reviewer], inputs={"pages": "list of image"}, llms={"vision-model": MockLLM()}, models=vision_only)
+
+    # documents and tables go through a conversion step
+    Path("house.md").write_text("# House rules\nOne idea per slide.", encoding="utf-8")
+    writer = Agent("writer", prompt="Follow these rules: {house_rules}", inputs=["house_rules"], output="draft")
+    with pytest.raises(ValueError, match=r"through a conversion step, such as one using xmas\.convert\.document_text"):
+        MAS([Agent("writer", "Follow {house}", "draft", inputs=["house"])], inputs={"house": "document"}, llm=MockLLM())
+    ruled = MAS(
+        [writer],
+        steps=[Step("rules", uses="document_text", reads={"source": "house"}, writes={"content": "house_rules"})],
+        edges=[("rules", "writer")],
+        inputs={"house": "document"},
+        tools=[document_text],
+        llm=MockLLM(lambda prompt: prompt),
+    ).run_state({"house": Path("house.md")})
+    assert ruled.output == "Follow these rules: # House rules\nOne idea per slide."
+    Path("deck.csv").write_text("page,words\nlight,4\n", encoding="utf-8")
+    assert table_rows(Ref.from_path("deck.csv")) == [{"page": "light", "words": "4"}]
+    with pytest.raises(ValueError, match="with a step of your own"):
+        document_text(Ref.from_bytes(b"%PDF", "application/pdf"))
+
+    # an image answer needs a model that produces images and no tools
+    painter = Agent("painter", prompt="Draw {query}", output="picture", output_type="image")
+    with pytest.raises(ValueError, match="produces only text"):
+        MAS([painter], llm=scripted())
+    assert isinstance(MAS([painter], llm=PaintingLLM()).run(QUERY)["painter"][0].outputs["picture"], str)
+    with pytest.raises(ValueError, match="has tools; an image answer takes none"):
+        MAS(
+            [Agent("painter", "Draw {query}", "picture", output_type="image", tools=["count_words"])],
+            tools=[count_words],
+            llm=PaintingLLM(),
+        )
+
+    # a remote tool reads no media; an MCP tool may write a picture
+    with pytest.raises(ValueError, match="remote tools read no media"):
+        MAS(
+            [Agent("judge", prompt="Is it a good answer? {web_search}", inputs=["web_search"], output="review")],
+            steps=[Step("search", uses="web_search", reads={"query": "pages"})],
+            edges=[("search", "judge")],
+            inputs={"pages": "list of image"},
+            tools=[RemotePages()],
+            llm=scripted(),
+        )
+    mcp = pytest.importorskip("xmas.tools.mcp")
+    assert "writes" in inspect.signature(mcp.MCPTools).parameters
+
+
 # ---------------------------------------------------------------- Save and share
 
 
@@ -1080,8 +1252,6 @@ def test_nothing_the_readme_calls_planned_exists_yet() -> None:
     assert "xmas" not in scripts
     assert not {"first of", "first_of"} & {kind.value for kind in EdgeKind}
     assert not hasattr(xmas, "FirstOf")
-    with pytest.raises(ValueError, match="image"):
-        MAS([Agent("painter", prompt="Draw {query}", output="picture", output_type="image")], llm=scripted())
     assert "langgraph" not in " ".join(inspect.signature(MAS).parameters).lower()
 
 
@@ -1101,6 +1271,6 @@ def test_every_component_the_readme_lists_exists() -> None:
 
     components = README.split("## 🏗 Components", 1)[1].split("\n## ", 1)[0]
     names = [line.split("`")[1] for line in components.splitlines() if line.startswith("- **`")]
-    assert len(names) == 13
+    assert len(names) == 15
     for name in names:
         assert hasattr(xmas, name) or hasattr(xmas.optimization, name), name

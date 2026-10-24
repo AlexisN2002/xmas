@@ -15,8 +15,8 @@ so you always know who was naughty and who was nice. A single agent is the small
 system, not a special case.
 
 Version 2 puts the whole workflow in one graph: agents, code steps, conditions and loops,
-chains that run once per item of a list, and answers with a fixed JSON shape. Pictures,
-documents and people are planned next.
+chains that run once per item of a list, answers with a fixed JSON shape, and pictures,
+documents and other files passed by reference. People are planned next.
 xmas checks the wiring before the first call and draws the picture from the graph that runs.
 A system made only of agents and plain edges is a version 1 system, and works as before.
 
@@ -24,6 +24,7 @@ A system made only of agents and plain edges is a version 1 system, and works as
 
 - **Your first system in minutes:** a few `Agent` objects and their edges, and it runs.
 - **Code and conditions in the graph:** plain Python steps, JSON answers with a fixed shape, and `when`, `while`, `switch` and `on error` edges.
+- **Pictures and files as values:** a model that can see gets the pictures, and the check refuses one that cannot.
 - **Know what every run cost:** one record per visit with time, tokens and cost, budgets that end a run cleanly, and health signals.
 - **Save and share:** a version 1 system as one YAML file today; a version 2 system as a `.mas` bundle, planned.
 - **Optimization built in:** improve every agent's prompt, the wiring and the models against your task.
@@ -32,9 +33,8 @@ See [docs/design-principles.md](docs/design-principles.md) for the principles be
 design.
 
 > **Status: beta.** Inference, the optimization loop, CANTANTE, topology search, code steps,
-> JSON answers, conditions, loops, per-item chains, budgets and health are in place. The
-> `.mas` bundle, values beyond text and JSON, people in the graph and the experiment layer
-> are still to come.
+> JSON answers, conditions, loops, per-item chains, media values, budgets and health are in
+> place. The `.mas` bundle, people in the graph and the experiment layer are still to come.
 
 | What | Today |
 |---|---|
@@ -50,8 +50,9 @@ design.
 | Optimizers: CANTANTE, topology search, `frozen` nodes | built |
 | `for each` chains: some nodes once per item of a list | built |
 | `run_state`: start a run from several named values and read several outputs | built |
+| Images, audio, documents, tables and files as values, passed by reference | built |
+| Models that state what they accept and produce, checked when the system is built | built |
 | `first of` races | planned |
-| Images, audio, documents, tables and files as values | planned |
 | People in the graph, and Stop | planned |
 | The `.mas` bundle, its commands and `verify()` | planned |
 | Learning from human picks | planned |
@@ -556,6 +557,102 @@ the `{kind, message, node}` of the failure an `on error` edge routed to it, and 
 what the run has spent so far. `Agent(..., inputs={"slide": "page"})` fills the
 placeholder `{slide}` from the value `page`.
 
+## Pictures, documents and other files
+
+A value can also be an `image`, `audio`, a `document`, a `table` or a `file`, or a list of
+them. Such a value is a reference, a `Ref`: where the file is, its media type, its size
+and a checksum. The bytes stay in the file until a model needs them.
+
+Here a reviewer looks at the pages of a deck, and a step keeps the first page as the
+cover. The pages come in as files on disk:
+
+```python
+from pathlib import Path
+from xmas import MAS, APILLM, Agent, Image, Step
+from xmas.tools import tool
+
+
+@tool(writes={"cover": "image"})
+def keep_cover(pages: list[Image]) -> Path:
+    """Keep the first page as the deck's cover."""
+    return Path(pages[0].location)
+
+
+reviewer = Agent("reviewer", prompt="Review these slides.\n{pages}", inputs=["pages"], output="review")
+vision = APILLM(model="vision-model", accepts=("text", "image"))
+deck = MAS(
+    [reviewer],
+    steps=[Step("cover", uses="keep_cover")],
+    inputs={"pages": "list of image"},
+    outputs={"review": "text", "cover": "image"},
+    tools=[keep_cover],
+    llm=vision,
+)
+
+trace = deck.run_state({"pages": [Path("slide-1.png"), Path("slide-2.png")]})
+print(trace["reviewer"][0].rendered_prompt)
+print(trace.outputs["cover"].location)  # a copy in the store, named by its checksum
+```
+
+The model gets each page as a picture between the parts of the prompt's text. Each item
+of a list gets a label, counted from 0 like `item`, so the model can name a page. The
+record shows a marker in place of each picture, never its bytes:
+
+```text
+Review these slides.
+
+[pages 0] [image slide-1.png, image/png, 182 KB]
+[pages 1] [image slide-2.png, image/png, 96 KB]
+```
+
+`run_state` turns each `Path` into a reference to your file. The checksum is checked on
+every read, so a file that changes during the run is refused. A step that returns a
+`Path` writes a copy in the store instead, so a step that rewrites one file per item
+leaves earlier values alone. A step may also return a `Ref`. Bytes are refused, since
+`Ref.from_bytes(data, "image/png")` stores them. The store is a folder (see
+Configuration), and the same bytes are stored once. In a trace, a reference is a small
+dictionary, so `trace.to_dict()` stays plain JSON.
+
+Each model states what it accepts and produces. On a model that takes only text, such
+as the quickstart's `llm`, the check refuses the reviewer before any call with a
+`ValueError`:
+
+```python
+MAS([reviewer], inputs={"pages": "list of image"}, llm=llm)
+```
+
+```text
+The system does not check (1 problem):
+- agent 'reviewer' reads image 'pages', but the default model accepts only text; give it accepts = ("text", "image") or convert it first with a step
+```
+
+What a model takes comes from the first of three places: the system's `models` entry for
+the model's name, the model's own `accepts` and `produces`, or else text only. In a spec,
+the `models` section names each model and says what it accepts and produces, and
+nothing else:
+
+```yaml
+models:
+  vision-model: {accepts: [image]}
+  painter-model: {produces: [image]}
+```
+
+`MAS(..., models={"vision-model": {"accepts": ["image"]}})` says the same in Python.
+Any other key, such as `temperature`, is refused, and so is a name no agent binds.
+The rest of the rules:
+
+- A model sees an image or audio as a content part. `APILLM` sends parts; another
+  model class needs `generate_parts_with_meta` and `full_response = True`.
+- A model never reads a document or a table directly. A step turns it into text or rows
+  first, so the conversion shows in the graph. `xmas.convert` has two such functions:
+  `document_text` reads text, Markdown and HTML, and `table_rows` reads CSV and TSV. For
+  a PDF, write a step of your own.
+- An agent with `output_type="image"` answers with a picture, on a model that produces
+  images. The picture goes to the store, and the value is its reference. Such an agent
+  takes no tools.
+- An MCP tool may write a picture too: `MCPTools(..., writes={"paint": {"png": "image"}})`.
+  A remote tool reads no media, so the check refuses a step that passes it one.
+
 ## 💾 Save and share
 
 A version 1 system, such as the quickstart's, saves as one YAML file. One file holds
@@ -590,7 +687,7 @@ A whole spec written to a YAML file, by hand or with `yaml.safe_dump(spec)`, loa
 `MAS.from_yaml(path, llm=llm, tools=[...])`.
 
 `callables` records where each function lives and what it reads and writes. Models
-appear by name only. Each agent's prompt sits under `prompts` for now; in the planned
+appear by name only, with what each accepts and produces under `models`. Each agent's prompt sits under `prompts` for now; in the planned
 bundle, each prompt gets a file of its own. `to_yaml` refuses a version 2 system, since
 its file format is the `.mas` bundle (see below), and points to `to_dict()` until then.
 Every version 1 file loads, runs and saves as before.
@@ -719,14 +816,7 @@ under a small budget: a step must match exactly, and an agent must pass the exam
 check. A failure warns by default. Run it after a model switch, after an optimizer run
 and before a release.
 
-### Beyond text
-
-Values today are `text`, `json` and lists of them, such as `list of text`. The check
-refuses any other type word with a message. Planned next are `image`, `audio`,
-`document`, `table` and `file`. Large values travel by reference. Each model states what
-it accepts, and an agent that reads an image on a model that cannot see fails when the
-system is built. Conversions, such as a document to text, are visible steps. A per-item
-chain can then render each slide of a deck and let a judge on a vision model look at it.
+### Racing branches: `first of`
 
 `first of` races branches, and the first good result wins.
 
@@ -762,6 +852,8 @@ xmas builds on:
 - **`MAS`** – The system and the predictor: agents, steps, edges, models and tools; runs a query and keeps its trace.
 - **`Trace`** – The per-agent record of one run: rendered prompts, outputs, tokens, cost, time, tool calls, status.
 - **`ForEach`** – The `for each` form of a chain: the item, the list it comes from, and options such as `at_once` and `key`.
+- **`Ref`** – A picture, a sound, a document, a table or a file as a value: where it is, its type, size and checksum.
+- **`Capabilities`** – What a model accepts and produces beyond text, such as `Capabilities(accepts=("image",))`.
 - **`Event`** – One start or end of a visit or an item, passed to `run_state`'s `on_event` as the run goes.
 - **`Budget`** – Limits on calls, cost and wall time for each run, and on model calls in flight.
 - **`Health`** – Signals read from a finished run: stuck loops, empty answers, retries, caps hit.
@@ -773,12 +865,13 @@ xmas builds on:
 
 xmas is configured entirely through the environment. There is no config file, and no
 credential is ever read from or written to the repository. A saved system never holds
-an endpoint or a key.
+an endpoint or a key, and never says where stored media goes.
 
 | Variable | Meaning |
 |---|---|
 | `XMAS_BASE_URL` | Base URL of an OpenAI-compatible endpoint |
 | `XMAS_API_KEY` | API key for that endpoint |
+| `XMAS_STORE` | Folder for stored pictures and other media; default `~/.cache/xmas/store` |
 
 ## Development
 
