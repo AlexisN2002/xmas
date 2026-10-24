@@ -18,7 +18,7 @@ reads from outside and writes each value the chain writes as a list.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +38,7 @@ from xmas.graph import (
     loop_problems,
     validate_graph,
 )
-from xmas.llms import meta as llm_meta
+from xmas.llms.meta import supports_images, supports_parts
 from xmas.nodes import Box
 from xmas.predicates import BUILTINS, KEYWORDS, Predicate, PredicateError, parse_predicate
 from xmas.prompts import extract_placeholders
@@ -67,17 +67,6 @@ SENT = ("image", "audio")
 
 _CONVERSIONS = {"document": "document_text", "table": "table_rows"}
 """The built-in :mod:`xmas.convert` step that turns each kind a model never reads into text or rows."""
-
-_supports_parts: Callable[[object], bool] = getattr(
-    llm_meta,
-    "supports_parts",
-    lambda llm: callable(getattr(llm, "generate_parts_with_meta", None)) and getattr(llm, "full_response", 0) is True,
-)
-_supports_images: Callable[[object], bool] = getattr(
-    llm_meta,
-    "supports_images",
-    lambda llm: callable(getattr(llm, "generate_image_with_meta", None)) and getattr(llm, "full_response", 0) is True,
-)
 
 RESERVED_READS = {"error": JSON, "run": JSON}
 """Values xmas fills and no node writes. ``error``, ``{kind, message, node}`` of
@@ -475,13 +464,13 @@ def _capability_problems(mas: MAS, types: Mapping[str, ValueType], members: set[
         for agent in mas.agents.values()
     }
     for called, kinds in sends.items():
-        if llms[called] is not None and not _supports_parts(llms[called]):
+        if llms[called] is not None and not supports_parts(llms[called]):
             yield (
                 f"{called} accepts {' and '.join(sorted(kinds))} but cannot send content parts; "
                 "use APILLM, or give it generate_parts_with_meta and full_response = True"
             )
     for called in sorted(paints):
-        if llms[called] is not None and not _supports_images(llms[called]):
+        if llms[called] is not None and not supports_images(llms[called]):
             yield (
                 f"{called} produces image but cannot answer with images; "
                 "use APILLM, or give it generate_image_with_meta and full_response = True"

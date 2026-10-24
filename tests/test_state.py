@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -20,7 +19,7 @@ from xmas import MAS, Agent, Box, Budget, ErrorKind, TokenUsage
 from xmas.edges import Edge, EdgeKind
 from xmas.media import Image, Ref
 from xmas.nodes import Step
-from xmas.tools import run_step, tool
+from xmas.tools import tool
 
 from .conftest import PNG, MockLLM, PaintingLLM, SeeingLLM
 
@@ -299,25 +298,6 @@ def test_run_state_with_pictures(png: Path) -> None:
     assert painted.to_dict()["outputs"] == {"picture": picture.to_dict()}
 
 
-def _stores_step_paths() -> bool:
-    """Whether a step's returned Path becomes a stored ref, which ``run_step`` does once it stores media writes."""
-    with tempfile.TemporaryDirectory() as folder, pytest.MonkeyPatch.context() as patch:
-        patch.setenv("XMAS_STORE", folder)
-        picture = Path(folder) / "a.png"
-        picture.write_bytes(PNG)
-
-        @tool(writes={"png": "image"})
-        def draw() -> Image:
-            """Return the picture's path."""
-            return cast("Image", picture)
-
-        try:
-            return isinstance(run_step(draw, cast("Any", None), {})["png"], Ref)
-        except Exception:
-            return False
-
-
-@pytest.mark.skipif(not _stores_step_paths(), reason="run_step does not store a step's returned Path yet")
 def test_a_step_returning_a_path_writes_a_stored_ref(png: Path) -> None:
     @tool(writes={"png": "image"})
     def draw(query: str) -> Image:

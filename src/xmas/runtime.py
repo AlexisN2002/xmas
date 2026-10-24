@@ -49,8 +49,9 @@ from xmas.edges import ANY_ERROR, Edge, EdgeKind
 from xmas.errors import RUN_ENDS, BadFormat, BudgetExceeded, ErrorKind, classify
 from xmas.graph import END, back_edges, join_nodes
 from xmas.health import summarize
-from xmas.llms.meta import SupportsMeta, supports_meta
-from xmas.media import Ref, store
+from xmas.llms.meta import SupportsImages, SupportsMeta, SupportsParts, supports_meta
+from xmas.llms.parts import Part, render_parts
+from xmas.media import store
 from xmas.nodes import Box, Step
 from xmas.predicates import Context, Predicate
 from xmas.prompts import safe_format
@@ -77,7 +78,7 @@ _RUN_KEY = "xmas_run"
 _ITEM_KEY = "xmas_item"
 """Key of the chain item a run works on, ``(index, key)``, in ``config["configurable"]``."""
 
-Prompt = str | list[str | Ref]
+Prompt = str | list[Part]
 """What an agent sends its model: one text, or content parts when it reads an image or audio."""
 
 
@@ -172,8 +173,7 @@ def _generate(llm: BaseLLM, rendered: Prompt) -> tuple[str, CallMeta | None]:
     made sure the model has.
     """
     if not isinstance(rendered, str):
-        answer: tuple[str, CallMeta] = cast("Any", llm).generate_parts_with_meta(rendered)
-        return answer
+        return cast("SupportsParts", llm).generate_parts_with_meta(rendered)
     if supports_meta(llm):
         return cast("SupportsMeta", llm).generate_with_meta(rendered)
     return llm.get_response([rendered])[0], None
@@ -351,7 +351,7 @@ def _paint(
 
 def _images(llm: BaseLLM, prompt: Prompt) -> tuple[tuple[str, list[tuple[bytes, str]]], CallMeta]:
     """Make one image call through ``generate_image_with_meta``, which the check made sure the model has."""
-    text, images, meta = cast("Any", llm).generate_image_with_meta(prompt)
+    text, images, meta = cast("SupportsImages", llm).generate_image_with_meta(prompt)
     return (text, list(images)), meta
 
 
@@ -377,8 +377,6 @@ def _agent_body(
     reads = agent.reads
     reads_run = mas.version == 2 and "run" in reads.values()
     shown = {placeholder for placeholder, name in reads.items() if media_kind(types.get(name, TEXT)) in SENT}
-    if shown:
-        from xmas.llms.parts import render_parts  # type: ignore[import-not-found, unused-ignore]
 
     def body(state: MASState, meter: VisitMeter) -> tuple[AgentRecord, dict[str, Any]]:
         template = state["prompts"].get(agent.name, agent.prompt)
@@ -412,7 +410,7 @@ def _agent_body(
 
             response, calls, usage, meta = run_tool_loop(
                 llm,
-                prompt,  # type: ignore[arg-type, unused-ignore]
+                prompt,
                 tools,
                 mas.max_tool_rounds,
                 DEFAULT_SYS_PROMPT,

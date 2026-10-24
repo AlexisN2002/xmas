@@ -8,14 +8,10 @@ to know it is not talking to a real endpoint.
 from __future__ import annotations
 
 import copy
-import importlib.util
 import json
 import os
-import re
-import sys
 import time
-import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +28,6 @@ from xmas.llms.api_llm import APILLM
 from xmas.llms.meta import CallMeta
 from xmas.media import Image, Ref
 from xmas.nodes import Step
-from xmas.prompts import safe_format
 from xmas.tools import Tool, ToolCallRequest, ToolSource, tool
 
 Turn = tuple[str, list[ToolCallRequest]]
@@ -480,44 +475,6 @@ prompts:
   reviewer: "Review the drawn deck against its plan and the house rules.\\nPlan: {plan}\\nRules: {rules}\\nPages: {pages}"
 """  # noqa: E501
 """A reviewer that reads the drawn pages as pictures, on a model that accepts images, and the house rules as text."""
-
-
-def _stand_in_parts() -> types.ModuleType:
-    """The content-parts contract of ``xmas.llms.parts`` for a tree without it: ``render_parts`` and ``marker``."""
-
-    def marker(ref: Ref) -> str:
-        size = "" if ref.size is None else f", {ref.size} B" if ref.size < 1024 else f", {round(ref.size / 1024)} KB"
-        return f"[{ref.kind} {ref.name}, {ref.media_type}{size}]"
-
-    def render_parts(template: str, text: Mapping[str, str], media: Mapping[str, Any]) -> tuple[list[str | Ref], str]:
-        pieces: list[list[str | Ref]] = []
-        values = dict(text)
-        for index, (placeholder, value) in enumerate(media.items()):
-            values[placeholder] = f"\x00{index}\x00"
-            if isinstance(value, Ref):
-                pieces.append([value])
-            elif value is None:
-                pieces.append([])
-            else:
-                pieces.append(
-                    [p for i, item in enumerate(value) for p in (f"\n[{placeholder} {i}] ", item or "(none)")]
-                )
-        parts: list[str | Ref] = []
-        for index, chunk in enumerate(re.split("\x00([0-9]+)\x00", safe_format(template, values))):
-            for part in pieces[int(chunk)] if index % 2 else [chunk]:
-                if isinstance(part, str) and parts and isinstance(parts[-1], str):
-                    parts[-1] += part
-                elif part != "":
-                    parts.append(part)
-        return parts, "".join(marker(part) if isinstance(part, Ref) else part for part in parts)
-
-    module = types.ModuleType("xmas.llms.parts")
-    module.marker, module.render_parts = marker, render_parts  # type: ignore[attr-defined]
-    return module
-
-
-if importlib.util.find_spec("xmas.llms.parts") is None:
-    sys.modules["xmas.llms.parts"] = _stand_in_parts()
 
 
 # ------------------------------------------------------------- live gateway
