@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from typing import Any
 
 from xmas.schemas import compile_form
@@ -19,9 +20,13 @@ class Agent:
 
     Attributes:
         name: Unique identifier, also the node name in the MAS graph.
-        prompt: Prompt template. ``{placeholders}`` naming input variables are
+        prompt: Prompt template. ``{placeholders}`` naming its reads are
             substituted at run time; unknown braces are left alone.
-        inputs: State variables this agent reads. Defaults to ``["query"]``.
+        reads: ``{placeholder: value}``: which value fills each placeholder.
+            A list of value names given as ``inputs`` fills each placeholder
+            from the value of its own name.
+        inputs: The values this agent reads, in order, each once. Defaults to
+            ``["query"]``; assigning a list reads each value under its own name.
         output: State variable this agent writes.
         tools: Names of tools this agent may call. Empty means no tool access.
         model: Name of the model to bind this agent to, resolved by the MAS
@@ -35,7 +40,7 @@ class Agent:
 
     name: str
     prompt: str
-    inputs: list[str]
+    reads: dict[str, str]
     output: str
     tools: list[str]
     model: str | None
@@ -47,7 +52,7 @@ class Agent:
         name: str,
         prompt: str,
         output: str,
-        inputs: list[str] | None = None,
+        inputs: list[str] | Mapping[str, str] | None = None,
         tools: list[str] | None = None,
         model: str | None = None,
         output_type: str = "text",
@@ -58,9 +63,7 @@ class Agent:
             raise ValueError("An agent needs a name.")
         if not output:
             raise ValueError(f"Agent {name!r} needs an output variable.")
-        resolved_inputs = list(inputs) if inputs is not None else ["query"]
-        if not resolved_inputs:
-            raise ValueError(f"Agent {name!r} needs at least one input variable.")
+        reads = _reads_map(name, inputs if inputs is not None else ["query"])
         try:
             answers_json = parse_type(output_type) == JSON
             if schema is not None:
@@ -72,23 +75,39 @@ class Agent:
 
         self.name = name
         self.prompt = prompt
-        self.inputs = resolved_inputs
+        self.reads = reads
         self.output = output
         self.tools = list(tools) if tools is not None else []
         self.model = model
         self.output_type = output_type
         self.schema = schema
 
+    @property
+    def inputs(self) -> list[str]:
+        """The values this agent reads, in order, each once."""
+        return list(dict.fromkeys(self.reads.values()))
+
+    @inputs.setter
+    def inputs(self, names: list[str]) -> None:
+        self.reads = _reads_map(self.name, names)
+
+    @property
+    def renamed(self) -> bool:
+        """Whether a placeholder reads a value of another name."""
+        return any(placeholder != value for placeholder, value in self.reads.items())
+
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form, which round-trips exactly through :meth:`from_dict`.
 
-        ``output_type`` and ``schema`` appear only when set, so a version 1
-        agent's dict keeps its six keys.
+        ``inputs`` is a list of value names, or the ``{placeholder: value}``
+        map when a placeholder reads a value of another name. ``output_type``
+        and ``schema`` appear only when set, so a version 1 agent's dict keeps
+        its six keys.
         """
         data: dict[str, Any] = {
             "name": self.name,
             "prompt": self.prompt,
-            "inputs": list(self.inputs),
+            "inputs": dict(self.reads) if self.renamed else list(self.reads),
             "output": self.output,
             "tools": list(self.tools),
             "model": self.model,
@@ -111,10 +130,9 @@ class Agent:
         for key in ("name", "prompt", "output"):
             if not isinstance(data[key], str):
                 raise ValueError(f"Agent {data['name']!r} needs a string {key!r}.")
-        for key in ("inputs", "tools"):
-            value = data.get(key, [])
-            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                raise ValueError(f"Agent {data['name']!r} needs {key!r} to be a list of strings.")
+        tools = data.get("tools", [])
+        if not isinstance(tools, list) or not all(isinstance(item, str) for item in tools):
+            raise ValueError(f"Agent {data['name']!r} needs 'tools' to be a list of strings.")
         model = data.get("model")
         if model is not None and not isinstance(model, str):
             raise ValueError(f"Agent {data['name']!r} needs 'model' to be a string or null.")
@@ -140,7 +158,7 @@ class Agent:
             "name": self.name,
             "prompt": self.prompt,
             "output": self.output,
-            "inputs": list(self.inputs),
+            "inputs": dict(self.reads),
             "tools": list(self.tools),
             "model": self.model,
             "output_type": self.output_type,
@@ -161,3 +179,19 @@ class Agent:
     def __repr__(self) -> str:
         """Return an unambiguous representation."""
         return f"Agent(name={self.name!r}, inputs={self.inputs!r}, output={self.output!r}, model={self.model!r})"
+
+
+def _reads_map(name: str, inputs: Any) -> dict[str, str]:
+    """Return an agent's ``{placeholder: value}`` map from a list of value names or a map."""
+    pairs = (
+        list(inputs.items())
+        if isinstance(inputs, Mapping)
+        else [(value, value) for value in inputs]
+        if isinstance(inputs, (list, tuple))
+        else None
+    )
+    if pairs is None or not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in pairs):
+        raise ValueError(f"Agent {name!r} needs 'inputs' to be a list of strings or a map of names to names.")
+    if not pairs:
+        raise ValueError(f"Agent {name!r} needs at least one input variable.")
+    return dict(pairs)
