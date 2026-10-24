@@ -1,7 +1,8 @@
-"""Spec version 2: the worked example round-trips, the check names every problem, describe is plain data.
+"""Spec version 2: the worked examples round-trip, the check names every problem, describe is plain data.
 
 These run on construction, serialization and ``describe()`` alone; running a
-version 2 system is tested in ``test_steps.py`` and ``test_operators.py``.
+version 2 system is tested in ``test_steps.py``, ``test_operators.py`` and
+``test_chains.py``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import pytest
 import yaml
 
 from xmas import END, MAS, START, Agent
+from xmas.chains import ForEach
 from xmas.check import check_system
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
 from xmas.health import HealthSettings
@@ -527,3 +529,416 @@ def test_a_box_maps_its_inner_inputs_and_never_contains_itself() -> None:
     inner.boxes["again"] = Box("again", nested, {"page": "page"}, {"short": "page2"})  # a system put inside itself
     with pytest.raises(ValueError, match="box 'again' contains the system it sits in"):
         check_system(inner)
+
+
+@tool(writes={"measure": "json"})
+def render_page(draft: str) -> dict[str, int]:
+    """Measure a drawn page."""
+    return {"words": len(draft.split())}
+
+
+@tool(writes={"deck": "json"})
+def assemble_deck(draft: list[str], verdict: list[Any], caption: list[str]) -> dict[str, Any]:
+    """Put the pages and captions of a deck together."""
+    return {"pages": draft, "verdicts": verdict, "captions": caption}
+
+
+# Two chains, one per slide and one per figure; END joins the deck with the notes.
+DECK = """
+version: 2
+inputs: {plan: json, house: text}
+outputs: {deck: json, notes: text}
+agents:
+- {name: drafter, model: writer-model,
+   for each: {item: page, in: plan.slides, at once: 4, key: id, item budget: {cost_usd: 0.05}},
+   reads: {slide: page, rules: house, verdict: verdict}, writes: {draft: text}}
+- {name: checker, model: judge-model, prompt: judge, for each: page in plan.slides,
+   reads: {planned: page, shown: measure}, writes: {verdict: json},
+   schema: {fits: {type: bool, means: the page makes its claim at a glance}, fix: {type: text}}}
+- {name: captioner, model: writer-model, for each: {item: figure, in: plan.figures, key: id},
+   reads: {figure: figure, rules: house}, writes: {caption: text}}
+- {name: figure_checker, model: judge-model, prompt: judge, for each: figure in plan.figures,
+   reads: {planned: figure, shown: caption}, writes: {figure_verdict: json},
+   schema: {fits: {type: bool}, fix: {type: text}}}
+- {name: noter, model: writer-model, reads: [plan], writes: {notes: text}}
+steps:
+- {name: render, uses: render_page, for each: page in plan.slides, retry: {outage: 1}}
+- {name: assemble, uses: assemble_deck}
+edges:
+- drafter -> render -> checker
+- 'checker -> drafter': {when: not verdict.fits, max_visits: 2}
+- 'checker -> assemble': else
+- captioner -> figure_checker -> assemble
+callables:
+  render_page: {kind: python, import: 'tests.test_spec:render_page', reads: {draft: text}, writes: {measure: json}}
+  assemble_deck: {kind: python, import: 'tests.test_spec:assemble_deck',
+                  reads: {draft: json, verdict: json, caption: json}, writes: {deck: json}}
+prompts:
+  drafter: "Draft slide {slide} in this house style: {rules}\\nThe last verdict, empty at first: {verdict}"
+  judge: "Does the page make the claim of its plan?\\nPlan: {planned}\\nAs drawn: {shown}"
+  captioner: "Caption figure {figure} in this house style: {rules}"
+  noter: "Write speaker notes for this plan: {plan}"
+"""
+DECK_DATA: dict[str, Any] = yaml.safe_load(DECK)
+
+
+def load_deck(data: dict[str, Any] | None = None) -> MAS:
+    return MAS.from_dict(
+        copy.deepcopy(DECK_DATA if data is None else data),
+        llms={"writer-model": MockLLM(), "judge-model": MockLLM()},
+        tools=[render_page, assemble_deck],
+    )
+
+
+def test_the_deck_example_round_trips() -> None:
+    mas = load_deck()
+    assert (mas.version, list(mas.each), mas.prompt_names, mas.retry) == (
+        2,
+        ["drafter", "checker", "captioner", "figure_checker", "render"],
+        {"checker": "judge", "figure_checker": "judge"},
+        {"render": {"outage": 1}},
+    )
+    assert mas.each["drafter"] == ForEach("page", "plan.slides", 4, "id", {"cost_usd": 0.05})
+    assert mas.agents["drafter"].reads == {"slide": "page", "rules": "house", "verdict": "verdict"}
+    assert mas.agents["checker"].prompt == mas.agents["figure_checker"].prompt == DECK_DATA["prompts"]["judge"]
+    info = mas._checked()
+    drafter, captioner = info.chains["drafter"], info.chains["captioner"]
+    assert (sorted(drafter.nodes), drafter.each.root, captioner.nodes) == (
+        ["checker", "drafter", "render"],
+        "plan",
+        ("captioner", "figure_checker"),
+    )
+    words = {name: str(vtype) for name, vtype in drafter.inputs.items()}
+    assert words == {"page": "json", "house": "text"} and set(captioner.inputs) == {"figure", "house"}
+    assert {name: str(vtype) for name, vtype in drafter.writes.items()} == {
+        "draft": "text",
+        "verdict": "json",
+        "measure": "json",
+    }
+    assert {name: str(info.types[name]) for name in ("draft", "verdict", "measure", "caption", "figure_verdict")} == {
+        "draft": "list of text",
+        "verdict": "list of json",
+        "measure": "list of json",
+        "caption": "list of text",
+        "figure_verdict": "list of json",
+    }
+    assert Edge("checker", END, EdgeKind.ELSE) in drafter.system.edges  # the exit ends one item's run
+    assert drafter.system.resolve_llm(mas.agents["checker"]) is mas.llms["judge-model"]  # through the outer system
+    assert info.edges == (Edge("drafter", "assemble"), Edge("captioner", "assemble"))
+    assert info.joins == {
+        "assemble": Join("join", (("drafter",), ("captioner",)), (None, None)),
+        END: Join("join", (("noter",), ("assemble",)), (None, None)),
+    }
+    assert set(info.graph.successors("checker")) == {"drafter", "assemble"}  # the full topology, for describe
+
+    spec = mas.to_dict()
+    assert spec == DECK_DATA
+    assert list(spec) == ["version", "inputs", "outputs", "agents", "steps", "edges", "callables", "prompts"]
+    assert list(spec["agents"][1]) == ["name", "model", "prompt", "for each", "reads", "writes", "schema"]
+    assert list(spec["steps"][0]) == ["name", "uses", "for each", "retry"]
+    again = load_deck(json.loads(json.dumps(spec)))
+    assert again.to_dict() == spec and again.structure == mas.structure  # idempotent
+
+    # A prompt given to one agent of a shared prompt reaches the others; a split made by hand does not dump.
+    shared = "Is this claim made? {planned} {shown}"
+    copied = mas.copy(prompts={"checker": shared})
+    assert copied.agents["figure_checker"].prompt == shared and copied.to_dict()["prompts"]["judge"] == shared
+    copied.agents["checker"].prompt = "Split {planned} {shown}"
+    with pytest.raises(ValueError, match="sharing the prompt 'judge' hold different texts"):
+        copied.to_dict()
+
+    described = mas.describe()
+    assert json.loads(json.dumps(described)) == described and described["outputs"] == {"deck": "json", "notes": "text"}
+    assert described["groups"] == [
+        {
+            "name": "drafter",
+            "for each": "page in plan.slides",
+            "nodes": ["drafter", "render", "checker"],
+            "at once": 4,
+            "key": "id",
+            "item budget": {"cost_usd": 0.05},
+        },
+        {
+            "name": "captioner",
+            "for each": "figure in plan.figures",
+            "nodes": ["captioner", "figure_checker"],
+            "key": "id",
+        },
+    ]
+    nodes = {node["name"]: node for node in described["nodes"]}
+    assert nodes["drafter"]["for each"] == "page in plan.slides" and "for each" not in nodes["noter"]
+    assert (
+        nodes["checker"]["placeholders"] == {"planned": "page", "shown": "measure"}
+        and "placeholders" not in nodes["noter"]
+    )
+    assert nodes["checker"]["reads"] == {"page": "json", "measure": "json"}  # one item's types
+    assert nodes["assemble"]["reads"] == {"draft": "list of text", "verdict": "list of json", "caption": "list of text"}
+    assert nodes["render"]["retry"] == {"outage": 1} and described["joins"] == {"assemble": "join", END: "join"}
+
+    def variant(name: str, **fields: Any) -> MAS:
+        data = copy.deepcopy(DECK_DATA)
+        for entry in data["agents"] + data["steps"]:
+            entry.update(fields if entry["name"] == name else {})
+        return load_deck(data)
+
+    head = DECK_DATA["agents"][0]["for each"]
+    assert variant("drafter", **{"for each": {**head, "at once": 2}}).structure != mas.structure
+    assert variant("drafter", **{"for each": {**head, "item budget": {"wall_s": 60}}}).structure == mas.structure
+    assert variant("noter", reads={"plan": "plan", "house": "house"}).structure != mas.structure
+    assert variant("render", retry={"timeout": 2}).structure != mas.structure
+    assert mas.copy(prompts={"noter": "Notes on {plan}"}).structure == mas.structure
+
+
+def chain_of(form: Any) -> MAS:
+    """A one-agent chain over ``plan.slides`` whose list of drafts is the output."""
+    return MAS(
+        [Agent("writer", "Write {page}", "draft", inputs=["page"])],
+        inputs={"plan": "json"},
+        outputs={"draft": "list of text"},
+        each={"writer": form},
+        llm=MockLLM(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("form", "want"),
+    [
+        pytest.param("page in plan.slides", ForEach("page", "plan.slides"), id="short"),
+        pytest.param({"item": "page", "in": "plan.slides"}, ForEach("page", "plan.slides"), id="long"),
+        pytest.param(" page \t in  plan.slides ", ForEach("page", "plan.slides"), id="spaces"),
+        pytest.param(
+            {"item": "page", "in": "plan.slides", "at once": 4, "key": "id", "item budget": {"wall_s": 120}},
+            ForEach("page", "plan.slides", 4, "id", {"wall_s": 120}),
+            id="options",
+        ),
+        pytest.param(
+            "page in plan.slides[0]", r"'page in plan.slides\[0\]' must read '<item> in <list>'", id="indexing"
+        ),
+        pytest.param("page plan.slides", r"must read '<item> in <list>'", id="no in"),
+        pytest.param("in in plan.slides", r"chain 'writer': the item 'in' is a reserved name", id="reserved item"),
+        pytest.param(
+            {"item": "page", "in": "plan.slides", "key": "id", "at once": 0},
+            r"at once must be a positive integer, got 0",
+            id="round trip",
+        ),
+    ],
+)
+def test_for_each_grammar(form: Any, want: ForEach | str) -> None:
+    if isinstance(want, str):
+        with pytest.raises(ValueError, match=want):
+            chain_of(form)
+        return
+    each = ForEach.parse(form)
+    assert each == want and (each.root, each.fields) == ("plan", ("slides",)) and str(each) == "page in plan.slides"
+    assert ForEach.parse(each.to_spec()) == each and chain_of(each).each["writer"] == each
+    assert each.to_spec() == (form if each.options else "page in plan.slides")
+    if each.options:  # the round trip of a dumped long form, the options left out when none is set
+        assert chain_of(form).to_dict()["agents"][0]["for each"] == form
+        assert ForEach.parse({"item": "page", "in": "plan.slides", "key": "id"}).to_spec() == {
+            "item": "page",
+            "in": "plan.slides",
+            "key": "id",
+        }
+
+
+def deck(**sections: Any) -> dict[str, Any]:
+    """The deck with some top-level sections replaced."""
+    return {**copy.deepcopy(DECK_DATA), **sections}
+
+
+def entries(section: str, name: str, **fields: Any) -> dict[str, list[dict[str, Any]]]:
+    """The deck's ``section`` with the fields of entry ``name`` replaced, ``None`` dropping one."""
+    changed = []
+    for entry in copy.deepcopy(DECK_DATA[section]):
+        if entry["name"] == name:
+            entry = {key: value for key, value in {**entry, **fields}.items() if value is not None}
+        changed.append(entry)
+    return {section: changed}
+
+
+def over(path: str, key: str | None = None) -> dict[str, Any]:
+    """The deck with the slide chain running over ``path``."""
+    head = {"item": "page", "in": path, **({"key": key} if key else {})}
+    agents = entries("agents", "drafter", **{"for each": head})["agents"]
+    agents[1]["for each"] = f"page in {path}"
+    return deck(agents=agents, steps=entries("steps", "render", **{"for each": f"page in {path}"})["steps"])
+
+
+def boxed_chain() -> MAS:
+    """A chain whose one node is a box holding a chain of its own."""
+    inner = chain_of("page in plan.slides")
+    return MAS(
+        [],
+        boxes=[Box("pages", inner, {"plan": "deck"}, {"draft": "drafts"})],
+        inputs={"decks": "json"},
+        outputs={"drafts": "list of list of text"},
+        each={"pages": "deck in decks"},
+    )
+
+
+def small(**settings: Any) -> MAS:
+    """Two agents, ``a -> b``, with the given settings."""
+    agents = [Agent("a", "Do {query}", "x"), Agent("b", "Check {x}", "y", inputs=["x"])]
+    return MAS(agents, edges=[("a", "b")], llm=MockLLM(), **settings)
+
+
+@pytest.mark.parametrize(
+    ("build", "phrase"),
+    [
+        pytest.param(
+            lambda: load_deck(deck(edges=[*DECK_DATA["edges"], "noter -> checker"])),
+            r"chain \['drafter', 'checker', 'render'\] \(page in plan.slides\) is entered at \['checker', 'drafter'\]",
+            id="two heads",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(edges=[*DECK_DATA["edges"], "render -> noter"])),
+            r"chain 'drafter' leaves to \['assemble', 'noter'\]; a chain leaves to one node",
+            id="exits to two targets",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(edges=[*DECK_DATA["edges"], {"render -> assemble": {"on error": "any"}}])),
+            r"chain 'drafter': the error edge render -> assemble leaves it; route it inside the chain",
+            id="an error edge leaving",
+        ),
+        pytest.param(
+            boxed_chain, r"chain 'pages': box 'pages' holds a for each chain; chains do not nest", id="nested"
+        ),
+        pytest.param(
+            lambda: load_deck(deck(inputs={"plan": "json", "house": "text", "page": "json"})),
+            r"chain 'drafter': the item 'page' is an input or a written value too",
+            id="item is an input",
+        ),
+        pytest.param(
+            lambda: load_deck(over("spec.slides")),
+            r"'drafter' reads 'spec', which is neither an input nor written by any node",
+            id="root unreadable",
+        ),
+        pytest.param(
+            lambda: load_deck(over("house")),
+            r"chain 'drafter': for each page in house runs over text 'house'; a chain runs over json or a list",
+            id="text root",
+        ),
+        pytest.param(
+            lambda: load_deck(over("titles", key="id") | {"inputs": {**DECK_DATA["inputs"], "titles": "list of text"}}),
+            r"chain 'drafter': key 'id' needs json items, not text",
+            id="key on text items",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(**entries("agents", "noter", writes={"draft": "text"}))),
+            r"chain 'drafter': 'noter' writes 'draft', which the chain writes; a value written in a chain has",
+            id="chain write written outside",
+        ),
+        pytest.param(
+            lambda: load_deck(
+                deck(
+                    **entries("agents", "checker", **{"for each": {"item": "page", "in": "plan.slides", "at once": 2}})
+                )
+            ),
+            r"chain 'drafter': 'checker' sets at once, which only the head 'drafter' sets",
+            id="option off the head",
+        ),
+        pytest.param(
+            lambda: small(each={"a": "q in query"}, version=1),
+            r"for each, retry, shared prompts, read maps, conditional edges and typed writes need version 2",
+            id="each in version 1",
+        ),
+        pytest.param(
+            lambda: MAS(
+                [Agent("writer", "Write {page}", "draft", inputs=["page"])],
+                inputs={"plan": "json"},
+                each={"writer": "page in plan"},
+                llm=MockLLM(),
+            ),
+            r"chain 'writer': it feeds the end, which needs declared outputs",
+            id="chain into the end without outputs",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(outputs={**DECK_DATA["outputs"], "summary": "text"})),
+            r"output 'summary' is neither an input nor written by any node",
+            id="output not written",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(outputs={"deck": "json", "notes": "json"})),
+            r"output 'notes' is declared json but is text",
+            id="output type",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(**entries("steps", "render", retry={"money": 1}))),
+            r"chain 'drafter': 'render' retries on 'money'; a node retries on \['outage', 'rate_limited', 'timeout'\]",
+            id="retry money",
+        ),
+        pytest.param(
+            lambda: MAS(
+                [],
+                boxes=[Box("b", chain_of("page in plan.slides"), {"plan": "plan"}, {"draft": "d"})],
+                inputs={"plan": "json"},
+                retry={"b": {"outage": 1}},
+            ),
+            r"box 'b' takes no retry; retry inside its system",
+            id="retry on a box",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(**entries("agents", "checker", prompt="judges"))),
+            r"Agent 'checker': prompt 'judges' names no entry of 'prompts'",
+            id="prompt names no entry",
+        ),
+        pytest.param(
+            lambda: load_deck().copy(
+                prompts={"checker": "A {planned} {shown}", "figure_checker": "B {planned} {shown}"}
+            ),
+            r"agents \['checker', 'figure_checker'\] share the prompt 'judge' but hold different texts",
+            id="shared texts differ",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(**entries("agents", "noter", reads=["plan", "error"]))),
+            r"'noter' reads 'error', which only a node an on error edge reaches can read",
+            id="error read without an error edge",
+        ),
+        pytest.param(
+            lambda: load_deck(deck(**entries("agents", "noter", writes={"run": "text"}))),
+            r"'noter' writes 'run', which is a reserved name",
+            id="a node writing run",
+        ),
+    ],
+)
+def test_check_names_every_chain_problem(build: Any, phrase: str) -> None:
+    with pytest.raises(ValueError) as info:
+        build()
+    assert re.search(phrase, str(info.value)), str(info.value)
+
+
+@pytest.mark.xfail(strict=True, reason="the engine renders a prompt from its read map (runtime._agent_body)")
+def test_agent_read_maps_and_dicts() -> None:
+    drafter = Agent("drafter", "Draft {slide} in {rules}", "draft", inputs={"slide": "page", "rules": "house"})
+    assert (drafter.reads, drafter.inputs, drafter.renamed) == (
+        {"slide": "page", "rules": "house"},
+        ["page", "house"],
+        True,
+    )
+    data = drafter.to_dict()
+    assert data["inputs"] == {"slide": "page", "rules": "house"} and Agent.from_dict(data) == drafter
+    assert drafter.copy(inputs=["page"]).reads == {"page": "page"}
+    assert drafter.copy(inputs={"slide": "page"}).to_dict()["inputs"] == {"slide": "page"}
+    assert Agent("a", "{v} {w}", "x", inputs={"v": "v", "w": "v"}).inputs == ["v"]  # values once each, in order
+    assert Agent("a", "{query}", "x", inputs={"query": "query"}).to_dict()["inputs"] == ["query"]  # identity is a list
+    with pytest.raises(ValueError, match="Unknown agent keys: \\['reads'\\]"):
+        Agent.from_dict({**data, "reads": {"slide": "page"}})
+    with pytest.raises(ValueError, match="'inputs' to be a list of strings or a map of names to names"):
+        Agent.from_dict({**data, "inputs": {"slide": 3}})
+    v1 = Agent("solver", "Solve {query}", "answer")
+    assert list(v1.to_dict()) == ["name", "prompt", "inputs", "output", "tools", "model"]
+    v1.inputs = ["query", "hint"]
+    assert v1.reads == {"query": "query", "hint": "hint"} and not v1.renamed
+
+    # A renamed read makes a system version 2; a placeholder outside the map is a problem.
+    reader = Agent("reader", "Read {text}", "said", inputs={"text": "query"})
+    with pytest.raises(ValueError, match="read maps"):
+        MAS([reader], llm=MockLLM(), version=1)
+    with pytest.raises(ValueError, match=r"prompt placeholders \['query'\] are not among its reads \['text'\]"):
+        MAS([reader.copy(prompt="Read {query}")], llm=MockLLM())
+    with pytest.raises(ValueError, match="takes the prompt 'reader', another agent's name"):
+        MAS([reader, Agent("twin", "Read {query}", "heard")], llm=MockLLM(), prompt_names={"twin": "reader"})
+
+    llm = MockLLM(lambda prompt: prompt.upper())
+    trace = MAS([reader], llm=llm).run("cats")
+    assert trace["reader"][0].inputs == {"text": "cats"} and llm.calls == ["Read cats"]  # keyed by placeholder

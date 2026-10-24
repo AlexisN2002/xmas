@@ -6,7 +6,7 @@ import copy as _copy
 import dataclasses
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +17,7 @@ from promptolution.predictors.base_predictor import BasePredictor
 from xmas import runtime
 from xmas.agent import Agent
 from xmas.budget import Budget
+from xmas.chains import ChainShape, ForEach
 from xmas.check import MERGE_LAST, SystemInfo, check_system, step_maps
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
 from xmas.graph import (
@@ -36,8 +37,8 @@ from xmas.nodes import Box, Step
 from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import validate_spec, validate_spec_v2
 from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools
-from xmas.trace import Trace
-from xmas.values import TEXT, ValueType, parse_type
+from xmas.trace import Event, Trace
+from xmas.values import TEXT, ValueType, check_value, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
@@ -76,6 +77,12 @@ class MAS(BasePredictor):
         inputs: The values a run starts with, with their types; ``{query: text}``
             unless a version 2 system declares others.
         merges: ``{value: "last"}`` for values several nodes may write.
+        each: ``{node: ForEach}`` for the nodes of ``for each`` chains.
+        outputs: The declared outputs with their types; a run's
+            ``Trace.outputs`` holds their final values.
+        retry: ``{node: {error kind: attempts}}``: how often a failed visit
+            runs again on each kind of :data:`~xmas.check.RETRYABLE`.
+        prompt_names: ``{agent: prompt name}`` for agents that share one prompt.
         version: 1 or 2.
         info: What the version 2 check learned (types, writers, joins); ``None``
             in version 1.
@@ -102,6 +109,10 @@ class MAS(BasePredictor):
     edges: tuple[Edge, ...]
     inputs: dict[str, ValueType]
     merges: dict[str, str]
+    each: dict[str, ForEach]
+    outputs: dict[str, ValueType]
+    retry: dict[str, dict[str, int]]
+    prompt_names: dict[str, str]
     version: int
     info: SystemInfo | None
     graph: nx.DiGraph[str]
@@ -127,6 +138,10 @@ class MAS(BasePredictor):
         boxes: Sequence[Box] = (),
         frozen: Iterable[str] = (),
         health: HealthSettings | None = None,
+        each: Mapping[str, str | Mapping[str, Any] | ForEach] | None = None,
+        outputs: Mapping[str, str | ValueType] | None = None,
+        retry: Mapping[str, Mapping[str, int]] | None = None,
+        prompt_names: Mapping[str, str] | None = None,
     ) -> None:
         """Initialize a MAS.
 
@@ -156,12 +171,21 @@ class MAS(BasePredictor):
             state: ``{value: {"merge": "last"}}`` for each value several nodes
                 may write.
             version: 1 or 2. Defaults to 2 when steps, boxes, conditional
-                edges, a non-text agent, ``inputs``, ``state`` or ``frozen``
-                are used, else 1.
+                edges, a non-text agent, an agent reading a value under
+                another name, ``inputs``, ``state``, ``frozen``, ``each``,
+                ``outputs``, ``retry`` or ``prompt_names`` are used, else 1.
             boxes: Nodes that run a whole version 2 system.
             frozen: Names of nodes no optimizer may change.
             health: Thresholds of the health signals; ``None`` keeps the
                 defaults.
+            each: ``{node: form}`` for every node of a ``for each`` chain, the
+                form a :class:`~xmas.chains.ForEach`, its text such as
+                ``"page in plan.slides"``, or its spec mapping.
+            outputs: ``{name: type}`` of the values a run returns; several
+                nodes may then feed the end.
+            retry: ``{node: {error kind: attempts}}`` for agents and steps.
+            prompt_names: ``{agent: prompt name}``: the agents that share one
+                prompt, which must hold the same text.
 
         Raises:
             ValueError: If the system is not runnable. A version 2 system
@@ -171,6 +195,10 @@ class MAS(BasePredictor):
         self.edges = tuple(edge if isinstance(edge, Edge) else Edge(*edge) for edge in edges or ())
         self.frozen = frozenset(frozen)
         self.health = health
+        self.each = {name: f if isinstance(f, ForEach) else ForEach.parse(f) for name, f in (each or {}).items()}
+        self.outputs = {name: t if isinstance(t, ValueType) else parse_type(t) for name, t in (outputs or {}).items()}
+        self.retry = {name: dict(rules) for name, rules in (retry or {}).items()}
+        self.prompt_names = dict(prompt_names or {})
         self.version = self._infer_version(version, agents, steps, boxes, inputs, state)
         if not agents and (self.version == 1 or not (steps or boxes)):
             raise ValueError(
@@ -218,17 +246,20 @@ class MAS(BasePredictor):
     ) -> int:
         """Return the version asked for, else 2 when a version 2 feature is used, else 1."""
         uses_v2 = (
-            bool(steps or boxes or self.frozen)
+            bool(steps or boxes or self.frozen or self.each or self.outputs or self.retry or self.prompt_names)
             or inputs is not None
             or state is not None
             or any(edge.kind is not EdgeKind.PLAIN for edge in self.edges)
-            or any(agent.output_type != "text" for agent in agents)
+            or any(agent.output_type != "text" or agent.renamed for agent in agents)
         )
         inferred = version if version is not None else 2 if uses_v2 else 1
         if inferred not in (1, 2):
             raise ValueError(f"version must be 1 or 2, not {inferred!r}.")
         if inferred == 1 and uses_v2:
-            raise ValueError("Steps, boxes, inputs, state, frozen, conditional edges and typed writes need version 2.")
+            raise ValueError(
+                "Steps, boxes, inputs, outputs, state, frozen, for each, retry, shared prompts, read maps, "
+                "conditional edges and typed writes need version 2."
+            )
         return inferred
 
     def _build_v1(self) -> None:
@@ -255,6 +286,12 @@ class MAS(BasePredictor):
             self.merges[value] = MERGE_LAST
         self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
         self.graph = self.info.graph
+
+    def _chain_system(
+        self, shape: ChainShape, inputs: Mapping[str, ValueType], written: Mapping[str, ValueType]
+    ) -> MAS:
+        """Build the system one item of a chain runs; :func:`~xmas.check.check_system` asks for it."""
+        return _ChainSystem(self, shape, inputs, written)
 
     def _checked(self, refusal: str = "A version 1 system is not checked.") -> SystemInfo:
         """Return what the check learned, which only a version 2 system has; ``refusal`` is the ValueError's text."""
@@ -317,7 +354,7 @@ class MAS(BasePredictor):
             declared = {name: str(vtype) for name, vtype in self.inputs.items()}
             raise ValueError(
                 f"This system's inputs are {declared}, not {{'query': 'text'}}, and run(query) only runs on one "
-                "text query; use it as a box."
+                "text query; use it as a box. run_state(values) runs it on its inputs."
             )
 
     def run(self, query: str) -> Trace:
@@ -329,6 +366,35 @@ class MAS(BasePredictor):
         """
         self._check_runs_on_query()
         return runtime.run_one(self, query, self.prompts())
+
+    def run_state(self, values: Mapping[str, Any], *, on_event: Callable[[Event], None] | None = None) -> Trace:
+        """Run the system on its inputs, given by name, and return the trace of the run.
+
+        A version 2 system takes exactly its inputs, each a value of its type,
+        and its trace's ``outputs`` hold the declared outputs. A version 1
+        system takes text values, ``query`` among them, and runs as :meth:`run`
+        runs. ``on_event`` hears every visit's and item's start and end; it is
+        called on the run's threads, so it must be quick and thread-safe. A
+        failure inside the run is a failed trace.
+
+        Raises:
+            ValueError: Listing every missing, extra or mistyped input, before any call.
+        """
+        if self.version == 2:
+            problems = [f"input {name!r} is missing" for name in self.inputs if name not in values]
+            problems += [f"{name!r} is no input of this system" for name in values if name not in self.inputs]
+            for name, vtype in self.inputs.items():
+                problem = check_value(values[name], vtype) if name in values else None
+                if problem is not None:
+                    problems.append(f"input {name!r} is no {vtype}: {problem}")
+        else:
+            problems = [] if "query" in values else ["input 'query' is missing"]
+            problems += [f"input {name!r} is not text" for name, value in values.items() if not isinstance(value, str)]
+        if problems:
+            lines = "\n".join(f"- {problem}" for problem in problems)
+            raise ValueError(f"run_state got inputs this system does not take:\n{lines}")
+        trace: Trace = runtime.run_state(self, values, self.prompts(), on_event)  # type: ignore[attr-defined]
+        return trace
 
     def run_batch(self, queries: list[str]) -> list[Trace]:
         """Run the MAS over several inputs, concurrently where the LLM allows; one trace per query, in order."""
@@ -402,16 +468,22 @@ class MAS(BasePredictor):
         original by reference, and the budget is carried over; everything else is
         copied, so the original is never touched.
 
-        ``prompts`` and ``models`` are keyed by agent name; a ``None`` model
-        unbinds an agent back to the MAS default. ``edges`` replaces the edge
-        set entirely. A key naming an unknown agent, or a result that is not
-        runnable, raises ``ValueError``.
+        ``prompts`` and ``models`` are keyed by agent name; a prompt given to
+        one agent of a shared prompt reaches every agent sharing it. A
+        ``None`` model unbinds an agent back to the MAS default. ``edges``
+        replaces the edge set entirely. A key naming an unknown agent, or a
+        result that is not runnable, raises ``ValueError``.
         """
-        prompts = prompts or {}
+        prompts = dict(prompts or {})
         models = models or {}
         unknown = (set(prompts) | set(models)) - set(self.agents)
         if unknown:
             raise ValueError(f"copy() names unknown agents: {sorted(unknown)}.")
+        for name, text in list(prompts.items()):
+            shared = self.prompt_names.get(name)
+            prompts.update(
+                {other: text for other, key in self.prompt_names.items() if key == shared and other not in prompts}
+            )
         new_agents = [
             agent.copy(prompt=prompts.get(name, agent.prompt), model=models.get(name, agent.model))
             for name, agent in self.agents.items()
@@ -449,6 +521,10 @@ class MAS(BasePredictor):
             "boxes": tuple(self.boxes.values()),
             "frozen": self.frozen,
             "health": self.health,
+            "each": dict(self.each),
+            "outputs": dict(self.outputs),
+            "retry": {name: dict(rules) for name, rules in self.retry.items()},
+            "prompt_names": dict(self.prompt_names),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -469,23 +545,53 @@ class MAS(BasePredictor):
                 "default_model": self.default_model,
             }
         sections: dict[str, Any] = {
-            "agents": [_agent_spec(agent) for agent in self.agents.values()],
-            "steps": [step.to_dict() for step in self.steps.values()],
-            "boxes": [box.to_dict() for box in self.boxes.values()],
+            "agents": [
+                self._entry(name, _agent_spec(agent, self.prompt_names.get(name)))
+                for name, agent in self.agents.items()
+            ],
+            "steps": [self._entry(name, step.to_dict()) for name, step in self.steps.items()],
+            "boxes": [self._entry(name, box.to_dict()) for name, box in self.boxes.items()],
             "edges": dump_edges(self.edges),
             "state": {value: {"merge": rule} for value, rule in self.merges.items()},
             "frozen": sorted(self.frozen),
             "health": _health_spec(self.health),
             "callables": self._callable_specs(),
             "default_model": self.default_model,
-            "prompts": self.prompts(),
+            "prompts": self._prompt_section(),
         }
         inputs = {} if self.inputs == _QUERY_ONLY else {"inputs": _type_words(self.inputs)}
+        outputs = {"outputs": _type_words(self.outputs)} if self.outputs else {}
         return {
             "version": 2,
             **inputs,
+            **outputs,
             **{key: value for key, value in sections.items() if value not in (None, [], {})},
         }
+
+    def _entry(self, name: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Return a node's spec entry with its ``for each`` after the keys that name it and its ``retry`` last."""
+        items = list(data.items())
+        named = sum(key in ("name", "model", "prompt", "uses") for key in data)
+        if name in self.each:
+            items.insert(named, ("for each", self.each[name].to_spec()))
+        if name in self.retry:
+            items.append(("retry", dict(self.retry[name])))
+        return dict(items)
+
+    def _prompt_section(self) -> dict[str, str]:
+        """Return the ``prompts`` section: one text per agent, or per shared prompt name.
+
+        Raises:
+            ValueError: If agents that share a prompt hold different texts.
+        """
+        prompts: dict[str, str] = {}
+        for name, agent in self.agents.items():
+            key = self.prompt_names.get(name, name)
+            if prompts.setdefault(key, agent.prompt) != agent.prompt:
+                raise ValueError(
+                    f"The agents sharing the prompt {key!r} hold different texts; copy(prompts=...) sets one on all."
+                )
+        return prompts
 
     def _callable_specs(self) -> dict[str, dict[str, Any]]:
         """Return the ``callables`` section: every callable a node uses, steps' first."""
@@ -555,13 +661,14 @@ class MAS(BasePredictor):
         """Rebuild a version 2 MAS and check its ``callables`` against those supplied."""
         spec: dict[str, Any] = dict(validate_spec_v2(data))
         prompts = spec.get("prompts", {})
+        entries = [*spec.get("agents", []), *spec.get("steps", []), *spec.get("boxes", [])]
         agents = []
         for item in spec.get("agents", []):
             ((output, output_type),) = item["writes"].items()
             agents.append(
                 Agent(
                     item["name"],
-                    prompts[item["name"]],
+                    prompts[item.get("prompt", item["name"])],
                     output,
                     item.get("reads"),
                     item.get("tools"),
@@ -577,7 +684,10 @@ class MAS(BasePredictor):
             llms=llms,
             default_model=spec.get("default_model"),
             tools=tools,
-            steps=[Step(**item) for item in spec.get("steps", [])],
+            steps=[
+                Step(item["name"], item["uses"], item.get("reads", {}), item.get("writes", {}))
+                for item in spec.get("steps", [])
+            ],
             inputs=spec.get("inputs"),
             state=spec.get("state"),
             version=2,
@@ -587,6 +697,10 @@ class MAS(BasePredictor):
             ],
             frozen=spec.get("frozen", ()),
             health=_health_settings(spec["health"]) if "health" in spec else None,
+            each={item["name"]: item["for each"] for item in entries if "for each" in item},
+            outputs=spec.get("outputs"),
+            retry={item["name"]: item["retry"] for item in entries if "retry" in item},
+            prompt_names={item["name"]: item["prompt"] for item in spec.get("agents", []) if "prompt" in item},
         )
         mas._check_callables(spec.get("callables", {}))
         return mas
@@ -652,6 +766,12 @@ class MAS(BasePredictor):
         edges; and an ``id``, the SHA-256 of the canonical JSON of the rest.
         Prompts are not part of it, so editing one keeps the id. A version 1
         system's ``<continue>`` back edges are ``"loop"`` edges.
+
+        A chain node gains its ``"for each"``, an agent reading a value under
+        another name its ``"placeholders"`` map, a node that retries its
+        ``"retry"``. Declared ``"outputs"`` and the chains, as ``"groups"``,
+        appear only when there are any; a chain node's reads and writes have
+        their types for one item.
         """
         declared = {(edge.source, edge.target): edge for edge in self.edges}
         loops = back_edges(self.graph) if self.info is None else set()
@@ -669,13 +789,35 @@ class MAS(BasePredictor):
             "edges": [self._describe_edge(pair, declared.get(pair), pair in loops) for pair in ordered],
             "joins": joins,
         }
+        if self.outputs:
+            description["outputs"] = _type_words(self.outputs)
+        chains = self.info.chains if self.info is not None else {}
+        if chains:
+            description["groups"] = [
+                {"name": head, "for each": str(chain.each), "nodes": [n for n in self.nodes if n in chain.nodes]}
+                | chain.each.options
+                for head, chain in chains.items()
+            ]
         canonical = json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         description["id"] = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return description
 
     def _describe_node(self, name: str, node: Agent | Step | Box) -> dict[str, Any]:
         """Return one node of :meth:`describe`."""
-        types = self.info.types if self.info is not None else {}
+        entry = self._describe_body(name, node)
+        if name in self.each:
+            entry["for each"] = str(self.each[name])
+        if isinstance(node, Agent) and node.renamed:
+            entry["placeholders"] = dict(node.reads)
+        if name in self.retry:
+            entry["retry"] = dict(self.retry[name])
+        return entry
+
+    def _describe_body(self, name: str, node: Agent | Step | Box) -> dict[str, Any]:
+        """Return the kind, model or callable or system, typed reads and writes, and frozen of one node."""
+        info = self.info
+        chain = next((c for c in info.chains.values() if name in c.nodes), None) if info is not None else None
+        types = chain.system._checked().types if chain is not None else info.types if info is not None else {}
 
         def typed(names: Iterable[str]) -> dict[str, str]:
             return {name: str(types.get(name, TEXT)) for name in names}
@@ -734,9 +876,10 @@ class MAS(BasePredictor):
         evaluate the other's prompt sets; an optimizer batches a population of
         prompt candidates through one predictor this way. Prompts travel in the
         run state, so they are absent. A version 2 system adds lines for its
-        steps, edges, answer types and forms, inputs, merges and boxes (each with
-        its inner structure, indented); frozen nodes and health settings change
-        no compiled graph and stay out.
+        steps, edges, answer types and forms, inputs, merges, outputs, read
+        maps, chain forms with ``at once`` and ``key``, retries and boxes (each
+        with its inner structure, indented); frozen nodes, health settings,
+        prompt names and item budgets change no compiled graph and stay out.
         """
         lines = [
             f"{agent.name} {','.join(agent.inputs)} -> {agent.output} model={agent.model} tools={','.join(agent.tools)}"
@@ -756,6 +899,14 @@ class MAS(BasePredictor):
         ]
         lines += [f"input {name} {vtype}" for name, vtype in sorted(self.inputs.items())]
         lines += [f"merge {value} {rule}" for value, rule in sorted(self.merges.items())]
+        lines += [f"output {name} {vtype}" for name, vtype in self.outputs.items()]
+        lines += [
+            f"reads {a.name} {_canonical(a.reads)}"
+            for a in sorted(self.agents.values(), key=lambda a: a.name)
+            if a.renamed
+        ]
+        lines += [f"each {name} {f} at_once={f.at_once} key={f.key}" for name, f in sorted(self.each.items())]
+        lines += [f"retry {name} {_canonical(rules)}" for name, rules in sorted(self.retry.items())]
         for box in sorted(self.boxes.values(), key=lambda b: b.name):
             lines.append(f"box {box.name} reads={_canonical(box.reads)} writes={_canonical(box.writes)}")
             lines += [f"  {line}" for line in box.system.structure.splitlines()]
@@ -781,13 +932,18 @@ class MAS(BasePredictor):
         return f"MAS(agents={agent_names(self.graph)!r}, edges={edges}, {ending})"
 
 
-def _agent_spec(agent: Agent) -> dict[str, Any]:
-    """Return one agent's version 2 entry, defaults left out; its prompt goes to ``prompts``."""
+def _agent_spec(agent: Agent, prompt: str | None) -> dict[str, Any]:
+    """Return one agent's version 2 entry, defaults left out; its prompt text goes to ``prompts``.
+
+    ``prompt`` names a shared prompt; ``reads`` is a list unless a placeholder reads another name.
+    """
     data: dict[str, Any] = {"name": agent.name}
     if agent.model is not None:
         data["model"] = agent.model
-    if agent.inputs != ["query"]:
-        data["reads"] = list(agent.inputs)
+    if prompt is not None:
+        data["prompt"] = prompt
+    if agent.reads != {"query": "query"}:
+        data["reads"] = dict(agent.reads) if agent.renamed else list(agent.reads)
     data["writes"] = {agent.output: str(parse_type(agent.output_type))}
     if agent.tools:
         data["tools"] = list(agent.tools)
@@ -822,3 +978,55 @@ def _type_words(types: Mapping[str, ValueType]) -> dict[str, str]:
 def _canonical(value: Any) -> str:
     """Write a structure part as canonical JSON, so equal parts give equal lines."""
     return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+
+class _ChainSystem(MAS):
+    """The nodes of one ``for each`` chain as a system of their own, which one item runs.
+
+    Its exits end it: ``checker -> assemble: else`` outside is ``checker ->
+    END: else`` inside. It declares the chain's writes as its outputs, so
+    several of its nodes may end it. Models, tools and callables resolve
+    through the outer system, so a subclass's ``resolve_llm`` serves the
+    chain's agents too.
+    """
+
+    def __init__(
+        self, outer: MAS, shape: ChainShape, inputs: Mapping[str, ValueType], written: Mapping[str, ValueType]
+    ) -> None:
+        """Build and check the chain's system from the outer one."""
+        self.outer = outer
+        super().__init__(
+            [outer.agents[name] for name in shape.nodes if name in outer.agents],
+            [*shape.internal, *(dataclasses.replace(edge, target=END) for edge in shape.exits)],
+            llm=outer.llm,
+            llms=outer.llms,
+            max_steps=outer.max_steps,
+            default_model=outer.default_model,
+            tools=outer.tools,
+            max_tool_rounds=outer.max_tool_rounds,
+            max_visits=outer.max_visits,
+            steps=[outer.steps[name] for name in shape.nodes if name in outer.steps],
+            inputs=inputs,
+            state={value: {"merge": rule} for value, rule in outer.merges.items() if value in written},
+            version=2,
+            boxes=[outer.boxes[name] for name in shape.nodes if name in outer.boxes],
+            health=outer.health,
+            outputs=written,
+            retry={name: rules for name, rules in outer.retry.items() if name in shape.nodes},
+        )
+
+    def _callables(self) -> ToolIndex:
+        """Return the outer system's callables registry."""
+        return self.outer._callables()
+
+    def resolve_tools(self, agent: Agent) -> ToolIndex:
+        """Resolve an agent's tools through the outer system."""
+        return self.outer.resolve_tools(agent)
+
+    def resolve_callable(self, step: Step) -> tuple[Tool, ToolSource]:
+        """Resolve a step's callable through the outer system."""
+        return self.outer.resolve_callable(step)
+
+    def resolve_llm(self, agent: Agent) -> BaseLLM:
+        """Resolve an agent's model through the outer system."""
+        return self.outer.resolve_llm(agent)
