@@ -138,8 +138,10 @@ BAD_FILES = [
         "example 'a': media examples/media/b.png is not in the bundle",
     ),
     (
-        "version: 1\nexamples: [{name: a, inputs: {p: {location: examples/media/a.png, media_type: image/png,"
-        " sha256: f0}}}]\n",
+        (
+            "version: 1\nexamples: [{name: a, inputs: {p: {location: examples/media/a.png, media_type: image/png,"
+            " sha256: f0}}}]\n"
+        ),
         "example 'a': media examples/media/a.png changed since the case was written (sha256)",
     ),
     ("version: 1\nexamples: [{name: a}, {name: a}]\n", "example 'a' is named in examples/warmup.yaml too"),
@@ -154,7 +156,8 @@ def test_level_0_unchanged_since_saved(tmp_path: Path, monkeypatch: pytest.Monke
         warnings.simplefilter("error")
         report = verify(d, 0)
     lock = Lock.from_yaml((folder / "xmas.lock").read_text(encoding="utf-8"))
-    assert report.ok and report.lines() == [
+    assert report.ok
+    assert report.lines() == [
         f"level 0: unchanged since saved (bundle {lock.bundle[:16]}, {len(lock.files)} files)",
         "ok: level 0",
     ]
@@ -181,7 +184,9 @@ def test_level_0_unchanged_since_saved(tmp_path: Path, monkeypatch: pytest.Monke
     edited.agents["noter"].prompt = "Write short notes for this plan: {plan}"
     with pytest.warns(VerifyWarning):
         report = verify(edited, 0)
-    assert report.lock is not None and report.lock.clean and report.unsaved == ("prompts/noter.md",)
+    assert report.lock is not None
+    assert report.lock.clean
+    assert report.unsaved == ("prompts/noter.md",)
 
     with pytest.warns(VerifyWarning, match="not saved: no lock"):
         report = verify(deck(), 0)
@@ -189,7 +194,8 @@ def test_level_0_unchanged_since_saved(tmp_path: Path, monkeypatch: pytest.Monke
     (tmp_path / "edited.mas" / "xmas.lock").write_text("files: [\n", encoding="utf-8")  # a lock edited by hand
     with pytest.warns(VerifyWarning):
         report = verify(edited, 0)
-    assert report.lines()[0] == "level 0: changed: xmas.lock" and not report.ok
+    assert report.lines()[0] == "level 0: changed: xmas.lock"
+    assert not report.ok
     with pytest.raises(ValueError, match="levels are 0, 1 and 2, got 3"):
         verify(deck(), 3)
 
@@ -229,7 +235,9 @@ def test_level_1_is_dry(tmp_path: Path, png: Path) -> None:
     )
     assert report.misses == {"writer-model": ("writer-model-2", "judge-model")}
     assert report.lines()[1] == "level 1: 6 problems; model names checked against the configured catalogue"
-    assert calls(d) == [[], []] and seer.calls == [] and seer.parts == []
+    assert calls(d) == [[], []]
+    assert seer.calls == []
+    assert seer.parts == []
 
     for text, problem in BAD_FILES:
         with pytest.raises(ValueError, match=f"^examples/warmup.yaml: .*{re.escape(problem)}"):
@@ -298,7 +306,8 @@ def test_level_2_node_cases(tmp_path: Path) -> None:
     assert rows["render-wrong"].failures == (
         'equals {"words": 12, "overflow": true}: got {"words": 13, "overflow": true}',
     )
-    assert all(r.latency_s > 0 for r in report.examples) and report.cost_usd == pytest.approx(0.02)
+    assert all(r.latency_s > 0 for r in report.examples)
+    assert report.cost_usd == pytest.approx(0.02)
     assert report.lines()[2].startswith("level 2: checker-sees-the-overflow  pass  0.0100 USD  ")
     assert report.lines()[4] == "  - verdict.fits equals true: got false"
     assert report.lines()[-1] == "not ok: level 0 differs; 2 examples passed, 2 fail, 0.0200 USD"
@@ -327,7 +336,8 @@ def test_level_2_node_cases(tmp_path: Path) -> None:
     ):
         run_node(boxed, "cutter", {"page": "x"})
     whole = run_node(boxed, "shorten", {"draft": "A draft."})  # the box itself is one node
-    assert whole.outputs == {"short": "echo:Cut A draft."} and whole.records[0].kind == "box"
+    assert whole.outputs == {"short": "echo:Cut A draft."}
+    assert whole.records[0].kind == "box"
     with pytest.raises(ValueError, match=r"'nobody' is no node of the system; its nodes: \['shorten', 'writer'\]"):
         run_node(boxed, "nobody", {})
     asked = gated()
@@ -355,15 +365,18 @@ def test_level_2_run_cases_and_budgets(tmp_path: Path) -> None:
     ]
     capped = examples_file(tmp_path, RUN, budget={"cost_usd": 0.5, "per example": {"cost_usd": 0.02, "wall_s": 60}})
     (row,) = check(deck(), 2, examples=capped).examples
-    assert row.status == "fail" and row.failures[0].startswith("budget: BudgetExceeded: cost_usd")
+    assert row.status == "fail"
+    assert row.failures[0].startswith("budget: BudgetExceeded: cost_usd")
     walled = examples_file(tmp_path, RUN, budget={"cost_usd": 0.5})
     for given in (None, Budget(max_wall_s=60)):  # a budget without money keeps the 0.02 USD per example
         (row,) = check(deck(), 2, examples=walled, budget=given).examples
-        assert row.status == "fail" and row.failures[0].startswith("budget: BudgetExceeded: cost_usd"), given
+        assert row.status == "fail", given
+        assert row.failures[0].startswith("budget: BudgetExceeded: cost_usd"), given
 
     d = deck()
     report = check(d, 2, examples=examples_file(tmp_path, RENDER, CHECKER), budget=0)
-    assert [r.status for r in report.examples] == ["skipped", "skipped"] and report.cost_usd == 0.0
+    assert [r.status for r in report.examples] == ["skipped", "skipped"]
+    assert report.cost_usd == 0.0
     assert calls(d) == [[], []]
 
     unpriced = MAS.from_dict(
@@ -377,7 +390,8 @@ def test_level_2_run_cases_and_budgets(tmp_path: Path) -> None:
         "cost_unknown: a call reported no cost and its model has no price, so the cap cannot bind",
     )
     assert report.examples[1].notes == ("budget: an earlier example's cost is unknown",)
-    assert report.cost_usd is None and report.lines()[-1].endswith("0 examples passed, 1 fail, 1 skipped, cost unknown")
+    assert report.cost_usd is None
+    assert report.lines()[-1].endswith("0 examples passed, 1 fail, 1 skipped, cost unknown")
 
     asked = gated()
     (row,) = check(
@@ -474,7 +488,8 @@ def test_warning_strict_and_only(tmp_path: Path) -> None:
     d.save(folder)  # the lock now holds the examples too
     with pytest.warns(VerifyWarning) as caught:
         report = verify(d, 2, config=NAMES)
-    assert len(caught) == 1 and str(caught[0].message) == str(report)
+    assert len(caught) == 1
+    assert str(caught[0].message) == str(report)
     assert report.lines()[0].startswith("level 0: unchanged since saved")
     with pytest.raises(VerifyFailed) as failed:
         verify(d, 2, strict=True, config=NAMES)
@@ -489,7 +504,8 @@ def test_warning_strict_and_only(tmp_path: Path) -> None:
     assert by_name.lines()[-1] == "ok: 1 example passed, 0.0100 USD"
     assert [r.name for r in by_node.examples] == ["render-measures"]
     data = by_name.to_dict()
-    assert json.loads(json.dumps(data)) == data and (data["ok"], data["examples"][0]["status"]) == (True, "pass")
+    assert json.loads(json.dumps(data)) == data
+    assert (data["ok"], data["examples"][0]["status"]) == (True, "pass")
     with pytest.warns(VerifyWarning, match="1 problem"):
         unknown = verify(d, 1, only=["nobody"], config=NAMES)
     assert unknown.problems == ("only names no example or node: 'nobody'",)
@@ -518,12 +534,14 @@ def test_save_examples_from_a_trace(tmp_path: Path, png: Path) -> None:
         {"path": "verdict.fits", "exists": True},
         {"path": "verdict.fix", "exists": True},
     ]
-    assert trace.run_id is not None and cases["checker"]["from"].startswith(f"trace {trace.run_id[:8]}, record ")
+    assert trace.run_id is not None
+    assert cases["checker"]["from"].startswith(f"trace {trace.run_id[:8]}, record ")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         report = verify(d, 2, budget=0.1, config=NAMES)
     assert report.lines()[0].startswith("level 0: unchanged since saved")  # the lock was refreshed
-    assert [r.status for r in report.examples] == ["pass"] * 7 and report.cost_usd == pytest.approx(0.05)
+    assert [r.status for r in report.examples] == ["pass"] * 7
+    assert report.cost_usd == pytest.approx(0.05)
 
     assert save_examples(d, trace, nodes=["checker"]) == ["checker"]  # replaces the case of its name
     assert len(yaml.safe_load((folder / "examples" / "warmup.yaml").read_text(encoding="utf-8"))["examples"]) == 7
@@ -539,6 +557,8 @@ def test_save_examples_from_a_trace(tmp_path: Path, png: Path) -> None:
     with pytest.raises(ValueError, match="node 'nobody' finished no first visit in the trace"):
         save_examples(d, trace, nodes=["nobody"])
 
+
+def test_save_examples_keeps_media_in_the_bundle(tmp_path: Path, png: Path) -> None:
     seer = SeeingLLM("The deck keeps its plan.")
     media = MAS.from_dict(yaml.safe_load(MEDIA), llms={"vision-model": seer}, tools=[document_text, render_pages])
     house = png.with_name("house.md")
@@ -548,10 +568,12 @@ def test_save_examples_from_a_trace(tmp_path: Path, png: Path) -> None:
     assert save_examples(media, shown, nodes=["reviewer", "render"], path=other) == ["reviewer", "render"]
     reviewer, render = yaml.safe_load((other / "examples" / "warmup.yaml").read_text(encoding="utf-8"))["examples"]
     (page,) = reviewer["inputs"]["slide_png"]
-    assert page["location"].startswith("examples/media/") and (other / page["location"]).read_bytes() == b"page intro"
+    assert page["location"].startswith("examples/media/")
+    assert (other / page["location"]).read_bytes() == b"page intro"
     assert render["recorded"] == [page]  # the step's pictures, compared by their bytes
     report = check(media, 2, examples=other)
-    assert [r.passed for r in report.examples] == [True, True] and len(seer.parts) == 2
+    assert [r.passed for r in report.examples] == [True, True]
+    assert len(seer.parts) == 2
     with pytest.raises(ValueError, match=re.escape("named by a plain word, got '../x'")):
         save_examples(media, shown, nodes=["reviewer"], path=other, file="../x")
     zipped = tmp_path / "zipped.mas"

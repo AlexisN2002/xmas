@@ -18,11 +18,10 @@ import json
 import sys
 import time
 import warnings
-from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from xmas.agent import Agent
 from xmas.budget import Budget
@@ -33,6 +32,9 @@ from xmas.mas import MAS
 from xmas.store import open_store
 from xmas.values import TEXT, ValueType, media_kind, plain
 from xmas.verify import VerifyWarning
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
 __all__ = [
     "main",
@@ -141,7 +143,7 @@ def load(args: argparse.Namespace, **options: Any) -> MAS:
     return MAS.load(args.bundle, trust=args.trust, **options)
 
 
-def init(args: argparse.Namespace) -> int:
+def init_command(args: argparse.Namespace) -> int:
     path = Path(args.bundle)
     if path.exists():
         raise UsageError(f"{path} exists; init writes a new bundle")
@@ -182,7 +184,7 @@ def summary(description: Mapping[str, Any]) -> str:
     return ", ".join(f"{n} {word}{'s' * (n != 1)}" for word, n in counts.items())
 
 
-def check(args: argparse.Namespace) -> int:
+def check_command(args: argparse.Namespace) -> int:
     mas = load(args, resolve=False)
     problems: list[str] = []
     parse_examples(read(args.bundle), Path(args.bundle) if Path(args.bundle).is_dir() else None, problems=problems)
@@ -196,7 +198,7 @@ def words(values: Mapping[str, str]) -> str:
     return ", ".join(f"{name} {vtype}" for name, vtype in values.items())
 
 
-def show(args: argparse.Namespace) -> int:
+def show_command(args: argparse.Namespace) -> int:
     description = load(args, resolve=False).describe()
     if args.json:
         print(json.dumps(description, indent=2))
@@ -233,13 +235,13 @@ def value(text: str, vtype: ValueType) -> Any:
     if vtype.item is None and media_kind(vtype) is not None:
         return Path(text)
     try:
-        value = json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         raise UsageError(f"a {vtype} input is JSON, not {text!r}") from None
-    return [Path(item) for item in value] if media_kind(vtype) is not None and isinstance(value, list) else value
+    return [Path(item) for item in parsed] if media_kind(vtype) is not None and isinstance(parsed, list) else parsed
 
 
-def run(args: argparse.Namespace) -> int:
+def run_command(args: argparse.Namespace) -> int:
     config = Config.load()
     if not config.base_url:
         raise ValueError(f"no endpoint: set XMAS_BASE_URL, or base_url under [endpoint] in {config_path()}")
@@ -268,7 +270,7 @@ def run(args: argparse.Namespace) -> int:
     return 1 if trace.failed else 0
 
 
-def diff(args: argparse.Namespace) -> int:
+def diff_command(args: argparse.Namespace) -> int:
     if not Path(args.bundle).exists() or (args.other and not Path(args.other).exists()):
         raise UsageError(f"no bundle at {args.bundle if not Path(args.bundle).exists() else args.other}")
     left = read(args.bundle)
@@ -303,7 +305,7 @@ def diff(args: argparse.Namespace) -> int:
     return 1 if report["added"] or report["removed"] or changed else 0
 
 
-def verify(args: argparse.Namespace) -> int:
+def verify_command(args: argparse.Namespace) -> int:
     mas = load(args, resolve=False)
     report = mas.verify(args.level, budget=args.budget, only=args.only)
     print(json.dumps(report.to_dict(), indent=2) if args.json else str(report))
@@ -314,7 +316,7 @@ def run_cost(totals: Mapping[str, Any] | None) -> float | None:
     return None if not totals or totals["uncosted_calls"] else float(totals["cost_usd"])
 
 
-def runs(args: argparse.Namespace) -> int:
+def runs_command(args: argparse.Namespace) -> int:
     store = open_store()
     rows = store.runs(args.status, args.system, args.limit)
     if args.json:
@@ -332,7 +334,7 @@ def runs(args: argparse.Namespace) -> int:
     return 0
 
 
-def trace(args: argparse.Namespace) -> int:
+def trace_command(args: argparse.Namespace) -> int:
     store = open_store()
     try:
         trace = store.trace(args.run_id)
@@ -359,14 +361,14 @@ def trace(args: argparse.Namespace) -> int:
 
 
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
-    "init": init,
-    "check": check,
-    "show": show,
-    "run": run,
-    "diff": diff,
-    "verify": verify,
-    "runs": runs,
-    "trace": trace,
+    "init": init_command,
+    "check": check_command,
+    "show": show_command,
+    "run": run_command,
+    "diff": diff_command,
+    "verify": verify_command,
+    "runs": runs_command,
+    "trace": trace_command,
 }
 """Each command's function, by the name typed after ``xmas``."""
 

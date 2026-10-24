@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 from xmas.schemas import compile_form
 from xmas.values import JSON, parse_type
@@ -51,7 +51,7 @@ class Agent:
     output_type: str
     schema: dict[str, Any] | None
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917  the public constructor, kept for version 1 callers
         self,
         name: str,
         prompt: str,
@@ -179,6 +179,9 @@ class Agent:
         if not isinstance(other, Agent):
             return NotImplemented
         return self.to_dict() == other.to_dict()
+
+    # agents are mutable and compare by value, so they cannot be dict keys or set members
+    __hash__: ClassVar[None] = None  # type: ignore[assignment]  # typeshed's idiom for an unhashable class
 
     def __repr__(self) -> str:
         """Return an unambiguous representation."""

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import re
 import statistics
-from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +23,8 @@ from xmas.errors import ErrorKind
 from xmas.prompts import extract_placeholders
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping, Sequence
+
     from xmas.budget import RunMeter
     from xmas.trace import AgentRecord
 
@@ -130,7 +131,7 @@ class Health:
         return data
 
 
-def summarize(
+def summarize(  # noqa: PLR0913  the public keyword-only signature, kept for version 1 callers
     records: Sequence[AgentRecord],
     *,
     meter: RunMeter | None = None,
@@ -166,6 +167,15 @@ def outputs_text(record: AgentRecord) -> str:
     return "\n".join(record.outputs.values())
 
 
+@dataclass(frozen=True)
+class SignalRules:
+    """What every record of one run is judged by: the settings, the leak patterns and the system's value names."""
+
+    settings: HealthSettings
+    leaks: tuple[re.Pattern[str], ...]
+    values: frozenset[str] | None
+
+
 def flags(
     records: Sequence[AgentRecord],
     settings: HealthSettings,
@@ -173,7 +183,7 @@ def flags(
     over: Mapping[int, list[tuple[str, str]]],
 ) -> tuple[Flag, ...]:
     """Return every record's flags, in record order; ``over`` holds the item budget flags by record position."""
-    leaks = [re.compile(pattern) for pattern in (*DEFAULT_LEAKS, *settings.leak)]
+    rules = SignalRules(settings, tuple(re.compile(pattern) for pattern in (*DEFAULT_LEAKS, *settings.leak)), values)
     lengths: dict[str, list[int]] = {}
     for record in records:
         if record.error is None:
@@ -183,7 +193,7 @@ def flags(
     flags: list[Flag] = []
     for position, record in enumerate(records):
         mine = (record.agent, record.item)
-        found = record_signals(record, previous.get(mine), leaks, medians.get(record.agent), settings, values)
+        found = record_signals(record, previous.get(mine), medians.get(record.agent), rules)
         found += over.get(position, [])
         flags.extend(Flag(signal, record.agent, record.step, detail) for signal, detail in found)
         previous[mine] = record
@@ -193,19 +203,17 @@ def flags(
 def record_signals(
     record: AgentRecord,
     before: AgentRecord | None,
-    leaks: list[re.Pattern[str]],
     median: float | None,
-    settings: HealthSettings,
-    values: frozenset[str] | None,
+    rules: SignalRules,
 ) -> list[tuple[str, str]]:
     """Return ``(signal, detail)`` for each signal one record shows, in the order of the table."""
     ok, text = record.error is None, outputs_text(record)
     failure = f"{'unknown' if record.error_kind is None else record.error_kind.value}: {record.error}"
     same = before.step if before is not None and before.error is None and outputs_text(before) == text else None
     placeholders = extract_placeholders(record.prompt)
-    missing = sorted((placeholders if values is None else placeholders & values) - set(record.inputs))
-    leak = next((match.group() for pattern in leaks if (match := pattern.search(text))), None)
-    size, factor, median = len(text), settings.length_factor, median or 0
+    missing = sorted((placeholders if rules.values is None else placeholders & rules.values) - set(record.inputs))
+    leak = next((match.group() for pattern in rules.leaks if (match := pattern.search(text))), None)
+    size, factor, median = len(text), rules.settings.length_factor, median or 0
     lengths = f"{size} characters, the node's median is {median:g}"
     signals: dict[str, object] = {
         "retried": record.rejected and f"{len(record.rejected)} answer(s) rejected: {record.rejected[0].error}",

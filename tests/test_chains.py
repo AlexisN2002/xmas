@@ -90,11 +90,13 @@ def test_the_deck_runs_per_item_and_gathers_in_order() -> None:
 
     # "intro" finished last, yet its records come first: records keep the items' order
     finished = [event.item_key for event in events if event.kind == "item_end" and event.node == "drafter"]
-    assert finished[-1] == "intro" and sorted(finished) == sorted(pages)
+    assert finished[-1] == "intro"
+    assert sorted(finished) == sorted(pages)
 
     # assemble runs once, after both chains; noter runs beside them; neither is an item
     names = [r.agent for r in trace.records]
-    assert names.count("assemble") == 1 and names.count("noter") == 1
+    assert names.count("assemble") == 1
+    assert names.count("noter") == 1
     assert names.index("assemble") > max(i for i, name in enumerate(names) if name in ("checker", "figure_checker"))
     assert (trace["assemble"][0].item, trace["assemble"][0].visit) == (None, 1)
     assert trace["noter"][0].item is None
@@ -104,7 +106,8 @@ def test_the_deck_runs_per_item_and_gathers_in_order() -> None:
     assert trace.cost_usd == pytest.approx(0.01 * (5 * 4 + 2 * 2 + 1))
     health = trace.health
     assert health is not None
-    assert health.items["drafter"]["items"] == 5 and health.items["drafter"]["failed"] == 0
+    assert health.items["drafter"]["items"] == 5
+    assert health.items["drafter"]["failed"] == 0
 
 
 def pages(
@@ -175,21 +178,25 @@ def test_a_failed_item_keeps_the_others() -> None:
 
     mas, _ = pages(writer)
     trace = mas.run_state(plan_of("a", "b", "c", "d"))
-    assert trace.error is None and trace.status is RunStatus.OK
+    assert trace.error is None
+    assert trace.status is RunStatus.OK
     assert trace.outputs == {"words": [4, 4, None, 4], "total": {"words": 12, "missing": 1}}
     assert trace["fin"][0].inputs == {"words": "[4, 4, null, 4]"}
     (failed,) = [r for r in trace["count"] if r.error is not None]
     assert (failed.item, failed.item_key, failed.error) == (2, "c", "ValueError: cannot count a broken page")
-    assert failed.error_kind is ErrorKind.UNKNOWN and failed.route is None
+    assert failed.error_kind is ErrorKind.UNKNOWN
+    assert failed.route is None
     assert [(r.agent, r.item) for r in trace.records][:8] == [(n, i) for i in range(4) for n in ("writer", "count")]
     health = trace.health
     assert health is not None
-    assert health.items["writer"]["failed"] == 1 and "item_failed" in {flag.signal for flag in health.flags}
+    assert health.items["writer"]["failed"] == 1
+    assert "item_failed" in {flag.signal for flag in health.flags}
 
     # money in one item ends the run: the siblings finished and were paid, and keep their records
     money = {"plan": {"slides": [{"id": n, "say": "money"} for n in "abd"]}}
     broke = pages(writer)[0].run_state(money)
-    assert broke.error == "OutOfMoneyError: Key limit exceeded" and broke.error_kind is ErrorKind.MONEY
+    assert broke.error == "OutOfMoneyError: Key limit exceeded"
+    assert broke.error_kind is ErrorKind.MONEY
     kept = sorted((r.item, r.agent, r.error is None) for r in broke.records)
     assert kept == [
         (0, "count", True),
@@ -214,7 +221,8 @@ def test_zero_items_outer_loop_and_key_problems(case: str) -> None:
         for values in empty:
             mas, llm = pages()
             trace = mas.run_state(values)
-            assert trace.error is None and llm.calls == []
+            assert trace.error is None
+            assert llm.calls == []
             assert [r.agent for r in trace.records] == ["fin"]
             assert trace["fin"][0].inputs == {"words": "[]"}
             assert trace.outputs == {"words": [], "total": {"words": 0, "missing": 0}}
@@ -245,9 +253,11 @@ def test_zero_items_outer_loop_and_key_problems(case: str) -> None:
         for values, problem in cases[case]:
             mas, llm = pages()
             trace = mas.run_state(values)
-            assert trace.error is not None and trace.error.startswith("ValueError: for each page in plan.slides: ")
+            assert trace.error is not None
+            assert trace.error.startswith("ValueError: for each page in plan.slides: ")
             assert problem in trace.error
-            assert llm.calls == [] and trace.records == ()
+            assert llm.calls == []
+            assert trace.records == ()
 
 
 def test_a_box_and_shared_prompts_in_a_chain() -> None:
@@ -285,7 +295,8 @@ def test_a_box_and_shared_prompts_in_a_chain() -> None:
     # a chain inside a box keeps its items' records in the box's inner trace
     boxed = MAS([], boxes=[Box("all", mas, reads={"plan": "plan"}, writes={"short": "short"})], inputs={"plan": "json"})
     (whole,) = boxed.run_state(plan_of("one", "two"))["all"]
-    assert whole.outputs == {"short": '["DRAFT ONE", "DRAFT TWO"]'} and whole.inner is not None
+    assert whole.outputs == {"short": '["DRAFT ONE", "DRAFT TWO"]'}
+    assert whole.inner is not None
     assert [(r.agent, r.item_key) for r in whole.inner.records] == [
         ("writer", "one"),
         ("shorten", "one"),
@@ -331,11 +342,13 @@ def test_topology_search_never_breaks_a_chain() -> None:
     )
     updater = GraphUpdater(MechanicalSynthesizer(), TopologyBudget(min_agents=2, max_agents=5, max_edges=8), seed=0)
     fixed = updater.fixed_of(mas)
-    assert fixed is not None and {"writer", "count"} <= fixed.nodes  # chain members are held
+    assert fixed is not None
+    assert {"writer", "count"} <= fixed.nodes  # chain members are held
     candidates = updater.propose(mas, {}, 4)
     assert candidates
     for candidate in candidates:
-        assert candidate.each == mas.each and candidate.agents["writer"].reads == {"slide": "page"}
+        assert candidate.each == mas.each
+        assert candidate.agents["writer"].reads == {"slide": "page"}
         assert {(e.source, e.target) for e in candidate.edges} >= {("writer", "count"), ("count", "summarizer")}
         assert candidate.run_state(plan_of("a", "b")).error is None
 
@@ -348,7 +361,7 @@ def test_boxes_in_items_keep_apart() -> None:
         return prompt.upper()
 
     def counted(prompt: str) -> str:
-        tag = prompt.split()[0]
+        tag = prompt.split(maxsplit=1)[0]
         with lock:
             now[tag] += 1
             most[tag] = max(most[tag], now[tag])
@@ -368,7 +381,8 @@ def test_boxes_in_items_keep_apart() -> None:
     mas = MAS([], boxes=[box], each={"shorten": "page in pages"}, outputs={"short": "list of text"}, inputs=pages)
     trace = mas.run_state({"pages": ["a", "bad", "c", "d"]})
     (failed,) = [r for r in trace.records if r.error is not None]
-    assert failed.item == 1 and failed.inner is not None
+    assert failed.item == 1
+    assert failed.inner is not None
     assert [(r.agent, r.item) for r in failed.inner.records] == [("first", 1)]  # no sibling's records
 
     # two chains with the same head name keep their own at once
@@ -474,7 +488,8 @@ def test_the_judge_sees_each_slide(png: Path) -> None:  # the fixture keeps the 
     broken, eye, desk = slides(assemble=False)
     plan = {"plan": {"slides": [{"id": "intro"}, {"id": "method", "broken": True}, {"id": "result"}]}}
     failed = broken.run_state(plan)
-    assert failed.error is None and failed.outputs["verdict"] == ["fits slide intro", None, "fits slide result"]
+    assert failed.error is None
+    assert failed.outputs["verdict"] == ["fits slide intro", None, "fits slide result"]
     assert len(eye.parts) == 2
     (parts,) = desk.parts
     assert [type(part).__name__ for part in parts] == ["str", "Ref", "str", "Ref"]

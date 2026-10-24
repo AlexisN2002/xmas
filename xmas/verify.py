@@ -63,6 +63,17 @@ PER_EXAMPLE_USD = 0.02
 STATUSES = ("pass", "fail", "skipped", "error")
 """How an example ended: its checks passed or failed, it was not run, or it could not run."""
 
+DRY_LEVEL = 1
+WARM_UP_LEVEL = 2
+LEVELS = (0, DRY_LEVEL, WARM_UP_LEVEL)
+# the levels: 0 checksums, 1 dry, 2 warm-up; each includes the ones below
+
+SHORTEST_SHOWN_S = 0.1
+# an example faster than this shows as "<0.1 s"
+
+GRAPH_VERSION = 2
+# the system version whose graph check_system reads
+
 PLACEHOLDER_TYPES = {"image": "image/png", "audio": "audio/wav", "document": "application/pdf", "table": "text/csv"}
 
 
@@ -152,17 +163,17 @@ class VerifyReport:
     def lines(self) -> list[str]:
         """Return the report as lines: one block per level, then the verdict."""
         lines = self.level0()
-        if self.level >= 1:
+        if self.level >= DRY_LEVEL:
             count = len(self.problems)
             head = "no problems" if not count else f"{count} problem{'s' * (count > 1)}"
             lines.append(f"level 1: {head}; {self.names()}")
             lines += [f"  - {problem}" for problem in self.problems]
-        if self.level >= 2:
+        if self.level >= WARM_UP_LEVEL:
             width = max((len(result.name) for result in self.examples), default=0)
             status = max((len(result.status) for result in self.examples), default=0)
             for result in self.examples:
                 cost = usd(result.cost_usd)
-                took = "<0.1 s" if result.latency_s < 0.1 else f"{result.latency_s:.1f} s"
+                took = f"<{SHORTEST_SHOWN_S} s" if result.latency_s < SHORTEST_SHOWN_S else f"{result.latency_s:.1f} s"
                 lines.append(f"level 2: {result.name:<{width}}  {result.status:<{status}}  {cost}  {took}")
                 lines += [f"  - {failure}" for failure in result.failures]
                 lines += [f"  note: {note}" for note in result.notes]
@@ -195,11 +206,11 @@ class VerifyReport:
         tally = ", ".join(f"{n} {status}" for status, n in counts.items() if n and status != "pass")
         examples = f"{counts['pass']} example{'s' * (counts['pass'] != 1)} passed" + (f", {tally}" if tally else "")
         if self.ok:
-            return f"ok: {examples}, {cost}" if self.level >= 2 else f"ok: level {self.level}"
+            return f"ok: {examples}, {cost}" if self.level >= WARM_UP_LEVEL else f"ok: level {self.level}"
         reasons = [] if self.lock is not None and self.lock.clean and not self.unsaved else ["level 0 differs"]
         if self.problems:
             reasons.append(f"{len(self.problems)} problem{'s' * (len(self.problems) > 1)}")
-        if self.level >= 2:
+        if self.level >= WARM_UP_LEVEL:
             reasons.append(f"{examples}, {cost}")
         return f"not ok: {'; '.join(reasons)}"
 
@@ -242,7 +253,7 @@ def lists(data: dict[str, Any]) -> dict[str, Any]:
     return {key: list(value) if isinstance(value, tuple) else value for key, value in data.items()}
 
 
-def verify(
+def verify(  # noqa: PLR0913  the public signature, kept for version 1 callers
     mas: MAS,
     level: int = 1,
     *,
@@ -271,7 +282,7 @@ def verify(
         ValueError: For a level that is not 0, 1 or 2.
         VerifyFailed: When ``strict`` and the report is not ok.
     """
-    if level not in (0, 1, 2):
+    if level not in LEVELS:
         raise ValueError(f"verify levels are 0, 1 and 2, got {level!r}")
     bundle = mas.bundle
     files = {} if bundle is None else dict(read(bundle))
@@ -280,16 +291,16 @@ def verify(
     misses: dict[str, tuple[str, ...]] = {}
     catalogue = None
     wanted = set(only)
-    if level >= 1:
+    if level >= DRY_LEVEL:
         parsed, problems, misses, catalogue = level1(mas, sources(examples, bundle, files), config)
         named = {name for file in parsed for example in file.examples for name in (example.name, example.node)}
         problems += [f"only names no example or node: {name!r}" for name in sorted(wanted - named)]
     results: tuple[ExampleResult, ...] = ()
     cost: float | None = 0.0
     notes: tuple[str, ...] = ()
-    if level == 2 and problems:
+    if level == WARM_UP_LEVEL and problems:
         notes = ("not run: level 1 found problems",)
-    elif level == 2:
+    elif level == WARM_UP_LEVEL:
         results, cost = level2(mas, parsed, wanted, budget)
         notes = () if results else ("no examples to run",)
     report = VerifyReport(
@@ -349,7 +360,7 @@ def level1(
     """Check the system, read the examples, render every prompt and look up every model name; no model call."""
     problems: list[str] = []
     for _, system in systems(mas):
-        if system.version == 2:
+        if system.version == GRAPH_VERSION:
             try:
                 check_system(system)
             except ValueError as error:

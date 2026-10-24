@@ -76,6 +76,8 @@ REF_KEYS = frozenset(item.name for item in fields(Ref))
 NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 PATH = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d+\])*)\Z")
 STEP = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]")
+# a value shown in a failed check is cut to this many characters, the cut marked with "..."
+SHOWN_WIDTH = 80
 
 
 class Unset:
@@ -358,7 +360,7 @@ def parse_path(text: Any, where: str) -> tuple[str | int, ...]:
     match = PATH.match(text) if isinstance(text, str) else None
     if match is None:
         raise ValueError(f"{where}: path is a value name, then .field or [i] steps, got {text!r}")
-    steps = [name if name else int(index) for name, index in STEP.findall(match.group(2))]
+    steps = [name or int(index) for name, index in STEP.findall(match.group(2))]
     return (match.group(1), *steps)
 
 
@@ -382,7 +384,7 @@ def as_number(value: Any) -> float | None:
 
 def show(value: Any) -> str:
     text = json.dumps(plain(value), ensure_ascii=False, default=str)
-    return text if len(text) <= 80 else f"{text[:77]}..."
+    return text if len(text) <= SHOWN_WIDTH else f"{text[: SHOWN_WIDTH - len('...')]}..."
 
 
 def same(left: Any, right: Any) -> bool:
@@ -438,7 +440,7 @@ def run_checks(checks: Sequence[Check], values: Mapping[str, Any], record: Agent
     return failed
 
 
-def contains(found: Any, want: Any, wanted: bool) -> str | None:
+def contains(found: Any, want: Any, *, wanted: bool) -> str | None:
     if isinstance(found, str) and isinstance(want, str):
         held = want in found
     elif isinstance(found, list):
@@ -477,9 +479,9 @@ def near(found: Any, want: Any, within: float) -> str | None:
 JUDGES: dict[str, Callable[[Any, Check, AgentRecord | None], str | None]] = {
     "form": lambda found, check, record: "no visit to judge" if record is None else record.error,  # noqa: ARG005 (one signature for every kind)
     "equals": lambda found, check, *_: None if same(found, check.value) else f"got {show(found)}",
-    "contains": lambda found, check, *_: contains(found, check.value, True),
-    "not contains": lambda found, check, *_: contains(found, check.value, False),
-    "matches": lambda found, check, *_: in_text(found, lambda text: bool(re.search(check.value, text, re.M))),
+    "contains": lambda found, check, *_: contains(found, check.value, wanted=True),
+    "not contains": lambda found, check, *_: contains(found, check.value, wanted=False),
+    "matches": lambda found, check, *_: in_text(found, lambda text: bool(re.search(check.value, text, re.MULTILINE))),
     "line": lambda found, check, *_: in_text(found, lambda text: check.value in text.splitlines(), "no such line in"),
     "len": lambda found, check, *_: length(found, check.value),
     "not empty": lambda found, *_: "empty" if found is None or found in ("", [], {}) else None,
@@ -573,7 +575,10 @@ def default_checks(node: Agent | Step) -> list[Check]:
         return []
     if parse_type(node.output_type) == JSON:
         form = compile_form(node.schema)
-        return [Check("form", value="valid"), *(Check("exists", (node.output, f), True) for f in form.fields or {})]
+        return [
+            Check("form", value="valid"),
+            *(Check("exists", (node.output, f), value=True) for f in form.fields or {}),
+        ]
     if parse_type(node.output_type) == TEXT:
         return [Check("not empty", value=True)]
     return [Check("form", value="valid")]

@@ -153,7 +153,7 @@ def looping_system(llm: MockLLM, counter: Tool = count_words) -> MAS:
         inputs=["query", "verdict"],
         output="draft",
     )
-    mas = MAS(
+    return MAS(
         [writer, judge],
         steps=[Step("count", uses="count_words"), Step("publish", uses="publish"), Step("sorry", uses="apologize")],
         edges=[
@@ -167,7 +167,6 @@ def looping_system(llm: MockLLM, counter: Tool = count_words) -> MAS:
         tools=[counter, publish, apologize],
         llm=llm,
     )
-    return mas
 
 
 def quickstart_agents() -> tuple[Agent, Agent]:
@@ -263,7 +262,7 @@ def test_a_tool_needs_a_docstring_and_a_hint_on_every_parameter() -> None:
 
     with pytest.raises(ValueError, match="docstring"):
         tool(no_doc)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="has no type hint"):
         tool(no_hint)
 
 
@@ -393,7 +392,7 @@ def test_the_form_dialect_the_guide_names() -> None:
         "action": {"type": "text", "one of": ["publish", "shorten"]},
     }
     Agent("judge", prompt="{query}", output="verdict", output_type="json", schema=schema)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unknown type 'boolean'"):
         Agent("judge", prompt="{query}", output="verdict", output_type="json", schema={"fits": {"type": "boolean"}})
 
 
@@ -450,8 +449,8 @@ def test_the_check_refuses_two_writers_a_type_clash_and_a_bad_condition() -> Non
     with pytest.raises(ValueError, match="json"):
         MAS([json_writer], steps=[Step("s", uses="shout")], edges=[("judge", "s")], tools=[shout], llm=llm)
 
+    looping = [Agent("writer", "{query}", output="draft"), json_judge()]
     with pytest.raises(ValueError, match="position"):
-        looping = [Agent("writer", "{query}", output="draft"), json_judge()]
         MAS(
             looping,
             steps=[Step("count", uses="count_words"), Step("publish", uses="publish")],
@@ -759,7 +758,8 @@ def test_box_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> None:
     box = trace["shorten"][0]
     assert box.kind == "box"
     assert box.inner is not None
-    assert box.cost_usd is None and trace.cost_usd is None, "a model that reports no cost leaves every sum unknown"
+    assert box.cost_usd is None, "a model that reports no cost leaves every sum unknown"
+    assert trace.cost_usd is None, "a model that reports no cost leaves every sum unknown"
     assert (
         box.inner["cutter"][0].rendered_prompt == "Cut this to half its length: Sunlight hits air, which scatters blue."
     )
@@ -846,12 +846,17 @@ def test_for_each_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> N
     print(trace["total"][0].inputs)  # {'count_words': '[4, null, 4]'}: the page 'air' failed
 
     assert capsys.readouterr().out.splitlines() == [
-        "[('planner', None), ('page_writer', 'light'), ('count', 'light'), ('page_writer', 'air'), "
-        "('page_writer', 'eye'), ('count', 'eye'), ('total', None)]",
+        (
+            "[('planner', None), ('page_writer', 'light'), ('count', 'light'), ('page_writer', 'air'), "
+            "('page_writer', 'eye'), ('count', 'eye'), ('total', None)]"
+        ),
         "{'count_words': '[4, null, 4]'}",
     ]
-    assert trace.status == "ok" and trace.error is None and trace.output == "8"
-    assert trace["page_writer"][1].error_kind is ErrorKind.TIMEOUT and trace["page_writer"][1].item == 1
+    assert trace.status == "ok"
+    assert trace.error is None
+    assert trace.output == "8"
+    assert trace["page_writer"][1].error_kind is ErrorKind.TIMEOUT
+    assert trace["page_writer"][1].item == 1
     assert deck.describe()["groups"] == [
         {
             "name": "page_writer",
@@ -897,7 +902,8 @@ def test_for_each_claims_without_a_block() -> None:
         llm=MockLLM(lambda prompt: "A page.", meta=True),
     )
     over = costly.run_state({"plan": {"pages": [{"id": "light"}]}})
-    assert over.error is None and over.health is not None
+    assert over.error is None
+    assert over.health is not None
     assert [flag.signal for flag in over.health.flags] == ["item_over_budget"]
 
     # the spec form: each node carries the short form, the first may write the long one
@@ -955,10 +961,12 @@ def test_run_state_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> 
         ("page_writer", "light", "ok"),
         ("page_writer", "eye", "ok"),
     }
-    assert trace.run_id is not None and trace.graph_id == pages.describe()["id"]
-    with pytest.raises(ValueError) as caught:
+    assert trace.run_id is not None
+    assert trace.graph_id == pages.describe()["id"]
+    with pytest.raises(ValueError, match="do not fit the system's inputs") as caught:
         pages.run_state({"plan": {1, 2}, "style": "short"})
-    assert len(str(caught.value).splitlines()) == 3 and len(llm.calls) == 2  # two problems, no call
+    assert len(str(caught.value).splitlines()) == 3  # two problems, no call
+    assert len(llm.calls) == 2
     with pytest.raises(ValueError, match="run_state"):
         pages.run(QUERY)
 
@@ -1005,7 +1013,8 @@ def test_run_state_claims_without_a_block() -> None:
         "records",
     }
     slide = Agent("slide", prompt="Write a slide on {slide}", inputs={"slide": "page"}, output="draft")
-    assert slide.reads == {"slide": "page"} and slide.inputs == ["page"]
+    assert slide.reads == {"slide": "page"}
+    assert slide.inputs == ["page"]
 
 
 # ---------------------------- docs/guide/media.md: Pictures, documents and other files
@@ -1057,14 +1066,17 @@ def test_a_judge_looks_at_the_pictures(slides: Path, capsys: pytest.CaptureFixtu
     assert cover.read_bytes() == Path("slide-1.png").read_bytes()
     assert trace.outputs["review"] == "Clear slides. The second needs a title."
     dumped = json.dumps(trace.to_dict())
-    assert "base64," not in dumped and json.loads(dumped)["outputs"]["cover"] == cover.to_dict()
+    assert "base64," not in dumped
+    assert json.loads(dumped)["outputs"]["cover"] == cover.to_dict()
 
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ValueError, match="does not check") as caught:
         MAS([reviewer], inputs={"pages": "list of image"}, llm=quickstart_llm())
     assert str(caught.value).splitlines() == [
         "The system does not check (1 problem):",
-        "- agent 'reviewer' reads image 'pages', but the default model accepts only text; "
-        'give it accepts = ("text", "image") or convert it first with a step',
+        (
+            "- agent 'reviewer' reads image 'pages', but the default model accepts only text; "
+            'give it accepts = ("text", "image") or convert it first with a step'
+        ),
     ]
 
 
@@ -1074,7 +1086,7 @@ class Blind(SeeingLLM):
     accepts = ("text",)
 
 
-def test_media_claims_without_a_block(slides: Path) -> None:
+def test_media_claims_refs_and_bytes(slides: Path) -> None:
     """Mirrors docs/guide/media.md."""
     # a referenced file that changes is refused; a step's Path is copied; bytes are refused
     page = Ref.from_path("slide-2.png")
@@ -1097,8 +1109,12 @@ def test_media_claims_without_a_block(slides: Path) -> None:
         tools=[raw_cover],
         llm=SeeingLLM(),
     ).run_state({"pages": [Path("slide-1.png")]})
-    assert raw.status == "failed" and "Ref.from_bytes stores bytes" in str(raw.error)
+    assert raw.status == "failed"
+    assert "Ref.from_bytes stores bytes" in str(raw.error)
 
+
+def test_media_claims_models_section(slides: Path) -> None:
+    """Mirrors docs/guide/media.md."""
     # the models section: the page's entries, models over the model's own word, nothing else
     models = yaml.safe_load("models:" + MEDIA.split("```yaml\nmodels:", 1)[1].split("```", 1)[0])
     assert models == {"models": {"vision-model": {"accepts": ["image"]}, "painter-model": {"produces": ["image"]}}}
@@ -1137,6 +1153,10 @@ def test_media_claims_without_a_block(slides: Path) -> None:
     with pytest.raises(ValueError, match="cannot send content parts"):
         MAS([reviewer], inputs={"pages": "list of image"}, llms={"vision-model": MockLLM()}, models=vision_only)
 
+
+@pytest.mark.usefixtures("slides")
+def test_media_claims_conversion_steps() -> None:
+    """Mirrors docs/guide/media.md."""
     # documents and tables go through a conversion step
     Path("house.md").write_text("# House rules\nOne idea per slide.", encoding="utf-8")
     writer = Agent("writer", prompt="Follow these rules: {house_rules}", inputs=["house_rules"], output="draft")
@@ -1156,6 +1176,10 @@ def test_media_claims_without_a_block(slides: Path) -> None:
     with pytest.raises(ValueError, match="with a step of your own"):
         document_text(Ref.from_bytes(b"%PDF", "application/pdf"))
 
+
+@pytest.mark.usefixtures("slides")
+def test_media_claims_image_answers() -> None:
+    """Mirrors docs/guide/media.md."""
     # an image answer needs a model that produces images and no tools
     painter = Agent("painter", prompt="Draw {query}", output="picture", output_type="image")
     with pytest.raises(ValueError, match="produces only text"):
@@ -1168,6 +1192,10 @@ def test_media_claims_without_a_block(slides: Path) -> None:
             llm=PaintingLLM(),
         )
 
+
+@pytest.mark.usefixtures("slides")
+def test_media_claims_remote_and_mcp_tools() -> None:
+    """Mirrors docs/guide/media.md."""
     # a remote tool reads no media; an MCP tool may write a picture
     with pytest.raises(ValueError, match="remote tools read no media"):
         MAS(
@@ -1225,7 +1253,8 @@ def test_people_block_runs_as_written(capsys: pytest.CaptureFixture[str]) -> Non
     ]
     (record,) = done["editor"]
     assert (record.kind, record.cost_usd, record.inputs) == ("human", 0.0, {"draft": DRAFT})
-    assert json.loads(record.raw_response)["who"] == "tom" and record.wait_s is not None
+    assert json.loads(record.raw_response)["who"] == "tom"
+    assert record.wait_s is not None
 
 
 def test_people_claims_without_a_block() -> None:
@@ -1256,10 +1285,12 @@ def test_people_claims_without_a_block() -> None:
         )
 
     timed = gate(timeout_s=0, default={"approved": False}).run_state({"query": QUERY})
-    assert timed.status == "ok" and json.loads(timed["approve"][0].raw_response)["timed_out"] is True
+    assert timed.status == "ok"
+    assert json.loads(timed["approve"][0].raw_response)["timed_out"] is True
     assert gate(default={"approved": True}).run(QUERY).status == "ok"
     failed = gate().run(QUERY)
-    assert failed.status == "failed" and "human node 'approve' got no answer" in str(failed.error)
+    assert failed.status == "failed"
+    assert "human node 'approve' got no answer" in str(failed.error)
 
     # an asker that replays recorded answers lets a system with people run unattended
     asked = gate()
@@ -1334,7 +1365,8 @@ def test_version_1_save_block_runs_as_written(tmp_path: Path, monkeypatch: pytes
 
     assert team("Why is the sky blue?") == "Rayleigh scattering."
     text = (tmp_path / "team.yaml").read_text(encoding="utf-8")
-    assert "http" not in text and "key" not in text.lower()
+    assert "http" not in text
+    assert "key" not in text.lower()
 
 
 def test_version_2_save_block_runs_as_written(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
@@ -1362,7 +1394,8 @@ def test_version_2_save_block_runs_as_written(capsys: pytest.CaptureFixture[str]
         {**spec, "edges": yaml.safe_load(shown)}, llm=llm, tools=[count_words, publish, apologize]
     )
     assert from_yaml_edges.describe()["id"] == mas.describe()["id"]
-    assert "http" not in yaml.safe_dump(spec) and "api_key" not in yaml.safe_dump(spec)
+    assert "http" not in yaml.safe_dump(spec)
+    assert "api_key" not in yaml.safe_dump(spec)
     (tmp_path / "spec.yaml").write_text(yaml.safe_dump(spec), encoding="utf-8")
     from_file = MAS.from_yaml(tmp_path / "spec.yaml", llm=llm, tools=[count_words, publish, apologize])
     assert (from_file.version, from_file.describe()["id"]) == (2, mas.describe()["id"])
@@ -1424,11 +1457,13 @@ def test_the_bundle_block_runs_as_written(endpoint: MockLLM, capsys: pytest.Capt
 
     entry = ModelEntry.parse(yaml.safe_load(block("yaml", "models:\n  editor:"))["models"]["editor"], "editor")
     editor = build_llms(["editor"], {"editor": entry}, Config(base_url="http://localhost:8000/v1"))["editor"]
-    assert isinstance(editor, APILLM) and (editor.model_id, editor.call_timeout_s) == ("llama-3.1-70b", 120)
+    assert isinstance(editor, APILLM)
+    assert (editor.model_id, editor.call_timeout_s) == ("llama-3.1-70b", 120)
     assert editor.call_params() == {"max_tokens": 2000, "temperature": 0.2}
     assert "`" + "`, `".join(PARAMS).replace(", `reasoning_effort", " and\n`reasoning_effort") + "`" in BUNDLES
     zipped = mas.save("team-zip.mas", zipped=True)
-    assert zipped.is_file() and MAS.load(zipped).describe()["id"] == mas.describe()["id"]
+    assert zipped.is_file()
+    assert MAS.load(zipped).describe()["id"] == mas.describe()["id"]
     (Path("team.mas") / "callables.yaml").write_text("# hand notes\n" + files["callables.yaml"].decode(), "utf-8")
     team.agents["writer"].prompt = "Write a very short answer to: {query}\nThe judge's last verdict: {verdict}"
     team.save("team.mas")  # only the changed prompt file and the lock are rewritten; the comment stays
@@ -1456,7 +1491,8 @@ def test_the_verify_block_runs_as_written(endpoint: MockLLM, capsys: pytest.Capt
     parse_examples({"examples/hand.yaml": hand.read_bytes()}, None, problems=problems)
     assert problems == []
     report = team.verify(2, examples=hand)
-    assert report.ok and [(r.name, r.status) for r in report.examples] == [("judge", "pass"), ("short-answer", "pass")]
+    assert report.ok
+    assert [(r.name, r.status) for r in report.examples] == [("judge", "pass"), ("short-answer", "pass")]
     kinds = BUNDLES.split("A check is one of ", 1)[1].split(". Its `path`", 1)[0]
     assert {word.split(":")[0] for word in re.findall(r"`([^`]+)`", kinds)} - {"within"} == set(CHECK_KINDS)
     assert (BUDGET_USD, PER_EXAMPLE_USD) == (0.05, 0.02)
@@ -1491,7 +1527,9 @@ def test_the_command_line_block_runs_as_written(
         if command[1] == "init":
             shutil.copytree("team.mas", "copy.mas")
     out = capsys.readouterr().out
-    assert "ok: 1 node, 0 edges, 0 chains" in out and "Rayleigh scattering." in out and "same files" in out
+    assert "ok: 1 node, 0 edges, 0 chains" in out
+    assert "Rayleigh scattering." in out
+    assert "same files" in out
     assert out.rstrip().endswith("ok: 1 example passed, 0.0100 USD")
 
 
