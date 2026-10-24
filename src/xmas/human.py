@@ -32,9 +32,6 @@ from xmas.values import TEXT, ValueType, check_value, parse_type, render_value
 if TYPE_CHECKING:  # pragma: no cover
     from xmas.trace import Trace
 
-FORMS = ("ask", "judge", "approve", "edit")
-"""The forms of a human node."""
-
 ANSWER_FIELDS: dict[str, tuple[str, ...]] = {
     "ask": ("option",),
     "judge": ("pick",),
@@ -42,6 +39,9 @@ ANSWER_FIELDS: dict[str, tuple[str, ...]] = {
     "edit": ("changed",),
 }
 """The fields an answer of each form holds besides :data:`COMMON_FIELDS`."""
+
+FORMS = tuple(ANSWER_FIELDS)
+"""The forms of a human node."""
 
 EDITED = "value"
 """The key of an edit's edited value in what a host gives and in :func:`answer_value`'s
@@ -320,9 +320,8 @@ class Human:
             ValueError: If an ask node's options read from state are not a
                 list of text or of ``{label: ...}`` maps.
         """
-        reads = self.reads
-        mine = {placeholder: values.get(value) for placeholder, value in reads.items()}
-        typed = {placeholder: types.get(value, TEXT) for placeholder, value in reads.items()}
+        mine = {placeholder: values.get(value) for placeholder, value in self.reads.items()}
+        typed = {placeholder: types.get(value, TEXT) for placeholder, value in self.reads.items()}
         name = node or self.name
         deadline = None if self.timeout_s is None else (now + timedelta(seconds=self.timeout_s)).isoformat()
         return Question(
@@ -331,7 +330,7 @@ class Human:
             node=name,
             form=self.form,
             text=fill(self.question, mine, typed),
-            shown={placeholder: render_value(mine[placeholder], typed[placeholder]) for placeholder in reads},
+            shown={placeholder: render_value(mine[placeholder], typed[placeholder]) for placeholder in mine},
             options=self._options(mine, typed),
             item=item,
             item_key=item_key,
@@ -366,20 +365,17 @@ class Human:
 
     def state_writes(self, answer: Mapping[str, Any], original: Any = None) -> dict[str, Any]:
         """Return what the node writes for an answer: the answer, and an edit's value (``original`` when unchanged)."""
-        writes = self.writes
-        out: dict[str, Any] = {writes["answer"]: {k: v for k, v in answer.items() if k != EDITED}}
-        if "value" in writes:
-            out[writes["value"]] = answer.get(EDITED, original)
+        out: dict[str, Any] = {self.answer: {k: v for k, v in answer.items() if k != EDITED}}
+        if "value" in self.writes:
+            out[self.writes["value"]] = answer.get(EDITED, original)
         return out
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form, the set keys only, in the order a spec writes them."""
-        reads = self.reads
-        writes = self.writes
         data: dict[str, Any] = {"name": self.name, "form": self.form}
-        if reads:
-            data["reads"] = dict(reads) if self.renamed else list(reads)
-        data["writes"] = writes["answer"] if list(writes) == ["answer"] else dict(writes)
+        if self.reads:
+            data["reads"] = dict(self.reads) if self.renamed else list(self.reads)
+        data["writes"] = self.answer if list(self.writes) == ["answer"] else dict(self.writes)
         given = {
             "question": self.question or None,
             "options": list(self.options) if isinstance(self.options, tuple) else self.options,
@@ -517,10 +513,9 @@ class ReplayAsker:
 
 def _field_problems(form: str, given: Mapping[str, Any], choices: Sequence[str] | None) -> Iterator[str]:
     """Say which of a form's fields that are present have the wrong type or an unknown choice."""
-    if "approved" in given and not isinstance(given["approved"], bool):
-        yield f"approved is true or false, got {given['approved']!r}"
-    if "changed" in given and not isinstance(given["changed"], bool):
-        yield f"changed is true or false, got {given['changed']!r}"
+    for name in ("approved", "changed"):
+        if name in given and not isinstance(given[name], bool):
+            yield f"{name} is true or false, got {given[name]!r}"
     for name in ("option", "pick"):
         if name in given and choices is not None and form != "approve" and given[name] not in choices:
             yield f"{name} {given[name]!r} is not one of {list(choices)}"
