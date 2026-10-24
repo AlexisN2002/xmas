@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 import warnings
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -96,15 +96,7 @@ class ExampleResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form."""
-        return {
-            "name": self.name,
-            "node": self.node,
-            "status": self.status,
-            "failures": list(self.failures),
-            "cost_usd": self.cost_usd,
-            "latency_s": self.latency_s,
-            "notes": list(self.notes),
-        }
+        return _lists(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -157,7 +149,7 @@ class VerifyReport:
             width = max((len(result.name) for result in self.examples), default=0)
             status = max((len(result.status) for result in self.examples), default=0)
             for result in self.examples:
-                cost = "cost unknown" if result.cost_usd is None else f"{result.cost_usd:.4f} USD"
+                cost = _usd(result.cost_usd)
                 took = "<0.1 s" if result.latency_s < 0.1 else f"{result.latency_s:.1f} s"
                 lines.append(f"level 2: {result.name:<{width}}  {result.status:<{status}}  {cost}  {took}")
                 lines += [f"  - {failure}" for failure in result.failures]
@@ -171,14 +163,8 @@ class VerifyReport:
             return ["level 0: not saved: no lock"]
         if self.lock.clean and not self.unsaved:
             return [f"level 0: unchanged since saved (bundle {self.digest}, {self.files} files)"]
-        found = [
-            ("changed", self.lock.changed),
-            ("added", self.lock.added),
-            ("missing", self.lock.missing),
-            ("code changed", self.lock.code_changed),
-            ("in memory, not saved", self.unsaved),
-        ]
-        return [f"level 0: {label}: {', '.join(paths)}" for label, paths in found if paths]
+        found = [*asdict(self.lock).items(), ("in memory, not saved", self.unsaved)]
+        return [f"level 0: {label.replace('_', ' ')}: {', '.join(paths)}" for label, paths in found if paths]
 
     def _names(self) -> str:
         catalogue = self.catalogue
@@ -190,7 +176,7 @@ class VerifyReport:
 
     def _verdict(self) -> str:
         counts = {status: sum(r.status == status for r in self.examples) for status in STATUSES}
-        cost = "cost unknown" if self.cost_usd is None else f"{self.cost_usd:.4f} USD"
+        cost = _usd(self.cost_usd)
         tally = ", ".join(f"{n} {status}" for status, n in counts.items() if n and status != "pass")
         examples = f"{counts['pass']} example{'s' * (counts['pass'] != 1)} passed" + (f", {tally}" if tally else "")
         if self.ok:
@@ -204,20 +190,12 @@ class VerifyReport:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the plain-data form, ``ok`` included."""
-        lock = self.lock
         catalogue = self.catalogue
         return {
             "ok": self.ok,
             "level": self.level,
             "bundle": None if self.bundle is None else str(self.bundle),
-            "lock": None
-            if lock is None
-            else {
-                "changed": list(lock.changed),
-                "added": list(lock.added),
-                "missing": list(lock.missing),
-                "code_changed": list(lock.code_changed),
-            },
+            "lock": None if self.lock is None else _lists(asdict(self.lock)),
             "digest": self.digest,
             "files": self.files,
             "unsaved": list(self.unsaved),
@@ -239,6 +217,14 @@ class VerifyReport:
     def __str__(self) -> str:
         """Return :meth:`lines` as one text."""
         return "\n".join(self.lines())
+
+
+def _usd(cost: float | None) -> str:
+    return "cost unknown" if cost is None else f"{cost:.4f} USD"
+
+
+def _lists(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: list(value) if isinstance(value, tuple) else value for key, value in data.items()}
 
 
 def verify(
