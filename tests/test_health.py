@@ -1,4 +1,4 @@
-"""Health signals on hand-built records."""
+"""Health signals on hand-built records, and the value checks they lean on."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from xmas.budget import Budget, RunMeter
 from xmas.errors import ErrorKind
 from xmas.health import Flag, Health, HealthSettings, summarize
 from xmas.trace import AgentRecord, Rejected
+from xmas.values import JSON, TEXT, check_value, fits, parse_type, render_value
 
 
 def rec(
@@ -125,3 +126,21 @@ def test_a_healthy_run_reports_nothing() -> None:
     healthy = summarize([rec("w", 0, "a draft", prompt="Write {query}", inputs={"query": "cats"}), rec("j", 1, "ok")])
     assert healthy == Health()
     assert healthy.to_dict() == {}
+
+
+def test_list_values_check_and_fit() -> None:
+    texts, nested = parse_type("list of text"), parse_type("list of list of json")
+    assert check_value(["a", None, "c"], texts) is None  # a gathered list holds null where an item failed
+    assert check_value(["a", "b", 3], texts) == "expected text at 2, got int"
+    assert check_value("a", texts) == "expected list of text, got str"
+    assert check_value([None, [None, {"n": 1}]], nested) is None
+    assert check_value([[1], "x"], nested) == "expected list of json at 1, got str"
+    assert check_value([[1], [{"n": {2}}]], nested) == "not JSON at 1.0.n: set"
+    assert check_value(3, TEXT) == "expected text, got int"
+
+    assert fits(texts, JSON) and fits(nested, JSON) and fits(texts, texts)
+    assert not fits(JSON, texts) and not fits(TEXT, JSON) and not fits(texts, nested)
+
+    assert render_value(["a", None], texts) == '["a", null]'
+    assert render_value([["é"]], nested) == '[["é"]]'
+    assert render_value(["a"], texts, present=False) == ""

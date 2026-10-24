@@ -5,10 +5,10 @@ data (``dict`` with ``str`` keys, ``list``, ``str``, ``int``, ``float``,
 ``bool``, ``None``). The type lives in the system, never on the value, so a
 version 1 state of strings stays a valid version 2 state of text.
 
-:func:`parse_type` reads every type word of the format, but only text and json
-run: :func:`xmas.check.check_system` refuses the others before a value of
-theirs is rendered or checked. This is a leaf module: it imports no
-other xmas module.
+:func:`parse_type` reads every type word of the format, but only text, json
+and lists of them, nested too, run: :func:`xmas.check.check_system` refuses
+the others before a value of theirs is rendered or checked. This is a leaf
+module: it imports no other xmas module.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ def type_of_hint(hint: Any) -> ValueType:
 def render_value(value: Any, vtype: ValueType, *, present: bool = True) -> str:
     """Render a value as the text a prompt, a record or a trace output shows.
 
-    Text renders as itself; json renders as one line of
+    Text renders as itself; json and lists render as one line of
     ``json.dumps(value, ensure_ascii=False)`` with the keys in the order the
     value has them, so ``0``, ``false``, ``[]`` and a json ``null`` show as
     JSON. A missing value renders as ``""``: the caller says so with
@@ -103,10 +103,34 @@ def render_value(value: Any, vtype: ValueType, *, present: bool = True) -> str:
 
 
 def check_value(value: Any, vtype: ValueType) -> str | None:
-    """Return ``None`` when a value fits its type, else one line such as ``"not JSON at counts.words: set"``."""
+    """Return ``None`` when a value fits its type, else one line such as ``"not JSON at counts.words: set"``.
+
+    A list checks every item and allows ``null`` items, which a gathered list
+    holds where an item failed; a bad item is named by its index, such as
+    ``"expected text at 2, got int"``.
+    """
+    return _problem(value, vtype, "")
+
+
+def fits(value: ValueType, wanted: ValueType) -> bool:
+    """Whether a value of type ``value`` may be read where ``wanted`` is declared: the same type, or a list as json."""
+    return value == wanted or (wanted == JSON and value.item is not None)
+
+
+def _problem(value: Any, vtype: ValueType, path: str) -> str | None:
+    """Return where ``value`` stops fitting ``vtype``, or ``None``."""
+    where = f" at {path}" if path else ""
+    if vtype.item is not None:
+        if not isinstance(value, list):
+            return f"expected {vtype}{where}, got {type(value).__name__}"
+        for index, item in enumerate(value):
+            problem = None if item is None else _problem(item, vtype.item, _join(path, index))
+            if problem is not None:
+                return problem
+        return None
     if vtype == TEXT:
-        return None if isinstance(value, str) else f"expected text, got {type(value).__name__}"
-    return _json_problem(value, "")
+        return None if isinstance(value, str) else f"expected text{where}, got {type(value).__name__}"
+    return _json_problem(value, path)
 
 
 def _json_problem(value: Any, path: str) -> str | None:
@@ -118,7 +142,7 @@ def _json_problem(value: Any, path: str) -> str | None:
         return None if math.isfinite(value) else f"not JSON{where}: {value!r}"
     if isinstance(value, list):
         for index, item in enumerate(value):
-            problem = _json_problem(item, f"{path}.{index}" if path else str(index))
+            problem = _json_problem(item, _join(path, index))
             if problem is not None:
                 return problem
         return None
@@ -126,8 +150,13 @@ def _json_problem(value: Any, path: str) -> str | None:
         for key, item in value.items():
             if not isinstance(key, str):
                 return f"not JSON{where}: key {key!r} is not a string"
-            problem = _json_problem(item, f"{path}.{key}" if path else key)
+            problem = _json_problem(item, _join(path, key))
             if problem is not None:
                 return problem
         return None
     return f"not JSON{where}: {type(value).__name__}"
+
+
+def _join(path: str, step: int | str) -> str:
+    """Return ``path`` one item or key deeper, such as ``counts.words``."""
+    return f"{path}.{step}" if path else str(step)
