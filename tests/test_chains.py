@@ -96,8 +96,7 @@ def test_the_deck_runs_per_item_and_gathers_in_order() -> None:
     assert trace.cost_usd == pytest.approx(0.01 * (5 * 4 + 2 * 2 + 1))
     health = trace.health
     assert health is not None
-    if hasattr(health, "items"):  # P1: Health.items
-        assert health.items["drafter"]["items"] == 5 and health.items["drafter"]["failed"] == 0
+    assert health.items["drafter"]["items"] == 5 and health.items["drafter"]["failed"] == 0
 
 
 def pages(
@@ -177,8 +176,7 @@ def test_a_failed_item_keeps_the_others() -> None:
     assert [(r.agent, r.item) for r in trace.records][:8] == [(n, i) for i in range(4) for n in ("writer", "count")]
     health = trace.health
     assert health is not None
-    if hasattr(health, "items"):  # P1: Health.items, item_failed
-        assert health.items["writer"]["failed"] == 1
+    assert health.items["writer"]["failed"] == 1 and "item_failed" in {flag.signal for flag in health.flags}
 
     # money in one item ends the run: the siblings finished and were paid, and keep their records
     money = {"plan": {"slides": [{"id": n, "say": "money"} for n in "abd"]}}
