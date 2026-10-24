@@ -20,17 +20,16 @@ the host answers it.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol, cast
 
+from xmas.trace import Trace
 from xmas.values import TEXT, ValueType, check_value, parse_type, render_value
-
-if TYPE_CHECKING:  # pragma: no cover
-    from xmas.trace import Trace
 
 __all__ = [
     "ANSWER_FIELDS",
@@ -87,6 +86,9 @@ YES_NO = {True: "yes", False: "no"}
 
 ROLES = ("answer", "value")
 """The keys of ``writes``: the answer, and an edit's edited value."""
+
+PAIR_SIZE = 2
+"""A judge node picks between two reads."""
 
 PLACEHOLDER = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\}(?!\})")
 
@@ -190,7 +192,7 @@ class Human:
     timeout_s: float | None
     default: dict[str, Any] | None
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  the public signature: one keyword per setting, as a spec writes them
         self,
         name: str,
         form: str,
@@ -207,46 +209,21 @@ class Human:
     ) -> None:
         """Refuse a setting of the wrong shape and keep plain copies; the fields are described on the class."""
         where = f"Human {name!r}"
-        given: dict[str, Any] = {"name": name, "form": form, "reads": reads, "writes": writes, "question": question}
-        given.update(options=options, labels=labels, pair=pair, edits=edits, timeout_s=timeout_s, default=default)
-        if not is_text(given["name"]) or not is_text(given["form"]) or not isinstance(given["question"], str):
+        if not is_text(name) or not is_text(form) or not isinstance(question, str):
             raise ValueError(f"{where}: a human node needs a name, a form and a text question.")
-        if isinstance(reads, Mapping):
-            pairs = list(given["reads"].items())
-        else:
-            pairs = [(value, value) for value in texts(where, "reads", given["reads"])]
-        if not all(is_text(k) and is_text(v) for k, v in pairs):
-            raise ValueError(f"{where}: reads must name values, got {reads!r}.")
-        given["reads"] = dict(pairs)
-        named = {"answer": writes} if isinstance(writes, str) else given["writes"]
-        if isinstance(named, Mapping) and len(named) == 1 and not set(named) <= set(ROLES):
-            ((value, word),) = named.items()  # {name: type}, as an agent writes
-            named = {"answer": value} if word == "json" else named
-        if (
-            not isinstance(named, Mapping)
-            or "answer" not in named
-            or not set(named) <= set(ROLES)
-            or not all(is_text(v) for v in named.values())
-        ):
-            raise ValueError(
-                f"{where}: writes is a value name, {{name: json}} or {{answer: name, value: name}}, got {writes!r}."
-            )
-        given["writes"] = dict(named)
-        if options is not None and not isinstance(options, str):
-            given["options"] = texts(where, "options", given["options"])
-        if pair is not None:
-            given["pair"] = texts(where, "pair", given["pair"])
-        for label in ("labels", "default"):
-            if given[label] is not None and not isinstance(given[label], Mapping):
-                raise ValueError(f"{where}: {label} is a mapping, got {given[label]!r}.")
-            given[label] = None if given[label] is None else dict(given[label])
-        if given["labels"] is not None:  # YAML reads a bare yes and no as true and false
-            given["labels"] = {YES_NO.get(key, key): text for key, text in given["labels"].items()}
-        if edits is not None and not is_text(given["edits"]):
-            raise ValueError(f"{where}: edits names a read, got {edits!r}.")
-        timeout = given["timeout_s"]
-        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int | float)):
-            raise ValueError(f"{where}: timeout_s is a number of seconds, got {timeout!r}.")
+        given: dict[str, Any] = {
+            "name": name,
+            "form": form,
+            "reads": plain_reads(where, reads),
+            "writes": plain_writes(where, writes),
+            "question": question,
+            "options": options if options is None or isinstance(options, str) else texts(where, "options", options),
+            "pair": None if pair is None else texts(where, "pair", pair),
+            "labels": yes_no_labels(plain_mapping(where, "labels", labels)),
+            "default": plain_mapping(where, "default", default),
+            "edits": checked_edits(where, edits),
+            "timeout_s": checked_timeout(where, timeout_s),
+        }
         for key, value in given.items():
             object.__setattr__(self, key, value)
 
@@ -276,36 +253,52 @@ class Human:
         if self.form not in FORMS:
             yield f"{where}: form {self.form!r} is not one of {list(FORMS)}"
             return
-        reads = self.reads
-        for form, setting in TAKES.items():
-            if form != self.form and getattr(self, setting) is not None:
-                yield f"{where}: {setting} belongs to the {form} form, not to {self.form}"
-        if self.form == "ask" and not self.options:
-            yield f"{where}: an ask node needs options, a list of labels or the path of a read"
-        if isinstance(self.options, str) and self.options.split(".")[0] not in reads:
-            yield f"{where}: options {self.options!r} is not the path of a read ({list(reads)})"
-        if self.form == "judge" and self.pair is not None:
-            if len(self.pair) != 2 or len(set(self.pair)) != 2 or not set(self.pair) <= set(reads):
-                yield f"{where}: pair names two different reads of {list(reads)}, got {list(self.pair)}"
-        elif self.form == "judge":
-            yield f"{where}: a judge node needs a pair, the names of two reads"
-        if self.form == "edit" and self.edits not in reads:
-            yield f"{where}: edits names one of its reads {list(reads)}, got {self.edits!r}"
-        wanted = ROLES if self.form == "edit" else ROLES[:1]
-        if tuple(sorted(self.writes)) != wanted:
-            yield f"{where}: the {self.form} form writes {list(wanted)}, got {sorted(self.writes)}"
-        yield from (
-            f"{where}: labels sets {key!r}; an approve node labels 'yes' and 'no'"
-            for key in sorted(set(self.labels or {}) - set(DEFAULT_LABELS))
-        )
-        for text in self.templates():
-            for path in template_paths(text):
-                if path[0] not in reads:
-                    yield f"{where}: placeholder {'.'.join(path)!r} is not among its reads {list(reads)}"
+        found = itertools.chain(self.setting_problems(), self.write_problems(), self.template_problems())
+        yield from (f"{where}: {problem}" for problem in found)
         if self.timeout_s is not None and self.timeout_s < 0:
             yield f"{where}: timeout_s is {self.timeout_s!r}; give 0 or more seconds"
         if self.default is not None:
             yield from (f"{where}: default {problem}" for problem in self.default_problems())
+
+    def setting_problems(self) -> Iterator[str]:
+        """Say which form setting is set on the wrong form, missing, or names no read."""
+        reads = self.reads
+        for form, setting in TAKES.items():
+            if form != self.form and getattr(self, setting) is not None:
+                yield f"{setting} belongs to the {form} form, not to {self.form}"
+        if self.form == "ask" and not self.options:
+            yield "an ask node needs options, a list of labels or the path of a read"
+        if isinstance(self.options, str) and self.options.split(".", maxsplit=1)[0] not in reads:
+            yield f"options {self.options!r} is not the path of a read ({list(reads)})"
+        if self.form == "judge":
+            yield from self.pair_problems()
+        if self.form == "edit" and self.edits not in reads:
+            yield f"edits names one of its reads {list(reads)}, got {self.edits!r}"
+
+    def pair_problems(self) -> Iterator[str]:
+        """Say what is wrong with a judge node's pair: it names two different reads."""
+        reads = self.reads
+        if self.pair is None:
+            yield "a judge node needs a pair, the names of two reads"
+        elif len(self.pair) != PAIR_SIZE or len(set(self.pair)) != PAIR_SIZE or not set(self.pair) <= set(reads):
+            yield f"pair names two different reads of {list(reads)}, got {list(self.pair)}"
+
+    def write_problems(self) -> Iterator[str]:
+        """Say what is wrong with the writes for the form, and with an approve node's label keys."""
+        wanted = ROLES if self.form == "edit" else ROLES[:1]
+        if tuple(sorted(self.writes)) != wanted:
+            yield f"the {self.form} form writes {list(wanted)}, got {sorted(self.writes)}"
+        yield from (
+            f"labels sets {key!r}; an approve node labels 'yes' and 'no'"
+            for key in sorted(set(self.labels or {}) - set(DEFAULT_LABELS))
+        )
+
+    def template_problems(self) -> Iterator[str]:
+        """Say which placeholder of the question, labels or options is not among the reads."""
+        for text in self.templates():
+            for path in template_paths(text):
+                if path[0] not in self.reads:
+                    yield f"placeholder {'.'.join(path)!r} is not among its reads {list(self.reads)}"
 
     def default_problems(self) -> Iterator[str]:
         """Say what is wrong with the default answer's fields."""
@@ -318,7 +311,7 @@ class Human:
         choices = (*self.pair, TIE) if self.form == "judge" and self.pair else None
         yield from field_problems(self.form, {k: v for k, v in default.items() if k in allowed}, options or choices)
 
-    def ask(
+    def ask(  # noqa: PLR0913  the public signature: the run, visit and item a question is asked in, by keyword
         self,
         values: Mapping[str, Any],
         types: Mapping[str, ValueType],
@@ -412,6 +405,63 @@ class Human:
         """Read a spec entry; ``for each`` is the MAS's, so it is skipped here."""
         settings = {key: value for key, value in data.items() if key not in ("name", "form", "reads", "for each")}
         return cls(data["name"], data["form"], data.get("reads", ()), **settings)
+
+
+def plain_reads(where: str, reads: Any) -> dict[str, str]:
+    """Return a human node's reads as ``{placeholder: value}``; a list reads each value under its own name."""
+    if isinstance(reads, Mapping):
+        pairs = list(reads.items())
+    else:
+        pairs = [(value, value) for value in texts(where, "reads", reads)]
+    if not all(is_text(k) and is_text(v) for k, v in pairs):
+        raise ValueError(f"{where}: reads must name values, got {reads!r}.")
+    return dict(pairs)
+
+
+def plain_writes(where: str, writes: Any) -> dict[str, str]:
+    """Return a human node's writes as ``{role: value}``; a bare name or ``{name: json}`` is the answer."""
+    named = {"answer": writes} if isinstance(writes, str) else writes
+    if isinstance(named, Mapping) and len(named) == 1 and not set(named) <= set(ROLES):
+        ((value, word),) = named.items()  # {name: type}, as an agent writes
+        named = {"answer": value} if word == "json" else named
+    if (
+        not isinstance(named, Mapping)
+        or "answer" not in named
+        or not set(named) <= set(ROLES)
+        or not all(is_text(v) for v in named.values())
+    ):
+        raise ValueError(
+            f"{where}: writes is a value name, {{name: json}} or {{answer: name, value: name}}, got {writes!r}."
+        )
+    return dict(named)
+
+
+def plain_mapping(where: str, label: str, value: Any) -> dict[Any, Any] | None:
+    """Return a plain copy of a mapping setting, ``None`` when unset; anything else is refused."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where}: {label} is a mapping, got {value!r}.")
+    return dict(value)
+
+
+def yes_no_labels(labels: dict[Any, Any] | None) -> dict[Any, Any] | None:
+    """Return an approve node's labels keyed ``yes`` and ``no``: YAML reads a bare yes and no as true and false."""
+    return None if labels is None else {YES_NO.get(key, key): text for key, text in labels.items()}
+
+
+def checked_edits(where: str, edits: Any) -> str | None:
+    """Return an edit node's ``edits`` once it names a read, or ``None``."""
+    if edits is not None and not is_text(edits):
+        raise ValueError(f"{where}: edits names a read, got {edits!r}.")
+    return cast("str | None", edits)
+
+
+def checked_timeout(where: str, timeout: Any) -> float | None:
+    """Return ``timeout_s`` once it is a number of seconds, or ``None``."""
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int | float)):
+        raise ValueError(f"{where}: timeout_s is a number of seconds, got {timeout!r}.")
+    return cast("float | None", timeout)
 
 
 @dataclass(frozen=True)
@@ -510,8 +560,6 @@ class ReplayAsker:
 
     def __init__(self, traces: Trace | Iterable[Trace]) -> None:
         """Index the human records of ``traces``, boxes' inner records included."""
-        from xmas.trace import Trace
-
         self.answers: dict[tuple[str, str | int | None, int | None], dict[str, Any]] = {}
         for trace in [traces] if isinstance(traces, Trace) else traces:
             for _, record in trace.walk():
@@ -575,35 +623,12 @@ def answer_value(
     if answered is not None:
         problems += time_problems(answered, question.asked_at)
     answer = {name: given.get(name) for name in fields}
-    approved = given.get("approved")
-    if question.form == "approve" and approved is None and given.get("option") in question.options:
-        approved = given["option"] == question.options[0]  # the label alone says the choice
-        answer["approved"] = approved
-    if question.form == "approve" and isinstance(approved, bool):
-        label = question.options[0 if approved else 1]
-        if given.get("option", label) != label:
-            problems.append(f"option {given['option']!r} is not the label of the choice, {label!r}")
-        answer["option"] = label
-    elif question.form == "approve" and not timed_out and approved is None:
-        problems.append("approved is missing")
+    if question.form == "approve":
+        problems += fill_approval(question, given, answer, timed_out=timed_out)
     elif question.form in ("ask", "judge") and not timed_out and given.get(fields[0]) is None:
         problems.append(f"{fields[0]} is missing")
     if question.form == "edit":
-        if EDITED in given:
-            answer[EDITED] = given[EDITED]
-            wrong = None if question.value_type is None else check_value(given[EDITED], parse_type(question.value_type))
-            if wrong is not None:
-                problems.append(f"the edited value is not {question.value_type}: {wrong}")
-            if "changed" not in given and question.edits is not None:
-                before = question.shown.get(question.edits)
-                answer["changed"] = before not in (
-                    leaf(given[EDITED]),
-                    json.dumps(given[EDITED], ensure_ascii=False),
-                )
-        elif given.get("changed"):
-            problems.append("changed is true, but the edited value is missing")
-        else:
-            answer["changed"] = False
+        problems += fill_edit(question, given, answer)
     if problems:
         raise ValueError(f"The answer to {question.id!r} does not fit: " + "; ".join(problems) + ".")
     return {
@@ -614,6 +639,40 @@ def answer_value(
         "comment": comment,
         "timed_out": timed_out,
     }
+
+
+def fill_approval(
+    question: Question, given: Mapping[str, Any], answer: dict[str, Any], *, timed_out: bool
+) -> list[str]:
+    """Fill an approve answer's choice and its label into ``answer``; return what does not fit."""
+    approved = given.get("approved")
+    if approved is None and given.get("option") in question.options:
+        approved = given["option"] == question.options[0]  # the label alone says the choice
+        answer["approved"] = approved
+    if isinstance(approved, bool):
+        label = question.options[0 if approved else 1]
+        answer["option"] = label
+        if given.get("option", label) != label:
+            return [f"option {given['option']!r} is not the label of the choice, {label!r}"]
+    elif not timed_out and approved is None:
+        return ["approved is missing"]
+    return []
+
+
+def fill_edit(question: Question, given: Mapping[str, Any], answer: dict[str, Any]) -> list[str]:
+    """Fill an edit answer's edited value and whether it changed into ``answer``; return what does not fit."""
+    if EDITED not in given:
+        if given.get("changed"):
+            return ["changed is true, but the edited value is missing"]
+        answer["changed"] = False
+        return []
+    edited = given[EDITED]
+    answer[EDITED] = edited
+    if "changed" not in given and question.edits is not None:
+        before = question.shown.get(question.edits)
+        answer["changed"] = before not in (leaf(edited), json.dumps(edited, ensure_ascii=False))
+    wrong = None if question.value_type is None else check_value(edited, parse_type(question.value_type))
+    return [] if wrong is None else [f"the edited value is not {question.value_type}: {wrong}"]
 
 
 def time_problems(answered: Any, asked_at: str) -> list[str]:

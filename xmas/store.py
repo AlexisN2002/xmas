@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import os
 import random
 import re
 import sqlite3
@@ -35,13 +34,11 @@ import threading
 import uuid
 import warnings
 import weakref
-from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
     BaseCheckpointSaver,
@@ -53,7 +50,6 @@ from langgraph.checkpoint.base import (
     get_checkpoint_metadata,
     writes_sort_key,
 )
-from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from xmas.errors import ErrorKind, classify
@@ -63,6 +59,12 @@ from xmas.media import Ref
 from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 
 if TYPE_CHECKING:
+    import os
+    from collections.abc import Iterator, Mapping, Sequence
+
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.serde.base import SerializerProtocol
+
     from xmas.llms.meta import CallMeta
 
 __all__ = [
@@ -345,7 +347,7 @@ class Store(BaseCheckpointSaver[str]):
         return CheckpointTuple(
             config(checkpoint_id),
             self.serde.loads_typed((type_, checkpoint)),
-            cast(CheckpointMetadata, json.loads(metadata) if metadata is not None else {}),
+            cast("CheckpointMetadata", json.loads(metadata) if metadata is not None else {}),
             config(parent_id) if parent_id else None,
             [(task, channel, self.serde.loads_typed((t, value))) for task, channel, t, value, _, _ in writes],
         )
@@ -358,7 +360,7 @@ class Store(BaseCheckpointSaver[str]):
         self,
         config: RunnableConfig | None,
         *,
-        filter: dict[str, Any] | None = None,
+        filter: dict[str, Any] | None = None,  # noqa: A002  the keyword LangGraph's BaseCheckpointSaver.list names
         before: RunnableConfig | None = None,
         limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
@@ -472,7 +474,7 @@ class Store(BaseCheckpointSaver[str]):
             " paused = excluded.paused, totals = COALESCE(excluded.totals, totals)",
             (run_id, system_id, status, now, now, json.dumps(list(paused)), dump_json(totals)),
         )
-        return cast(RunRow, self.run(run_id))
+        return cast("RunRow", self.run(run_id))
 
     def begin(self, run_id: str, system_id: str, query: str) -> RunRow:
         """Save a starting run's row, ``running``; a ``run_id`` saved already is refused with ``ValueError``."""
@@ -485,7 +487,7 @@ class Store(BaseCheckpointSaver[str]):
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"Run id {run_id!r} is taken in {self!r}.") from None
-        return cast(RunRow, self.run(run_id))
+        return cast("RunRow", self.run(run_id))
 
     def run(self, run_id: str) -> RunRow | None:
         """Return a run's row, or ``None`` for an unknown id."""
@@ -585,7 +587,7 @@ class Store(BaseCheckpointSaver[str]):
         """Return the msgpack of a record, or of a trace's ending: dataclasses and plain values."""
         return self.serde.dumps_typed(value)[1]
 
-    def save_question(
+    def save_question(  # noqa: PLR0913, PLR0917  the public signature: callers pass the question's columns positionally
         self,
         question_id: str,
         run_id: str,
@@ -615,7 +617,7 @@ class Store(BaseCheckpointSaver[str]):
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"question {question_id!r} is already saved") from None
-        return cast(QuestionRow, self.question(question_id))
+        return cast("QuestionRow", self.question(question_id))
 
     def answer(
         self, question_id: str, answer: Mapping[str, Any], who: str | None = None, answered_at: str | None = None
@@ -769,7 +771,7 @@ class RunLog:
             ),
         )
 
-    def call(
+    def call(  # noqa: PLR0913, PLR0917  the public signature: the budget passes one call's facts positionally
         self,
         node: str | None,
         llm: object,
@@ -844,7 +846,7 @@ class RunLog:
                 position = take(earlier.get(visit(record), []), record)
             if position is None:  # pragma: no cover - every record of a trace was kept
                 self.record(record)
-                position = cast(int, take(self.kept[visit(record)], record))
+                position = cast("int", take(self.kept[visit(record)], record))
             steps.append(position)
         return steps
 
@@ -907,7 +909,7 @@ def open_store(location: str | os.PathLike[str] | None = None) -> Store:
     configuration file. ``:memory:`` opens a store in memory, which logs no
     run. A file already open in this process is shared, not opened twice.
     """
-    from xmas.config import Config, runs_path  # here, not at the top: xmas.config imports the models
+    from xmas.config import Config, runs_path  # noqa: PLC0415  here, not at the top: xmas.config imports the models
 
     if location is None:
         location = Config.load().run_store or runs_path()
