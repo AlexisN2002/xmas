@@ -11,6 +11,7 @@ from typing import Annotated, Any
 import httpx2
 import openai
 import pytest
+from langgraph.errors import GraphBubbleUp, GraphInterrupt
 from pydantic import Field
 
 from xmas import END, MAS, START, Agent, Budget, ErrorKind, TokenUsage, ToolCall
@@ -545,6 +546,17 @@ def test_stopped_in_a_local_tool_stops_the_run() -> None:
     trace = MAS(agents=[coder(["slow"])], llm=llm, tools=[slow]).run("q")
     assert trace.error_kind == ErrorKind.STOPPED and trace.output == ""
     assert trace.error == "Stopped: stop pressed"
+
+
+def test_a_graph_signal_in_a_local_tool_is_not_wrapped() -> None:
+    @tool
+    def ask(text: str) -> str:
+        """Ask a person, pausing the graph."""
+        raise GraphInterrupt(())
+
+    with pytest.raises(GraphBubbleUp) as raised:
+        LocalTools([ask]).call("ask", {"text": "x"})
+    assert not isinstance(raised.value, XmasError)
 
 
 def test_api_llm_tool_turn_records_carry_provenance(monkeypatch: pytest.MonkeyPatch) -> None:

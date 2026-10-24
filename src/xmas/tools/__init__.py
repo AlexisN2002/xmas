@@ -28,6 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast, overload
 
+from langgraph.errors import GraphBubbleUp
 from pydantic import BaseModel, ValidationError
 
 from xmas.errors import BadFormat, BudgetExceeded, Stopped, XmasError
@@ -224,8 +225,8 @@ class LocalTools(ToolSource):
 
         Raises:
             XmasError: If the tool is unknown, the arguments are invalid, or the
-                function raised. ``BudgetExceeded`` and ``Stopped`` pass through
-                unwrapped, since they end the run.
+                function raised. ``BudgetExceeded``, ``Stopped`` and LangGraph's
+                own signals (``GraphBubbleUp``) pass through unwrapped.
         """
         spec = self.by_name.get(name)
         if spec is None:
@@ -233,7 +234,7 @@ class LocalTools(ToolSource):
         kwargs = spec.validate(arguments)
         try:
             result = spec(**kwargs)
-        except (BudgetExceeded, Stopped):
+        except (BudgetExceeded, Stopped, GraphBubbleUp):
             raise
         except Exception as exc:
             raise XmasError(f"{type(exc).__name__}: {exc}") from exc
