@@ -17,6 +17,12 @@ from html.parser import HTMLParser
 from xmas.media import Document, Table, base_type
 from xmas.tools import tool
 
+__all__ = [
+    "document_text",
+    "table_rows",
+]
+
+
 BLOCKS = frozenset({
     "address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "figcaption", "footer", "h1", "h2",
     "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "td", "th",

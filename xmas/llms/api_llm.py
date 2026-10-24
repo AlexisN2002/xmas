@@ -32,6 +32,13 @@ from xmas.tools import Tool, ToolCallRequest, turn_usage
 from xmas.trace import TokenUsage
 from xmas.utils import approximate_tokens, error_message, retry_after_seconds, timestamp
 
+__all__ = [
+    "APILLM",
+    "assemble",
+    "parse_score",
+]
+
+
 # promptolution's _ainvoke_with_retries returns only the text, so the provider's
 # completion id travels to CallRecord.response_id(s) in this per-request slot (each
 # prompt of a batch runs as its own task); a request outside that loop writes to the

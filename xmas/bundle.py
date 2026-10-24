@@ -43,6 +43,37 @@ from xmas.spec import V2_KEYS
 if TYPE_CHECKING:  # pragma: no cover
     from xmas.mas import MAS
 
+__all__ = [
+    "CALLABLES",
+    "LOCK",
+    "MAX_BYTES",
+    "OPTIMIZE",
+    "SUFFIX",
+    "WIRING",
+    "Lock",
+    "LockDiff",
+    "check_lock",
+    "code_hashes",
+    "compare",
+    "dump_prompt",
+    "dump_yaml",
+    "files_of",
+    "lock_of",
+    "outside",
+    "owned",
+    "parse_prompt",
+    "put",
+    "read",
+    "read_optimize",
+    "read_yaml",
+    "relock",
+    "same",
+    "spec_of",
+    "systems",
+    "write",
+]
+
+
 SUFFIX = ".mas"
 WIRING = "xmas.yaml"
 CALLABLES = "callables.yaml"

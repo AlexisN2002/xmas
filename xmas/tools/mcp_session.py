@@ -20,6 +20,12 @@ from mcp.types import Tool as McpTool
 from xmas.errors import XmasError
 from xmas.utils import retry_after_seconds
 
+__all__ = [
+    "McpSession",
+    "first_leaf",
+]
+
+
 logger = logging.getLogger(__name__)
 
 

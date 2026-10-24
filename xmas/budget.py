@@ -34,6 +34,18 @@ if TYPE_CHECKING:
     from xmas.llms.meta import CallMeta
     from xmas.store import RunLog
 
+__all__ = [
+    "RUNNING",
+    "SLICE_S",
+    "Budget",
+    "CancelFlag",
+    "RunMeter",
+    "VisitMeter",
+    "cancel_flag",
+    "contestant",
+]
+
+
 SLICE_S = 0.05
 """How often a wait for a slot, a place or a model's answer checks the cancel flag, in seconds."""
 

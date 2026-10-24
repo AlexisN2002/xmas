@@ -42,6 +42,18 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.mas import MAS
     from xmas.trace import Trace
 
+__all__ = [
+    "BUDGET_USD",
+    "PER_EXAMPLE_USD",
+    "STATUSES",
+    "ExampleResult",
+    "VerifyFailed",
+    "VerifyReport",
+    "VerifyWarning",
+    "verify",
+]
+
+
 BUDGET_USD = 0.05
 """What all examples together may cost when neither the caller nor an examples file sets a budget."""
 

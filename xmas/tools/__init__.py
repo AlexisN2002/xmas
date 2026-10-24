@@ -58,6 +58,20 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.llms.meta import CallMeta, SupportsMeta
     from xmas.llms.parts import Part
 
+__all__ = [
+    "LocalTools",
+    "Tool",
+    "ToolCallRequest",
+    "ToolIndex",
+    "ToolSource",
+    "execute_tool_call",
+    "index_tools",
+    "run_step",
+    "run_tool_loop",
+    "select_tools",
+    "tool",
+]
+
 
 def return_type(fn: Callable[..., Any] | None) -> ValueType:
     """Return the type a callable's single write has: text for a ``str`` return hint or a remote tool, else json."""

@@ -12,6 +12,11 @@ from xmas.optimization.attribution import Attributor
 from xmas.tasks.base import MASTask
 from xmas.trace import Trace
 
+__all__ = [
+    "MASOptimizer",
+    "traces_by_position",
+]
+
 
 class MASOptimizer(ABC):
     """Improves a MAS against a task by proposing, evaluating and selecting.

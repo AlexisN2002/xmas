@@ -24,6 +24,17 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.health import Health
     from xmas.human import Pause
 
+__all__ = [
+    "EVENT_KINDS",
+    "EVENT_STATUSES",
+    "AgentRecord",
+    "Event",
+    "Rejected",
+    "TokenUsage",
+    "ToolCall",
+    "Trace",
+]
+
 
 @dataclass(frozen=True)
 class TokenUsage:

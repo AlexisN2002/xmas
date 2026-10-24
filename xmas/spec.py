@@ -23,6 +23,13 @@ from __future__ import annotations
 
 from typing import Any
 
+__all__ = [
+    "V2_KEYS",
+    "validate_spec",
+    "validate_spec_v2",
+]
+
+
 V2_KEYS: dict[str, Any] = {
     "version": int,
     "inputs": dict,

@@ -36,6 +36,31 @@ if TYPE_CHECKING:  # pragma: no cover
     from pydantic import GetCoreSchemaHandler, GetJsonSchemaHandler
     from pydantic.json_schema import JsonSchemaValue
 
+__all__ = [
+    "ACCEPTABLE",
+    "DOCUMENT_TYPES",
+    "MAX_PART_BYTES",
+    "MEDIA_KINDS",
+    "PRODUCIBLE",
+    "TABLE_TYPES",
+    "TEXT_ONLY",
+    "Audio",
+    "Capabilities",
+    "Document",
+    "File",
+    "FileStore",
+    "Image",
+    "Kind",
+    "Ref",
+    "Store",
+    "Table",
+    "base_type",
+    "fits_kind",
+    "kind_of",
+    "store",
+]
+
+
 MEDIA_KINDS = ("image", "audio", "document", "table", "file")
 """The value kinds a :class:`Ref` holds; ``file`` takes any ref."""
 

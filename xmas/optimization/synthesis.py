@@ -15,6 +15,16 @@ from dataclasses import dataclass
 
 from promptolution.llms.base_llm import BaseLLM
 
+__all__ = [
+    "LLMPromptSynthesizer",
+    "MechanicalSynthesizer",
+    "Rewrite",
+    "mechanical_prompt",
+    "missing_inputs",
+    "prompt_from_response",
+    "rewrite_instruction",
+]
+
 
 @dataclass(frozen=True)
 class Rewrite:

@@ -65,6 +65,16 @@ from xmas.trace import AgentRecord, Event, Rejected, TokenUsage, ToolCall, Trace
 if TYPE_CHECKING:
     from xmas.llms.meta import CallMeta
 
+__all__ = [
+    "XMAS_TYPES",
+    "QuestionRow",
+    "RunLog",
+    "RunRow",
+    "Store",
+    "open_store",
+]
+
+
 XMAS_TYPES: tuple[type, ...] = (AgentRecord, TokenUsage, ToolCall, Rejected, Trace, Event, ErrorKind, Health, Flag, Ref)
 """The xmas classes a checkpoint may hold besides LangGraph's own safe types."""
 

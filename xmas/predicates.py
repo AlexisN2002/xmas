@@ -34,6 +34,18 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+__all__ = [
+    "BUILTINS",
+    "KEYWORDS",
+    "MAX_DEPTH",
+    "MAX_LENGTH",
+    "Context",
+    "Predicate",
+    "PredicateError",
+    "parse_predicate",
+]
+
+
 MAX_LENGTH = 500
 """The longest predicate text, in characters."""
 

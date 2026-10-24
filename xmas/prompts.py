@@ -15,6 +15,14 @@ from __future__ import annotations
 
 import re
 
+__all__ = [
+    "decode_prompts",
+    "encode_prompts",
+    "extract_placeholders",
+    "safe_format",
+]
+
+
 # A placeholder is a bare identifier in single braces. The lookarounds leave
 # doubled braces alone, so `{{literal}}` survives untouched, and the identifier
 # class means a JSON body like {"k": 1} is never mistaken for a placeholder.

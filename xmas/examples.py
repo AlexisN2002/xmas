@@ -48,6 +48,23 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.mas import MAS
     from xmas.trace import AgentRecord, Trace
 
+__all__ = [
+    "CHECK_KINDS",
+    "FOLDER",
+    "MEDIA",
+    "UNSET",
+    "VERSION",
+    "Check",
+    "Example",
+    "ExampleFile",
+    "cases_from_trace",
+    "parse_examples",
+    "run_checks",
+    "save_examples",
+    "written",
+]
+
+
 VERSION = 1
 FOLDER = "examples"
 MEDIA = "examples/media"

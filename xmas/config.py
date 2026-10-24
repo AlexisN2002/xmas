@@ -65,6 +65,30 @@ from xmas.llms.meta import TokenPrice
 from xmas.media import TEXT_ONLY, Capabilities
 from xmas.tools import ToolSource
 
+__all__ = [
+    "CATALOGUE_TTL_S",
+    "CONFIG_ENV",
+    "FETCH_TIMEOUT_S",
+    "MODELS_ENV",
+    "PARAMS",
+    "Catalogue",
+    "Config",
+    "ModelEntry",
+    "ModelNameWarning",
+    "Resolution",
+    "ToolServer",
+    "Unconfigured",
+    "build_llms",
+    "closest",
+    "config_path",
+    "misses",
+    "read_catalogue",
+    "resolve_names",
+    "runs_path",
+    "tool_sources",
+]
+
+
 CONFIG_ENV = "XMAS_CONFIG"
 MODELS_ENV = "XMAS_MODELS"
 CATALOGUE_TTL_S = 300.0

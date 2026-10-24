@@ -7,6 +7,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+__all__ = [
+    "assistant_span",
+    "mask_logprobs",
+]
+
 
 def assistant_span(tokens: Sequence[str], continuation: str) -> tuple[int, int]:
     """Return the half-open ``(start, end)`` range of ``continuation`` in the echoed ``tokens``.

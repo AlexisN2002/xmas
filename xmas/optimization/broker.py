@@ -39,6 +39,14 @@ if TYPE_CHECKING:  # pragma: no cover
 
     from xmas.tasks.base import MASTask
 
+__all__ = [
+    "Board",
+    "ProxyTask",
+    "Request",
+    "credit_result",
+    "rounds",
+]
+
 
 @dataclass
 class Request:

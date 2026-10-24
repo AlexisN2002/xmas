@@ -59,6 +59,8 @@ House rules the tools do not catch:
 - **Public API is typed and documented.** Google-style docstrings, checked by ruff's `D`
   rules. Strict mypy means no untyped defs and no implicit `Any`.
 - **Line length is 120.**
+- **Nothing starts with an underscore**, truly private or not: the public surface is each
+  module's `__all__` and the docs. `tests/test_naming.py` checks it.
 - **No credentials, ever.** Configuration comes from the environment
   (`XMAS_BASE_URL`, `XMAS_API_KEY`). `.env` is gitignored and gitleaks scans every commit.
 - **No run artifacts.** Results, logs, checkpoints and datasets stay out of the repo.

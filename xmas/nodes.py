@@ -16,6 +16,11 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.mas import MAS
     from xmas.values import ValueType
 
+__all__ = [
+    "Box",
+    "Step",
+]
+
 
 @dataclass(frozen=True)
 class Step:

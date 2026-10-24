@@ -20,6 +20,18 @@ from typing import Any
 from xmas.media import MAX_PART_BYTES, Ref
 from xmas.prompts import safe_format
 
+__all__ = [
+    "Part",
+    "content_text",
+    "has_media",
+    "marker",
+    "prompt_messages",
+    "record_text",
+    "render_parts",
+    "to_content",
+]
+
+
 Part = str | Ref
 """One piece of a prompt: text, or a media ref sent as a picture or a sound."""
 

@@ -8,6 +8,10 @@ import numpy as np
 import pandas as pd
 from promptolution.tasks.base_task import BaseTask
 
+__all__ = [
+    "MASTask",
+]
+
 
 class MASTask(BaseTask):
     """A dataset plus a reward over MAS outputs.

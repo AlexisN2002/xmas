@@ -13,6 +13,12 @@ from xmas.optimization.synthesis import LLMPromptSynthesizer, MechanicalSynthesi
 from xmas.optimization.topology import Edges, Fixed, TopologyBudget, crossover, mas_edges, mutate, terminals
 from xmas.optimization.updaters import weakest
 
+__all__ = [
+    "NEW_AGENT_PROMPT",
+    "GraphUpdater",
+]
+
+
 NEW_AGENT_PROMPT = "You are {name}. Do your part of the task and pass on your result."
 """Seed text for an agent a mutation invented, before its prompt is written."""
 

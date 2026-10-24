@@ -9,6 +9,10 @@ from typing import Any
 from xmas.schemas import compile_form
 from xmas.values import JSON, parse_type
 
+__all__ = [
+    "Agent",
+]
+
 
 class Agent:
     """A single LLM node: a prompt, the state it reads, and the state it writes.

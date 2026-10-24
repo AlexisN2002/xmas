@@ -27,6 +27,16 @@ from enum import StrEnum
 from itertools import pairwise
 from typing import Any
 
+__all__ = [
+    "ANY_ERROR",
+    "ARROW",
+    "Edge",
+    "EdgeKind",
+    "dump_edges",
+    "parse_edges",
+]
+
+
 ARROW = "->"
 """What separates the names of a chain."""
 

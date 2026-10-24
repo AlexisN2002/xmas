@@ -14,6 +14,12 @@ from xmas.optimization.optimizer import MASOptimizer
 from xmas.optimization.updaters import movable_agents, weakest
 from xmas.tasks.base import MASTask
 
+__all__ = [
+    "PREFIXES",
+    "PrefixSearchOptimizer",
+]
+
+
 # Fixed phrases tried against an agent's prompt. Not a method, a fixture.
 #
 # Fifteen of them, so a population of sixteen is available without repeating one.

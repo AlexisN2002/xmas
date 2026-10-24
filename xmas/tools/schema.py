@@ -9,6 +9,18 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
+__all__ = [
+    "arguments_from",
+    "arguments_model",
+    "describe_validation_error",
+    "function_name",
+    "indent_of",
+    "is_args_header",
+    "json_schema",
+    "split_docstring",
+    "valid_tool_name",
+]
+
 
 def valid_tool_name(name: str) -> bool:
     """Whether the OpenAI ``tools`` payload accepts ``name``: ASCII letters, digits, ``_`` and ``-``, 1 to 64 long."""

@@ -30,6 +30,14 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 from xmas.errors import ErrorKind
 from xmas.values import LIST_PREFIX
 
+__all__ = [
+    "RETRY_NOTE",
+    "AnswerForm",
+    "FormError",
+    "compile_form",
+]
+
+
 RETRY_NOTE = "Your previous answer did not match the required format: {problem}\nAnswer again with only the JSON."
 """Appended to the prompt of the one retry; ``{problem}`` is the first problem."""
 

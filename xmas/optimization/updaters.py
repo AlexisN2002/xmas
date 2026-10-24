@@ -13,6 +13,13 @@ from xmas.mas import MAS
 from xmas.prompts import encode_prompts
 from xmas.tasks.base import MASTask
 
+__all__ = [
+    "AgentPromptView",
+    "PromptUpdater",
+    "movable_agents",
+    "weakest",
+]
+
 
 def movable_agents(mas: MAS) -> list[str]:
     """Return the agents not frozen, in the system's order; ``ValueError`` when every agent is frozen.

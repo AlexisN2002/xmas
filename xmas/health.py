@@ -27,6 +27,15 @@ if TYPE_CHECKING:
     from xmas.budget import RunMeter
     from xmas.trace import AgentRecord
 
+__all__ = [
+    "DEFAULT_LEAKS",
+    "Flag",
+    "Health",
+    "HealthSettings",
+    "summarize",
+]
+
+
 DEFAULT_LEAKS = (r"<\|[A-Za-z_]{2,30}\|>", r"</?think>", r"<<<xmas:agent ")
 """Patterns that should never reach an output: chat-template tokens, reasoning tags, xmas's encoding header."""
 

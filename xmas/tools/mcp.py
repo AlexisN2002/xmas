@@ -20,6 +20,12 @@ from xmas.tools import Tool, ToolSource
 from xmas.tools.mcp_session import McpSession
 from xmas.tools.schema import valid_tool_name
 
+__all__ = [
+    "MCPTools",
+    "result_text",
+]
+
+
 logger = logging.getLogger(__name__)
 
 

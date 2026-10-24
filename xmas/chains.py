@@ -22,6 +22,16 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.mas import MAS
     from xmas.values import ValueType
 
+__all__ = [
+    "ITEM_BUDGET_KEYS",
+    "Chain",
+    "ChainShape",
+    "ForEach",
+    "collapse",
+    "find_chains",
+]
+
+
 ITEM_BUDGET_KEYS = ("cost_usd", "wall_s")
 """What an item budget may limit: an item's summed cost in USD and its summed latency in seconds."""
 

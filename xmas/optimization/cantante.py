@@ -18,6 +18,10 @@ from xmas.prompts import encode_prompts
 from xmas.tasks.base import MASTask
 from xmas.trace import Trace
 
+__all__ = [
+    "CantanteOptimizer",
+]
+
 
 class CantanteOptimizer(MASOptimizer):
     """Optimizes every agent's prompt at once, guided by credit assignment.

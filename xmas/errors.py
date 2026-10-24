@@ -27,6 +27,26 @@ import pydantic
 if TYPE_CHECKING:  # pragma: no cover
     from xmas.llms.meta import CallMeta
 
+__all__ = [
+    "MODERATION_WORDS",
+    "MONEY_WORDS",
+    "RUN_ENDS",
+    "BadFormat",
+    "BudgetExceeded",
+    "EmptyResponse",
+    "ErrorKind",
+    "RaceLost",
+    "RunStatus",
+    "Stopped",
+    "Unanswered",
+    "XmasError",
+    "classify",
+    "kind_of_finish",
+    "kind_of_status",
+    "status_for",
+]
+
+
 try:  # openai 3.x and the MCP client raise httpx2's errors, which httpx's types do not match
     import httpx2
 except ImportError:  # pragma: no cover (httpx2 is optional here, not a dependency)

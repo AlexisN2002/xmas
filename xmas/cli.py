@@ -34,6 +34,11 @@ from xmas.store import open_store
 from xmas.values import TEXT, ValueType, media_kind, plain
 from xmas.verify import VerifyWarning
 
+__all__ = [
+    "main",
+]
+
+
 EXAMPLES = """\
 version: 1
 # Warm-up cases: verify(2) and `xmas verify --level 2` run them under a small budget.

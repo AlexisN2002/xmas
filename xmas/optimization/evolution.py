@@ -15,6 +15,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from xmas.optimization.attribution import Attributor
     from xmas.tasks.base import MASTask
 
+__all__ = [
+    "EvolutionaryTopologyOptimizer",
+]
+
 
 class EvolutionaryTopologyOptimizer(MASOptimizer):
     """Searches topologies by mutating and recombining the ones that scored well.

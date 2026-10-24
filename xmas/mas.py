@@ -54,6 +54,11 @@ from xmas.values import TEXT, ValueType, parse_type
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
 
+__all__ = [
+    "MAS",
+]
+
+
 QUERY_ONLY = {"query": TEXT}
 
 

@@ -11,6 +11,12 @@ import pandas as pd
 
 from xmas.tasks.base import MASTask
 
+__all__ = [
+    "GSM8KTask",
+    "extract_number",
+    "is_correct",
+]
+
 
 class GSM8KTask(MASTask):
     """GSM8K with numeric-tolerant scoring.
