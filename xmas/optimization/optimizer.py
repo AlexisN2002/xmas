@@ -99,7 +99,12 @@ class MASOptimizer(ABC):
             self.rollouts.extend((trace, float(grid[index][column])) for (index, column), trace in traces.items())
         return scores
 
-    def run_task(self, predictor: MAS, encoded: list[str], *, full: bool) -> tuple[Any, dict[tuple[int, int], Trace]]:
+    def run_task(  # public since before the lint round: a subclass or caller may pass full by position
+        self,
+        predictor: MAS,
+        encoded: list[str],
+        full: bool,  # noqa: FBT001
+    ) -> tuple[Any, dict[tuple[int, int], Trace]]:
         """Evaluate encoded prompt sets on the task; ``full`` runs every datapoint and keys the traces by cell."""
         cached = set(self.task.eval_cache)
         prompts = [Prompt(text) for text in encoded]
