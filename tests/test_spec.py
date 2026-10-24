@@ -64,7 +64,7 @@ def repeat(text: str, times: int) -> str:
 class RemoteTools(ToolSource):
     """A tool source standing in for an MCP server."""
 
-    url = "https://tools.example.com/mcp"
+    name = "tools"
 
     def tools(self) -> list[Tool]:
         """Offer one remote tool."""
@@ -121,7 +121,7 @@ callables:
   count_words: {kind: python, import: 'tests.conftest:count_words', reads: {draft: text}, writes: {counts: json}}
   publish_text: {kind: python, import: 'tests.conftest:publish_text', reads: {text: text}, writes: {published: text}}
   apology_text: {kind: python, import: 'tests.conftest:apology_text', reads: {query: text}, writes: {published: text}}
-  web_fetch: {kind: mcp, server: 'https://tools.example.com/mcp', reads: {url: text}, writes: {web_fetch: text}}
+  web_fetch: {kind: mcp, server: tools, reads: {url: text}, writes: {web_fetch: text}}
 prompts:
   writer: 'Answer {query} in a short draft. The last verdict, empty at first: {verdict}'
   judge: "Judge this draft: {draft}\\nIts word counts: {counts}"

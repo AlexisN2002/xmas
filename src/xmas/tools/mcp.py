@@ -45,6 +45,7 @@ class MCPTools(ToolSource):
         timeout_s: float = 900.0,
         max_concurrent: int = 4,
         writes: Mapping[str, Mapping[str, str]] | None = None,
+        name: str | None = None,
     ) -> None:
         """Initialize the source. Nothing connects until the first use.
 
@@ -60,15 +61,22 @@ class MCPTools(ToolSource):
                 ``{tool: {write: type}}``; a tool not listed writes ``{tool: text}``.
                 A media write, such as ``{"paint": {"png": "image"}}``, is read
                 from the result's media blocks (:meth:`call_media`).
+            name: The server's name in the configuration (``[tools.<name>]``);
+                a saved system's callables name it as their ``server``, never
+                the address.
 
         Raises:
-            ValueError: If no key is given or set in the environment.
+            ValueError: If no key is given or set in the environment, or the
+                name holds ``://``.
         """
         key = key or os.environ.get("XMAS_TOOLS_KEY")
         if not key:
             raise ValueError("MCPTools needs a key, or XMAS_TOOLS_KEY set in the environment.")
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1.")
+        if name is not None and (not name or "://" in name):
+            raise ValueError(f"MCPTools name {name!r} is a name such as 'web'; the address is the url.")
+        self.name = name
         self.url = url
         self.timeout_s = timeout_s
         self.max_concurrent = max_concurrent
@@ -135,8 +143,9 @@ class MCPTools(ToolSource):
         self.close()
 
     def __repr__(self) -> str:
-        """Name the endpoint, never the key."""
-        return f"MCPTools({self.url!r})"
+        """Name the endpoint and the name, never the key."""
+        named = "" if self.name is None else f", name={self.name!r}"
+        return f"MCPTools({self.url!r}{named})"
 
 
 def _media_blocks(result: CallToolResult) -> list[tuple[bytes, str]]:

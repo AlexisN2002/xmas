@@ -12,7 +12,10 @@ node may run ``for each`` item of a list and ``retry`` on some error kinds; an
 agent may read values under placeholders of other names and share a prompt
 with other agents under a ``prompt`` name. Its ``models`` section says, per
 bound model name, which kinds beyond text the model ``accepts`` and
-``produces``; never a URL, a key or a model parameter. Its ``humans`` are the
+``produces``, and the catalogue id it stands for (``model``, default the
+name); never a URL, a key or a model parameter. A callable names code by
+``import`` or a tool server by name (``server``), and may bind constant
+``params``. Its ``humans`` are the
 nodes that ask a person (:class:`xmas.human.Human`), and an edge may be one of a
 ``first of`` race.
 """
@@ -85,7 +88,7 @@ _ENTRIES: dict[str, tuple[str, frozenset[str], dict[str, Any]]] = {
         },
     ),
 }
-_CALLABLE = {"kind": str, "import": str, "server": str, "reads": dict, "writes": dict}
+_CALLABLE = {"kind": str, "import": str, "server": str, "params": dict, "reads": dict, "writes": dict}
 _HEALTH = {"length_factor": (int, float), "min_samples": int, "leak": list}
 _MODEL_KEYS = ("accepts", "produces")
 _WORDS = {
@@ -168,19 +171,42 @@ def validate_spec_v2(data: dict[str, Any]) -> dict[str, Any]:
     _check_fields(data, "Spec", V2_KEYS)
     if data.get("version") != 2:
         raise ValueError(f"A version 2 spec needs 'version: 2', not {data.get('version')!r}.")
+    for entry in data.get("boxes", []):
+        if isinstance(entry, dict) and isinstance(entry.get("system"), str):
+            raise ValueError(
+                f"Box {entry.get('name')!r} names its system {entry['system']!r}: MAS.load reads a bundle's boxes; "
+                "from_dict needs the system's spec."
+            )
     for section, (label, required, fields) in _ENTRIES.items():
         for index, entry in enumerate(data.get(section, [])):
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 raise ValueError(f"{label} {index} must be a mapping with a string 'name'.")
             _check_fields(entry, f"{label} {entry['name']!r}", fields, required)
     for name, entry in data.get("callables", {}).items():
+        unknown = sorted(set(entry) - set(_CALLABLE)) if isinstance(entry, dict) else []
+        if unknown:
+            raise ValueError(
+                f"Callable {name!r} has unknown keys {unknown}; it takes {sorted(_CALLABLE)} (use a YAML comment "
+                "for a note)."
+            )
         _check_fields(entry, f"Callable {name!r}", _CALLABLE, frozenset({"kind"}))
         if entry["kind"] not in ("python", "mcp"):
             raise ValueError(f"Callable {name!r} needs 'kind' to be 'python' or 'mcp', not {entry['kind']!r}.")
+        if "params" in entry and entry["kind"] != "python":
+            raise ValueError(f"Callable {name!r} binds params, which only a python callable takes.")
+        if "://" in entry.get("server", ""):
+            raise ValueError(
+                f"Callable {name!r} names the server {entry['server']!r}: a callable names its server, and its "
+                "address goes to the configuration ([tools.<name>] url)."
+            )
     _check_fields(data.get("health", {}), "Spec 'health'", _HEALTH)
     for name, entry in data.get("models", {}).items():  # other keys are refused, with why, where the MAS reads them
         if not isinstance(entry, dict) or any(not isinstance(entry.get(key, []), list) for key in _MODEL_KEYS):
             raise ValueError(f"Spec 'models' entry {name!r} must map accepts and produces to lists, got {entry!r}.")
+        if not isinstance(entry.get("model", name), str):
+            raise ValueError(
+                f"Spec 'models' entry {name!r} needs 'model' to be a catalogue id, not {entry['model']!r}."
+            )
 
     prompts = data.get("prompts", {})
     if not all(isinstance(text, str) for text in prompts.values()):
