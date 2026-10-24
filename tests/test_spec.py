@@ -195,6 +195,23 @@ def test_the_worked_example_round_trips() -> None:
     assert load(inner).structure != mas.structure
 
 
+@tool
+def is_long(draft: str) -> bool:
+    """Say whether a draft runs past ten words."""
+    return len(draft.split()) > 10
+
+
+def test_a_callable_only_an_edge_condition_calls_counts_as_used() -> None:
+    writer = Agent("writer", "Write {query}", output="draft", inputs=["query"])
+    done = Agent("done", "Done {draft}", output="final", inputs=["draft"])
+    again = Agent("again", "Again {query}", output="final", inputs=["query"])
+    edges = [Edge("writer", "done", EdgeKind.WHEN, when="is_long(draft)"), Edge("writer", "again", EdgeKind.ELSE)]
+    state = {"final": {"merge": "last"}}
+    spec = MAS([writer, done, again], edges, state=state, tools=[is_long], llm=MockLLM(turns=[])).to_dict()
+    assert spec["callables"]["is_long"]["import"] == "tests.test_spec:is_long"
+    assert MAS.from_dict(spec, llm=MockLLM(turns=[]), tools=[is_long]).to_dict() == spec
+
+
 def test_a_version_2_system_is_not_saved_as_one_yaml_file(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=r"\.mas bundle"):
         load(example()).to_yaml(tmp_path / "v2.yaml")
