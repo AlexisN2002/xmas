@@ -73,6 +73,7 @@ which retries every error.
         - XmasError
         - BudgetExceeded
         - Stopped
+        - RaceLost
         - EmptyResponse
         - BadFormat
         - classify
@@ -482,6 +483,100 @@ with a message that asks for a step of your own.
       members:
         - document_text
         - table_rows
+
+## Version 2: people, Stop, first of
+
+A **human node** asks a person: `Human(name, form, reads, writes, question=...,
+options=, labels=, pair=, edits=, timeout_s=, default=)` with one of the four
+`FORMS`, passed as `MAS(..., humans=[...])`. A human makes the system version 2.
+Its question and labels are templates over its reads, paths included. It compiles
+to its asking node and a deferred `<name>.wait` node, so a question waits only
+once every other branch has ended or paused; the edges out of a human leave from
+its wait node and route on the answer. A chain or box that holds a human runs
+its items or inner run on threads of their own, so one paused item never holds
+its siblings.
+
+**`MAS.run_state(values, on_event=None, run_id=None)`** returns a `paused`
+trace (`Trace.pause`: a `Pause` with each open `Question`, its id
+`<run_id>/<node>[/<item key or index>]/<visit>`) when questions are still open;
+**`MAS.answer(run_id, answers)`** keeps answers (`{question id: answer}`) while
+the run goes or waits, all or none ("The answers were not kept: ..." lists each
+problem); **`MAS.resume(run_id, answers=None, on_event=None)`** goes on from
+the run's checkpoints, in this process or a new one. It refuses an unknown run,
+one that is not paused ("Run 'r' is stopped, not paused."), a system whose
+`describe()` id differs ("resume with that system"), and a resume with no
+question answered or past its deadline. The budget counts on from the pause
+(`RunMeter.seed`); the wait is not wall time and is reported as `wait_s` on the
+human's record and `waited_s` in health. A question past its deadline takes its
+`default`, with `timed_out` true. An `Asker` (`MAS(..., asker=...)`) is asked
+once per question and may answer at once; `withdraw(question, reason)` is
+called for each open question of a paused run that is stopped. `run`,
+`run_batch`, `predict` and the optimizers never wait: an open question takes its
+default, else the run fails with "human node 'x' got no answer in an unattended
+run". `ReplayAsker(traces)` answers from recorded human records.
+
+The **run store** (`MAS(..., store=RunStore(path))`, a path, or `XMAS_RUNS`;
+in memory by default) is a LangGraph checkpoint saver on one SQLite file, its
+tables laid out as `langgraph-checkpoint-sqlite` lays them out, plus a row per
+run (status, open questions, meter totals) and per question (payload, deadline,
+answer). `RunStore.due()` lists runs with a question past its deadline for a
+host's timer, and `prune_runs(days)` and `delete(run_id)` clean up. Only the
+classes in `XMAS_TYPES` are read back from a checkpoint.
+
+**`MAS.stop(run_id, reason="stopped")`** stops a running run in this process
+(`RUNNING` holds each run's meter by id): no call, step or item starts after
+it, waits for a slot or a gate end within `SLICE_S`, and a model call in flight
+sees the stop on its `cancel_flag()` and is cut (`Stopped`, with the paid
+`meta` and the partial `text`). The trace's status is `stopped`, one `stop`
+event is emitted, and a visit cut after a call keeps a failed record. A paused
+run is marked stopped instead; `False` means no such run is running or paused.
+A run id given to `run_state` that is running ("is in use by a running run") or
+kept in the store ("is taken") is refused. `APILLM(stream=True)` streams, so a
+cut call keeps its partial answer; the default request is unchanged.
+
+**`first of`** edges (`EdgeKind.FIRST`, `a -> b: first of` in a spec) from one
+node form a race of agents, steps or boxes that write the same values and go on
+to one node or all end the run. Each contestant runs under
+`contestant(meter.race(key))`, the key being the source, the item and the visit;
+the first to finish wins (`RunMeter.win`) and writes, the others are cut
+(`RaceLost`) or their writes dropped, and each keeps a record with `lost` set
+and its paid cost, its `end` event `lost`. A contestant that fails goes no
+further; the race fails with the last failure when every contestant failed.
+
+::: xmas.human
+    options:
+      members:
+        - Human
+        - Question
+        - Pause
+        - Asker
+        - ReplayAsker
+        - answer_value
+        - question_id
+        - FORMS
+        - ANSWER_FIELDS
+        - COMMON_FIELDS
+        - TIE
+        - DEFAULT_LABELS
+
+::: xmas.store
+    options:
+      members:
+        - Store
+        - RunRow
+        - QuestionRow
+        - open_store
+        - XMAS_TYPES
+
+::: xmas.budget
+    options:
+      members:
+        - RunMeter
+        - CancelFlag
+        - cancel_flag
+        - contestant
+        - RUNNING
+        - SLICE_S
 
 ## Prompts
 
