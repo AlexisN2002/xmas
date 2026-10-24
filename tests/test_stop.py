@@ -591,6 +591,7 @@ def test_first_of_races(server: SlowServer) -> None:
     assert meter.race("outline:0:1") is race
     assert not race.is_set()
     outcome: dict[str, tuple[str, float]] = {}
+    losses: dict[str, tuple[str, CallMeta | None, ErrorKind]] = {}
     started = time.monotonic()
 
     def contest(name: str, seconds: float) -> None:
@@ -599,7 +600,7 @@ def test_first_of_races(server: SlowServer) -> None:
             try:
                 meter.metered(lambda: model.generate_with_meta(name))
             except RaceLost as error:
-                assert (error.text, error.meta, error.kind) == ("half", CUT, ErrorKind.STOPPED)
+                losses[name] = (error.text, error.meta, error.kind)
                 outcome[name] = ("lost", time.monotonic() - started)
                 return
         outcome[name] = ("won" if meter.win("outline:0:1", name) else "dropped", time.monotonic() - started)
@@ -610,6 +611,7 @@ def test_first_of_races(server: SlowServer) -> None:
     for racer in racers:
         racer.join()
     assert {name: result for name, (result, _) in outcome.items()} == {"fast": "won", "mid": "lost", "slow": "lost"}
+    assert losses == {"mid": ("half", CUT, ErrorKind.STOPPED), "slow": ("half", CUT, ErrorKind.STOPPED)}
     assert max(at for _, at in outcome.values()) < 0.3 + 0.2, "the wall is the fastest contestant's"
     assert meter.calls == 3
     assert meter.cost_usd == pytest.approx(META_USD + 2 * CUT_USD)  # the losers paid for what they used

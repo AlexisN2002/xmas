@@ -250,6 +250,10 @@ class Parser:
             return inner
         if value == "[":
             return ("lit", self.nested(position, lambda: self.items("]", self.literal)))
+        return self.named(kind, value, position)
+
+    def named(self, kind: str, value: str, position: int) -> tuple[Any, ...]:
+        """Parse what starts with a name: a call, ``cost``, ``elapsed``, ``visits`` or a path."""
         if kind != "name" or value in KEYWORDS:
             raise PredicateError(f"unexpected {value!r}", position)
         if value.startswith("__"):
@@ -330,32 +334,29 @@ def walk(tree: tuple[Any, ...]) -> list[tuple[Any, ...]]:
 
 
 def evaluate_tree(tree: tuple[Any, ...], ctx: Context) -> Any:
-    """Return the value of one subtree in ``ctx``."""
+    """Return the value of one subtree in ``ctx``: a literal, a figure of the run, else by :data:`EVALUATORS`."""
     head = tree[0]
     if head == "lit":
         return tree[1]
-    if head == "path":
-        value = resolve(tree[1], ctx.values)
-        return None if value is MISSING else value
-    if head == "exists":
-        return resolve(tree[1], ctx.values) is not MISSING
-    if head == "len":
-        value = evaluate_tree(tree[1], ctx)
-        return len(value) if isinstance(value, str | list | tuple | dict) else None
-    if head == "visits":
-        return ctx.visits.get(ctx.node if tree[1] is None else tree[1], 0)
-    if head == "cost":
-        return ctx.cost_usd
-    if head == "elapsed":
-        return ctx.elapsed_s
-    if head == "not":
-        return not evaluate_tree(tree[1], ctx)
-    if head == "and":
-        return all(evaluate_tree(part, ctx) for part in tree[1])
-    if head == "or":
-        return any(evaluate_tree(part, ctx) for part in tree[1])
-    if head == "cmp":
-        return compare(tree[1], evaluate_tree(tree[2], ctx), evaluate_tree(tree[3], ctx))
+    if head in RUN_FIGURES:
+        return getattr(ctx, RUN_FIGURES[head])
+    return EVALUATORS[head](tree, ctx)
+
+
+def evaluate_path(tree: tuple[Any, ...], ctx: Context) -> Any:
+    """Return the value at a path, ``None`` when nothing is there."""
+    value = resolve(tree[1], ctx.values)
+    return None if value is MISSING else value
+
+
+def evaluate_len(tree: tuple[Any, ...], ctx: Context) -> Any:
+    """Return the length of a text, list or object, ``None`` for anything else."""
+    value = evaluate_tree(tree[1], ctx)
+    return len(value) if isinstance(value, str | list | tuple | dict) else None
+
+
+def evaluate_call(tree: tuple[Any, ...], ctx: Context) -> bool:
+    """Call a registered function on the arguments' values; it must return a bool."""
     name, args = tree[1], tuple(evaluate_tree(arg, ctx) for arg in tree[2])
     if ctx.call is None:
         raise PredicateError(f"unknown function {name!r}")
@@ -363,6 +364,23 @@ def evaluate_tree(tree: tuple[Any, ...], ctx: Context) -> Any:
     if not isinstance(result, bool):
         raise PredicateError(f"callable {name!r} returned {type(result).__name__}, not bool")
     return result
+
+
+RUN_FIGURES = {"cost": "cost_usd", "elapsed": "elapsed_s"}
+"""The built-ins that read a figure of the run, and the :class:`Context` field each reads."""
+
+EVALUATORS: dict[str, Callable[[tuple[Any, ...], Context], Any]] = {
+    "path": evaluate_path,
+    "exists": lambda tree, ctx: resolve(tree[1], ctx.values) is not MISSING,
+    "len": evaluate_len,
+    "visits": lambda tree, ctx: ctx.visits.get(ctx.node if tree[1] is None else tree[1], 0),
+    "not": lambda tree, ctx: not evaluate_tree(tree[1], ctx),
+    "and": lambda tree, ctx: all(evaluate_tree(part, ctx) for part in tree[1]),
+    "or": lambda tree, ctx: any(evaluate_tree(part, ctx) for part in tree[1]),
+    "cmp": lambda tree, ctx: compare(tree[1], evaluate_tree(tree[2], ctx), evaluate_tree(tree[3], ctx)),
+    "call": evaluate_call,
+}
+"""How each kind of subtree evaluates, by the head the parser gives it."""
 
 
 def resolve(path: tuple[str, ...], values: Mapping[str, Any]) -> Any:

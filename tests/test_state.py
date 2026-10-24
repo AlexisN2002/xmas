@@ -20,6 +20,7 @@ from xmas.edges import Edge, EdgeKind
 from xmas.media import Image, Ref
 from xmas.nodes import Step
 from xmas.tools import tool
+from xmas.trace import Trace
 
 from .conftest import PNG, MockLLM, PaintingLLM, SeeingLLM
 
@@ -262,6 +263,13 @@ def test_events_and_the_parallel_call_cap() -> None:
             Budget(max_parallel_calls=cast("int", wrong))
 
 
+def assert_plain_json(trace: Trace) -> None:
+    """A trace with pictures is plain JSON, and no picture's bytes are in it."""
+    text = json.dumps(trace.to_dict())
+    assert "base64," not in text
+    assert json.loads(text)["records"]
+
+
 def test_run_state_with_pictures(png: Path) -> None:
     judge = Agent("judge", "Look: {png}", "verdict", ["png"])
     seeing = SeeingLLM("fits")
@@ -273,6 +281,7 @@ def test_run_state_with_pictures(png: Path) -> None:
     assert record.rendered_prompt == "Look: \n[png 0] [image a.png, image/png, 6 B]"
     assert record.inputs == {"png": json.dumps([ref.to_dict()])}  # the model sees bytes, the record a reference
     assert json.loads(looked.query)["png"] == [ref.to_dict()]
+    assert_plain_json(looked)
 
     # a list of lists, such as each slide's pages gathered by a chain, labels a picture by its place
     nested = SeeingLLM()
@@ -301,7 +310,9 @@ def test_run_state_with_pictures(png: Path) -> None:
     changed = MAS([judge], inputs={"png": "list of image"}, llm=SeeingLLM()).run_state({"png": [ref]})
     assert "a.png changed since it was referenced" in (changed.error or "")
 
-    # a painting model's picture is kept in the store; the record holds its ref
+
+@pytest.mark.usefixtures("png")  # the store lives beside the picture
+def test_a_painting_model_keeps_its_picture_in_the_store() -> None:
     painter = Agent("painter", "Paint {query}", "picture", output_type="image")
     painted = MAS([painter], llm=PaintingLLM(), outputs={"picture": "image"}).run_state({"query": "a cat"})
     picture = painted.outputs["picture"]
@@ -321,11 +332,8 @@ def test_run_state_with_pictures(png: Path) -> None:
     nothing = MAS([many], llm=PaintingLLM(count=0), version=2).run("cats")
     assert "expected at least one image, got 0" in (nothing.error or "")
 
-    # a trace with pictures is plain JSON, and no picture's bytes are in it
-    for trace in (looked, painted, drawn):
-        text = json.dumps(trace.to_dict())
-        assert "base64," not in text
-        assert json.loads(text)["records"]
+    for trace in (painted, drawn):
+        assert_plain_json(trace)
     assert painted.to_dict()["outputs"] == {"picture": picture.to_dict()}
 
 

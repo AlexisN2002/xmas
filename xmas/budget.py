@@ -462,7 +462,7 @@ class RunMeter:
             return
         try:
             listener(event)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  a host's listener may raise anything; it is warned about once and dropped
             with self.lock:
                 first = self.listener is listener
                 self.listener = None
