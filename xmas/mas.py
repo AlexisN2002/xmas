@@ -6,23 +6,18 @@ import dataclasses
 import hashlib
 import importlib
 import json
-import os
 import sys
 import warnings
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
-from promptolution.llms.base_llm import BaseLLM
 from promptolution.predictors.base_predictor import BasePredictor
 
-from xmas import bundle, runtime
-from xmas import examples as examples
+from xmas import bundle, examples, runtime
 from xmas import verify as verification
 from xmas.agent import Agent
-from xmas.budget import Budget
 from xmas.chains import ChainShape, ForEach
 from xmas.check import MERGE_LAST, SystemInfo, check_system, step_maps
 from xmas.config import Config, ModelEntry, build_llms, resolve_names, tool_sources
@@ -48,11 +43,17 @@ from xmas.prompts import decode_prompts, encode_prompts
 from xmas.spec import validate_spec, validate_spec_v2
 from xmas.store import Store, open_store
 from xmas.tools import Tool, ToolIndex, ToolSource, index_tools, select_tools, tool
-from xmas.trace import Event, Trace
 from xmas.values import TEXT, ValueType, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
+    import os
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+
     import networkx as nx
+    from promptolution.llms.base_llm import BaseLLM
+
+    from xmas.budget import Budget
+    from xmas.trace import Event, Trace
 
 __all__ = [
     "MAS",
@@ -60,6 +61,9 @@ __all__ = [
 
 
 QUERY_ONLY = {"query": TEXT}
+
+VERSION_2 = 2
+"""The spec version with steps, boxes, human nodes, typed values and conditional edges."""
 
 
 class MAS(BasePredictor):
@@ -155,7 +159,7 @@ class MAS(BasePredictor):
     bundle: Path | None
     unresolved: dict[str, tuple[str, ...]]
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917  the public signature of versions 1 and 2, kept for their callers
         self,
         agents: list[Agent],
         edges: Sequence[tuple[str, str] | Edge] | None = None,
@@ -251,37 +255,19 @@ class MAS(BasePredictor):
         self.edges = tuple(edge if isinstance(edge, Edge) else Edge(*edge) for edge in edges or ())
         self.frozen = frozenset(frozen)
         self.health = health
-        self.each = {name: f if isinstance(f, ForEach) else ForEach.parse(f) for name, f in (each or {}).items()}
+        self.each = plain_each(each)
         self.outputs = typed(outputs or {})
         self.retry = {name: dict(rules) for name, rules in (retry or {}).items()}
         self.prompt_names = dict(prompt_names or {})
-        self.models = {
-            name: entry if isinstance(entry, Capabilities) else ModelEntry.parse(entry, f"models entry {name!r}")
-            for name, entry in (models or {}).items()
-        }
-        self.version = self.infer_version(version, agents, [*steps, *boxes, *humans], inputs, state)
-        if not agents and (self.version == 1 or not (steps or boxes or humans)):
-            raise ValueError(
-                "A MAS needs at least one node." if self.version == 2 else "A MAS needs at least one agent."
-            )
-        if max_tool_rounds < 0:
-            raise ValueError("max_tool_rounds must be >= 0.")
+        self.models = plain_models(models)
+        others: list[Step | Box | Human] = [*steps, *boxes, *humans]
+        self.version = self.infer_version(version, agents, others, inputs, state)
+        refuse_unrunnable(self.version, agents, others, max_tool_rounds)
         super().__init__(llm=llm)  # type: ignore[arg-type]
 
-        nodes: list[Agent | Step | Box | Human] = [*agents, *steps, *boxes, *humans]
-        names = [node.name for node in nodes]
-        if len(set(names)) != len(names):
-            raise ValueError(f"Node names must be unique: {sorted({n for n in names if names.count(n) > 1})}.")
-        self.agents = {agent.name: agent for agent in agents}
-        self.steps = {step.name: step for step in steps}
-        self.boxes = {box.name: box for box in boxes}
-        self.humans = {human.name: human for human in humans}
+        self.index_nodes(agents, steps, boxes, humans)
         self.llms = dict(llms or {})
-        for agent in agents:
-            if agent.model is not None and agent.model not in self.llms:
-                raise ValueError(
-                    f"Agent {agent.name!r} binds to model {agent.model!r}, which is not in llms={sorted(self.llms)}."
-                )
+        check_bindings(agents, self.llms)
         self.max_steps = max_steps
         self.max_visits = max_visits
         self.budget = budget
@@ -298,14 +284,21 @@ class MAS(BasePredictor):
         self.unresolved = {}
         if self.version == 1:
             self.build_v1()
-            return
-        self.inputs = typed(inputs if inputs is not None else QUERY_ONLY)
-        for value, entry in (state or {}).items():
-            if entry != {"merge": MERGE_LAST}:
-                raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
-        self.merges = dict.fromkeys(state or {}, MERGE_LAST)
-        self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
-        self.graph = self.info.graph
+        else:
+            self.build_v2(inputs, state)
+
+    def index_nodes(
+        self, agents: list[Agent], steps: Sequence[Step], boxes: Sequence[Box], humans: Sequence[Human]
+    ) -> None:
+        """Key the nodes of each kind by name; one name for two nodes is refused."""
+        nodes: list[Agent | Step | Box | Human] = [*agents, *steps, *boxes, *humans]
+        names = [node.name for node in nodes]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Node names must be unique: {sorted({n for n in names if names.count(n) > 1})}.")
+        self.agents = {agent.name: agent for agent in agents}
+        self.steps = {step.name: step for step in steps}
+        self.boxes = {box.name: box for box in boxes}
+        self.humans = {human.name: human for human in humans}
 
     def infer_version(
         self,
@@ -344,6 +337,18 @@ class MAS(BasePredictor):
         for agent in self.agents.values():
             if agent.tools:
                 self.resolve_tools(agent)
+
+    def build_v2(
+        self, inputs: Mapping[str, str | ValueType] | None, state: Mapping[str, Mapping[str, str]] | None
+    ) -> None:
+        """Keep a version 2 system's inputs and merges, then check it whole, so it fails now, not mid-run."""
+        self.inputs = typed(inputs if inputs is not None else QUERY_ONLY)
+        for value, entry in (state or {}).items():
+            if entry != {"merge": MERGE_LAST}:
+                raise ValueError(f"state[{value!r}] must be {{'merge': 'last'}}, got {entry!r}.")
+        self.merges = dict.fromkeys(state or {}, MERGE_LAST)
+        self.info = check_system(self)  # it checks the topology itself, so a bad edge is one problem of the list
+        self.graph = self.info.graph
 
     def chain_system(self, shape: ChainShape, inputs: Mapping[str, ValueType], written: Mapping[str, ValueType]) -> MAS:
         """Build the system one item of a chain runs; :func:`~xmas.check.check_system` asks for it."""
@@ -659,7 +664,7 @@ class MAS(BasePredictor):
         existing one pass ``**mas.v2_kwargs()``, so a field added here reaches
         all of them.
         """
-        v2 = self.version == 2
+        v2 = self.version == VERSION_2
         return {
             "steps": tuple(self.steps.values()),
             "inputs": dict(self.inputs) if v2 else None,
@@ -792,7 +797,7 @@ class MAS(BasePredictor):
             ValueError: If the spec is malformed, binds to an unsupplied model,
                 or (version 2) its ``callables`` do not match those supplied.
         """
-        if data.get("version") == 2:
+        if data.get("version") == VERSION_2:
             return cls.from_v2(data, llm=llm, llms=llms, tools=tools)
         spec = validate_spec(data)
         return cls(
@@ -888,7 +893,7 @@ class MAS(BasePredictor):
             ValueError: For a version 2 system, which :meth:`save` writes as a
                 ``.mas`` bundle; :meth:`to_dict` gives its spec.
         """
-        if self.version == 2:
+        if self.version == VERSION_2:
             raise ValueError(
                 "A version 2 system is not saved as one YAML file: it is saved as the .mas bundle "
                 "(name.mas/): save(path) writes it; to_dict() gives its spec."
@@ -926,7 +931,7 @@ class MAS(BasePredictor):
         self.bundle = bundle.write(path, bundle.files_of(self), bundle.code_hashes(self), zipped=zipped)
         return self.bundle
 
-    def verify(
+    def verify(  # noqa: PLR0913  the public signature: one keyword per option of xmas.verify.verify
         self,
         level: int = 1,
         *,
@@ -962,7 +967,7 @@ class MAS(BasePredictor):
         return examples.save_examples(self, trace, nodes=nodes, file=file, path=None if path is None else Path(path))
 
     @classmethod
-    def load(
+    def load(  # noqa: PLR0913  the public signature: one keyword per loading option
         cls,
         path: str | os.PathLike[str],
         *,
@@ -1018,29 +1023,16 @@ class MAS(BasePredictor):
 
         systems = list(spec_systems(spec))
         for system in systems:  # the shape first, so a malformed entry is named before any import
-            (validate_spec_v2 if system.get("version") == 2 else validate_spec)(dict(system))
+            (validate_spec_v2 if system.get("version") == VERSION_2 else validate_spec)(dict(system))
         if overlay:
-            agents = {item["name"]: item for item in spec["agents"]}
-            unknown = sorted(set(overlay) - set(agents))
-            if unknown:
-                raise ValueError(f"The overlay names unknown agents {unknown}; the agents are {sorted(agents)}.")
-            for name, model in overlay.items():
-                agents[name]["model"] = model
-        sources = [*tools, *callable_sources(systems, tools, configured, trust)]
+            apply_overlay(spec, overlay)
+        sources = [*tools, *callable_sources(systems, tools, configured, trust=trust)]
         given = dict(llms or {})
-        bound = {agent["model"] for system in systems for agent in system.get("agents", []) if agent.get("model")}
         default_model = spec.get("default_model")
-        if llm is None:  # each system's default, a box's too, is built unless llm= stands for them all
-            bound |= {system["default_model"] for system in systems if system.get("default_model")}
-        missing = sorted(bound - set(given))
+        # each system's default, a box's too, is built unless llm= stands for them all
+        missing = sorted(bound_models(systems, with_defaults=llm is None) - set(given))
         if missing:
-            models: dict[str, Capabilities] = {}
-            for system in reversed(systems):  # an outer entry wins over a box's
-                entries = system.get("models") or {}
-                models.update(
-                    {name: ModelEntry.parse(entry, f"models entry {name!r}") for name, entry in entries.items()}
-                )
-            given.update(build_llms(missing, models, configured()))
+            given.update(build_llms(missing, declared_models(systems), configured()))
         default = given.get(default_model) if llm is None and default_model is not None else llm
         mas = cls.from_dict(spec, llm=default, llms=given, tools=sources)
         mas.bundle = Path(path)
@@ -1099,7 +1091,7 @@ class MAS(BasePredictor):
             "version": self.version,
             "inputs": type_words(self.inputs),
             "nodes": [self.describe_node(name, node) for name, node in self.nodes.items()],
-            "edges": [self.describe_edge(pair, declared.get(pair), pair in loops) for pair in ordered],
+            "edges": [self.describe_edge(pair, declared.get(pair), loop=pair in loops) for pair in ordered],
             "joins": joins,
         }
         if self.outputs:
@@ -1150,17 +1142,23 @@ class MAS(BasePredictor):
             reads, writes = step_maps(node, self.resolve_callable(node)[0])
             entry = {"name": name, "kind": "step", "uses": node.uses, "reads": typed(reads.values())}
             entry["writes"] = typed(writes.values())
-        if name in self.frozen:
-            entry["frozen"] = True
-        if name in self.each:
-            entry["for each"] = str(self.each[name])
-        if isinstance(node, Agent) and node.renamed:
-            entry["placeholders"] = dict(node.reads)
-        if name in self.retry:
-            entry["retry"] = dict(self.retry[name])
+        entry.update(self.node_settings(name, node))
         return entry
 
-    def describe_edge(self, pair: tuple[str, str], edge: Edge | None, loop: bool) -> dict[str, Any]:
+    def node_settings(self, name: str, node: Agent | Step | Box | Human) -> dict[str, Any]:
+        """Return what :meth:`describe_node` adds for any kind: frozen, its chain form, read renames, retries."""
+        settings: dict[str, Any] = {}
+        if name in self.frozen:
+            settings["frozen"] = True
+        if name in self.each:
+            settings["for each"] = str(self.each[name])
+        if isinstance(node, Agent) and node.renamed:
+            settings["placeholders"] = dict(node.reads)
+        if name in self.retry:
+            settings["retry"] = dict(self.retry[name])
+        return settings
+
+    def describe_edge(self, pair: tuple[str, str], edge: Edge | None, *, loop: bool) -> dict[str, Any]:
         """Return one edge of :meth:`describe`: ``edge`` when declared, ``loop`` for a version 1 back edge."""
         source, target = pair
         item: dict[str, Any] = {"from": source, "to": target, "kind": EdgeKind.PLAIN.value}
@@ -1280,6 +1278,67 @@ def spec_systems(spec: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
             yield from spec_systems(box["system"])
 
 
+def plain_each(each: Mapping[str, str | Mapping[str, Any] | ForEach] | None) -> dict[str, ForEach]:
+    """Return the ``for each`` forms by node, each parsed from its text or spec mapping."""
+    return {name: form if isinstance(form, ForEach) else ForEach.parse(form) for name, form in (each or {}).items()}
+
+
+def plain_models(models: Mapping[str, Mapping[str, Any] | Capabilities] | None) -> dict[str, Capabilities]:
+    """Return the declared models by name, each spec mapping parsed as a :class:`~xmas.config.ModelEntry`."""
+    return {
+        name: entry if isinstance(entry, Capabilities) else ModelEntry.parse(entry, f"models entry {name!r}")
+        for name, entry in (models or {}).items()
+    }
+
+
+def refuse_unrunnable(
+    version: int, agents: Sequence[Agent], others: Sequence[Step | Box | Human], max_tool_rounds: int
+) -> None:
+    """Refuse a system without a node (an agent, in version 1), or a negative ``max_tool_rounds``."""
+    if not agents and (version == 1 or not others):
+        raise ValueError(
+            "A MAS needs at least one node." if version == VERSION_2 else "A MAS needs at least one agent."
+        )
+    if max_tool_rounds < 0:
+        raise ValueError("max_tool_rounds must be >= 0.")
+
+
+def check_bindings(agents: Iterable[Agent], llms: Mapping[str, BaseLLM]) -> None:
+    """Refuse an agent bound to a model name ``llms`` does not hold."""
+    for agent in agents:
+        if agent.model is not None and agent.model not in llms:
+            raise ValueError(
+                f"Agent {agent.name!r} binds to model {agent.model!r}, which is not in llms={sorted(llms)}."
+            )
+
+
+def apply_overlay(spec: Mapping[str, Any], overlay: Mapping[str, str]) -> None:
+    """Rebind the agents of ``spec`` that ``overlay`` names to its model names; an unknown agent is refused."""
+    agents = {item["name"]: item for item in spec["agents"]}
+    unknown = sorted(set(overlay) - set(agents))
+    if unknown:
+        raise ValueError(f"The overlay names unknown agents {unknown}; the agents are {sorted(agents)}.")
+    for name, model in overlay.items():
+        agents[name]["model"] = model
+
+
+def bound_models(systems: Sequence[Mapping[str, Any]], *, with_defaults: bool) -> set[str]:
+    """Return the model names the agents of ``systems`` bind, and each system's default ``with_defaults``."""
+    bound = {agent["model"] for system in systems for agent in system.get("agents", []) if agent.get("model")}
+    if with_defaults:
+        bound |= {system["default_model"] for system in systems if system.get("default_model")}
+    return bound
+
+
+def declared_models(systems: Sequence[Mapping[str, Any]]) -> dict[str, Capabilities]:
+    """Return the ``models:`` entries of ``systems``; an outer entry wins over a box's."""
+    models: dict[str, Capabilities] = {}
+    for system in reversed(systems):
+        entries = system.get("models") or {}
+        models.update({name: ModelEntry.parse(entry, f"models entry {name!r}") for name, entry in entries.items()})
+    return models
+
+
 def built_systems(mas: MAS) -> Iterator[MAS]:
     """Yield a system and each box's system, at every depth."""
     yield mas
@@ -1291,6 +1350,7 @@ def callable_sources(
     systems: Sequence[Mapping[str, Any]],
     supplied: Sequence[ToolSource | Tool],
     configured: Callable[[], Config],
+    *,
     trust: bool,
 ) -> list[ToolSource | Tool]:
     """Return the tools and tool sources a bundle's callables need, besides those ``supplied``.
@@ -1307,7 +1367,7 @@ def callable_sources(
             if name in offered or name in built:
                 continue
             if entry.get("kind") == "python":
-                built[name] = imported(name, entry, trust)
+                built[name] = imported(name, entry, trust=trust)
             elif entry.get("kind") == "mcp":
                 server = entry.get("server")
                 if not isinstance(server, str):
@@ -1319,7 +1379,7 @@ def callable_sources(
     return [*built.values(), *(tool_sources(servers, configured()) if servers else ())]
 
 
-def imported(name: str, entry: Mapping[str, Any], trust: bool) -> Tool:
+def imported(name: str, entry: Mapping[str, Any], *, trust: bool) -> Tool:
     """Find a python callable by its ``import`` path, as a tool named ``name`` bound to its ``params``.
 
     Untrusted, only a :class:`Tool` of a module already imported is taken: nothing is imported or wrapped.

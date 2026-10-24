@@ -214,14 +214,16 @@ def test_swaps_with_langgraph_sqlite_saver_both_ways(tmp_path: Path, serde_event
     store = Store(tmp_path / "a.db")
     pause(store)
     out = resume(sqlite_saver(tmp_path / "a.db", store))
-    assert out["answer"] == {"approved": True} and out["records"] == [RECORD]
+    assert out["answer"] == {"approved": True}
+    assert out["records"] == [RECORD]
     assert len(list(store.list(CONFIG))) == 2  # xmas reads what SqliteSaver wrote
 
     # Paused under SqliteSaver, resumed under xmas.
     pause(sqlite_saver(tmp_path / "b.db", store))
     other = Store(tmp_path / "b.db")
     out = resume(other)
-    assert out["answer"] == {"approved": True} and out["records"] == [RECORD]
+    assert out["answer"] == {"approved": True}
+    assert out["records"] == [RECORD]
     for table in ("checkpoints", "writes"):
         assert table_info(tmp_path / "a.db", table) == table_info(tmp_path / "b.db", table)
     assert not [e for e in serde_events if e["kind"] == "msgpack_unregistered_allowed"]
@@ -239,9 +241,11 @@ def test_runs_and_questions_tables(tmp_path: Path) -> None:
     ]  # fmt: skip
 
     started = store.save_run("r_1", "sys-a", "running")
-    assert started.paused == () and started.created_at == started.updated_at
+    assert started.paused == ()
+    assert started.created_at == started.updated_at
     paused = store.save_run("r_1", "sys-a", "paused", paused=["r_1/approve/1"])
-    assert paused.created_at == started.created_at and paused.updated_at >= started.updated_at
+    assert paused.created_at == started.created_at
+    assert paused.updated_at >= started.updated_at
     assert paused.paused == ("r_1/approve/1",)
     store.save_run("r2", "sys-b", "running")
     assert [r.run_id for r in store.runs()] == ["r_1", "r2"]
@@ -251,28 +255,35 @@ def test_runs_and_questions_tables(tmp_path: Path) -> None:
     asked = store.save_question(
         "r_1/approve/1", "r_1", "approve", "approve", {"draft": "d"}, "2026-10-01T08:00:00+00:00"
     )
-    assert asked.answer is None and asked.who is None and asked.answered_at is None
+    assert asked.answer is None
+    assert asked.who is None
+    assert asked.answered_at is None
     store.save_question("r_1/edit/1", "r_1", "edit", "edit", {})
     with pytest.raises(ValueError, match="already saved"):
         store.save_question("r_1/edit/1", "r_1", "edit", "edit", {})
     answered = store.answer("r_1/approve/1", {"approved": True, "option": "Ship it"}, who="tom")
-    assert answered.answer == {"approved": True, "option": "Ship it"} and answered.who == "tom"
-    assert answered.answered_at is not None and answered.shown == {"draft": "d"}
+    assert answered.answer == {"approved": True, "option": "Ship it"}
+    assert answered.who == "tom"
+    assert answered.answered_at is not None
+    assert answered.shown == {"draft": "d"}
     timed_out = store.answer("r_1/edit/1", {"changed": False}, answered_at="2026-10-25T08:00:00+00:00")
-    assert timed_out.who is None and timed_out.answered_at == "2026-10-25T08:00:00+00:00"
+    assert timed_out.who is None
+    assert timed_out.answered_at == "2026-10-25T08:00:00+00:00"
     assert [q.question_id for q in store.questions("r_1")] == ["r_1/approve/1", "r_1/edit/1"]
     assert store.question("nope") is None
     with pytest.raises(KeyError, match="nope"):
         store.answer("nope", {})
 
     reopened = Store(tmp_path / "runs.db")
-    assert reopened.run("r_1") == paused and reopened.questions("r_1") == store.questions("r_1")
+    assert reopened.run("r_1") == paused
+    assert reopened.questions("r_1") == store.questions("r_1")
 
     checkpoint: Any = {"id": "c1", "channel_values": {}}
     for thread in ("r_1", "r_1/each/drafter/1/0", "rx1/box/b/1", "r2"):
         store.put({"configurable": {"thread_id": thread, "checkpoint_ns": ""}}, checkpoint, {}, {})
     store.delete("r_1")
-    assert store.run("r_1") is None and store.questions("r_1") == ()
+    assert store.run("r_1") is None
+    assert store.questions("r_1") == ()
     with sqlite3.connect(tmp_path / "runs.db") as conn:
         threads = {row[0] for row in conn.execute("SELECT thread_id FROM checkpoints")}
     assert threads == {"rx1/box/b/1", "r2"}  # '_' matched literally, other runs kept
@@ -282,7 +293,9 @@ def test_open_store_defaults_to_one_file_in_the_data_folder(
     tmp_path: Path, run_log_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     default = run_log_home / "xmas" / "runs.sqlite"
-    assert runs_path() == default and open_store().path == default and default.is_file()
+    assert runs_path() == default
+    assert open_store().path == default
+    assert default.is_file()
     assert open_store() is open_store()  # one file, one store in a process
     assert runs_path({"HOME": "/home/x"}).parts[-3:] == ("share", "xmas", "runs.sqlite")
     monkeypatch.setenv("XMAS_RUNS", "")
@@ -292,11 +305,14 @@ def test_open_store_defaults_to_one_file_in_the_data_folder(
     monkeypatch.setenv("XMAS_CONFIG", str(config))
     assert open_store().path == tmp_path / "configured.db"
     monkeypatch.setenv("XMAS_RUNS", str(tmp_path / "env.db"))
-    assert open_store().path == tmp_path / "env.db" and (tmp_path / "env.db").is_file()
+    assert open_store().path == tmp_path / "env.db"
+    assert (tmp_path / "env.db").is_file()
     assert open_store(str(tmp_path / "given.db")).path == tmp_path / "given.db"
     monkeypatch.setenv("XMAS_RUNS", ":memory:")
-    assert open_store().path is None and open_store() is not open_store()
-    assert Store(":memory:").path is None and open_store(":memory:").path is None
+    assert open_store().path is None
+    assert open_store() is not open_store()
+    assert Store(":memory:").path is None
+    assert open_store(":memory:").path is None
 
 
 # ---------------------------------------------------------------- the run log
@@ -317,15 +333,32 @@ def test_every_run_is_logged_and_its_trace_rebuilds(run_log_home: Path) -> None:
     store = mas.runs()
     assert store.path == run_log_home / "xmas" / "runs.sqlite"
     rebuilt = store.trace(cast("str", trace.run_id))
-    assert rebuilt == trace and rebuilt.records == trace.records and rebuilt.outputs == trace.outputs
+    assert rebuilt == trace
+    assert rebuilt.records == trace.records
+    assert rebuilt.outputs == trace.outputs
     assert (rebuilt.status, rebuilt.run_id, rebuilt.graph_id) == ("ok", trace.run_id, mas.describe()["id"])
-    assert rebuilt.health is not None and rebuilt.health.flags == cast("Health", trace.health).flags
+    assert rebuilt.health is not None
+    assert rebuilt.health.flags == cast("Health", trace.health).flags
     row = cast("Any", store.run(cast("str", trace.run_id)))
     assert (row.status, row.system_id, row.totals["calls"]) == ("ok", trace.graph_id, 9)
     assert row.ended_at >= row.created_at
 
+    check_the_logged_records_and_events(store, trace)
+    check_the_logged_calls(store, trace)
+    check_every_entry_point_writes_through(store)
+
+    # a run id names one run
+    mas.run_state(deck_values("a"), run_id="fixed")
+    with pytest.raises(ValueError, match="'fixed' is taken"):
+        mas.run_state(deck_values("a"), run_id="fixed")
+    store.delete("fixed")
+    assert rows(store.path, "SELECT COUNT(*) FROM xmas_records WHERE run_id = 'fixed'") == [(0,)]
+
+
+def check_the_logged_records_and_events(store: Store, trace: Trace) -> None:
+    """The records of ``trace`` are rows in their columns, and every start and end is an event."""
     logged = rows(store.path, "SELECT * FROM xmas_records WHERE run_id = ? ORDER BY position", trace.run_id)
-    assert [c[1] for c in table_info(store.path, "xmas_records")][:12] == [
+    assert [c[1] for c in table_info(cast("Path", store.path), "xmas_records")][:12] == [
         "run_id", "position", "boxed", "kept_at", "node", "kind", "item", "item_key", "visit", "model",
         "served_model", "cost_usd",
     ]  # fmt: skip
@@ -334,23 +367,35 @@ def test_every_run_is_logged_and_its_trace_rebuilds(run_log_home: Path) -> None:
     assert (first[5], first[6], first[7], first[8], first[11]) == ("agent", 0, "a", 1, 0.01)
     assert json.loads(first[20]) == {"slide": '{"id": "a"}', "rules": "plain", "verdict": ""}
     events = store.events(cast("str", trace.run_id))
-    assert [e.kind for e in events].count("start") == len(trace.records) and events[-1].kind in ("end", "item_end")
-    calls = store.calls(cast("str", trace.run_id))
-    assert len(calls) == 9 and {c["cost_usd"] for c in calls} == {0.01}
-    assert calls[0]["tokens"] == {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
-    assert {c["model"] for c in calls} == {"MockLLM"} and {c["node"] for c in calls} == {"noter", "drafter", "checker"}
+    assert [e.kind for e in events].count("start") == len(trace.records)
+    assert events[-1].kind in ("end", "item_end")
 
-    # version 1 and a batch, a failure, a box: every entry point writes through
+
+def check_the_logged_calls(store: Store, trace: Trace) -> None:
+    """Every model call of ``trace`` is logged with its cost, tokens, model and node."""
+    calls = store.calls(cast("str", trace.run_id))
+    assert len(calls) == 9
+    assert {c["cost_usd"] for c in calls} == {0.01}
+    assert calls[0]["tokens"] == {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+    assert {c["model"] for c in calls} == {"MockLLM"}
+    assert {c["node"] for c in calls} == {"noter", "drafter", "checker"}
+
+
+def check_every_entry_point_writes_through(store: Store) -> None:
+    """Version 1 and a batch, a failure, a box: every entry point writes its run to ``store``."""
     v1 = MAS([Agent("a", "Answer {query}", "answer")], llm=MockLLM())
     batch = v1.run_batch(["x", "y"])
     v1.predict("Say {query}", ["z"])
     v1_runs = store.runs(system_id=v1.describe()["id"])
     assert [store.trace(r.run_id).query for r in v1_runs] == ["x", "y", "z"]
-    assert store.trace(v1_runs[0].run_id) == batch[0] and store.trace(v1_runs[0].run_id).graph_id is None
+    assert store.trace(v1_runs[0].run_id) == batch[0]
+    assert store.trace(v1_runs[0].run_id).graph_id is None
     broken = MAS([Agent("b", "Answer {query}", "answer")], llm=MockLLM(answers=[RuntimeError("boom")]))
     failed = broken.run("q")
     again = store.trace(store.runs(system_id=broken.describe()["id"])[0].run_id)
-    assert again == failed and again.status == "failed" and again.error_kind == failed.error_kind
+    assert again == failed
+    assert again.status == "failed"
+    assert again.error_kind == failed.error_kind
     inner = MAS([Agent("cut", "Cut {page}", "short", ["page"])], inputs={"page": "text"}, llm=MockLLM())
     boxed = MAS([], boxes=[Box("summarize", inner, reads={"page": "query"}, writes={"short": "short"})], llm=inner.llm)
     outer = boxed.run("cats")
@@ -359,17 +404,11 @@ def test_every_run_is_logged_and_its_trace_rebuilds(run_log_home: Path) -> None:
         ("cut", 1),
         ("summarize", 0),
     ]
-    assert [r.status for r in store.runs(limit=2)] == ["failed", "ok"] and len(store.runs()) == 6
+    assert [r.status for r in store.runs(limit=2)] == ["failed", "ok"]
+    assert len(store.runs()) == 6
     assert store.runs(status="failed", system_id="nope") == ()
     with pytest.raises(KeyError, match="no run 'nope'"):
         store.trace("nope")
-
-    # a run id names one run
-    with pytest.raises(ValueError, match="'fixed' is taken"):
-        for _ in range(2):
-            mas.run_state(deck_values("a"), run_id="fixed")
-    store.delete("fixed")
-    assert rows(store.path, "SELECT COUNT(*) FROM xmas_records WHERE run_id = 'fixed'") == [(0,)]
 
 
 def test_memory_opts_out_of_the_log(run_log_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -378,8 +417,10 @@ def test_memory_opts_out_of_the_log(run_log_home: Path, monkeypatch: pytest.Monk
     assert mas.run_state(deck_values("a")).status == "ok"
     explicit = MAS([Agent("a", "Answer {query}", "answer")], llm=MockLLM(), store=":memory:")
     explicit.run("x")
-    assert mas.runs().path is None and cast("Store", explicit.store).path is None
-    assert mas.runs().runs() == () and not (run_log_home / "xmas").exists()
+    assert mas.runs().path is None
+    assert cast("Store", explicit.store).path is None
+    assert mas.runs().runs() == ()
+    assert not (run_log_home / "xmas").exists()
 
 
 def test_writing_the_log_is_quick_and_a_failed_write_warns_once(tmp_path: Path) -> None:
@@ -395,7 +436,8 @@ def test_writing_the_log_is_quick_and_a_failed_write_warns_once(tmp_path: Path) 
     assert took < 0.5, took  # 200 records, events and calls: one insert each
     trace = Trace("q", "o", tuple(replace(RECORD, agent=f"n{i % 3}", step=i) for i in range(200)))
     log.end(trace, {"calls": 200, "cost_usd": 0.0, "uncosted_calls": 0, "active_s": 1.0})
-    assert store.trace("r") == trace and RunLog(store, "r").positions.__next__() == 200
+    assert store.trace("r") == trace
+    assert RunLog(store, "r").positions.__next__() == 200
 
     with sqlite3.connect(tmp_path / "runs.db") as conn:
         conn.execute("DROP TABLE xmas_events")
@@ -411,8 +453,11 @@ def test_a_run_without_its_end_keeps_what_it_wrote(tmp_path: Path) -> None:
     log.record(RECORD)
     log.record(replace(RECORD, agent="inner"), boxed=True)
     crashed = store.trace("r")
-    assert crashed.records == (RECORD,) and crashed.status == "failed" and crashed.query == "q"
-    assert "no end in the store" in cast("str", crashed.error) and crashed.graph_id == "sys"
+    assert crashed.records == (RECORD,)
+    assert crashed.status == "failed"
+    assert crashed.query == "q"
+    assert "no end in the store" in cast("str", crashed.error)
+    assert crashed.graph_id == "sys"
 
 
 def test_no_secret_reaches_the_log(run_log_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -435,7 +480,8 @@ def test_no_secret_reaches_the_log(run_log_home: Path, monkeypatch: pytest.Monke
     assert calls[0]["params"] == {"max_tokens": llm.max_tokens, "temperature": 0.2}
     assert (calls[0]["model"], calls[0]["served_model"]) == ("m", "m")
     files = list((run_log_home / "xmas").iterdir())
-    assert files and not any(secret.encode() in path.read_bytes() for path in files)
+    assert files
+    assert not any(secret.encode() in path.read_bytes() for path in files)
 
 
 def test_xmas_types_load_without_the_unregistered_type_warning(

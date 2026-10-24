@@ -190,7 +190,8 @@ def test_no_key_in_a_repr_or_a_message(tmp_path: Path) -> None:
     assert (config.api_key, config.tools["web"].key) == (KEY, KEY)
     assert KEY not in repr(config) + repr(config.tools["web"]) + str(caught[0].message)
     in_urls = Config(base_url=f"https://me:{KEY}@gw.example/v1?key={KEY}", tools={"web": ToolServer(f"u?token={KEY}")})
-    assert KEY not in repr(in_urls) and "base_url='https://gw.example/v1'" in repr(in_urls)
+    assert KEY not in repr(in_urls)
+    assert "base_url='https://gw.example/v1'" in repr(in_urls)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         Config.load(write(tmp_path, f'[endpoint]\napi_key = "{KEY}"\n', mode=0o600), environ={})
@@ -326,8 +327,10 @@ def test_names_resolve_with_suggestions_and_never_refuse_unchecked() -> None:
         "sonnet": (),
     }
     assert [str(warning) for warning in found.warnings] == [
-        "model 'claude-sonnet-5-5' (agent editor) is not in the catalogue of http://127.0.0.1:8000/v1; "
-        "closest: claude-sonnet-5.5, claude-sonnet-5, claude-opus-5.5",
+        (
+            "model 'claude-sonnet-5-5' (agent editor) is not in the catalogue of http://127.0.0.1:8000/v1; "
+            "closest: claude-sonnet-5.5, claude-sonnet-5, claude-opus-5.5"
+        ),
         "model 'sonnet' is not in the catalogue of http://127.0.0.1:8000/v1; nothing close",
     ]
     first = found.warnings[0]

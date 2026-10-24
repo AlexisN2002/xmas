@@ -135,7 +135,9 @@ def test_approve_pauses_and_resumes(tmp_path: Path) -> None:
     mas = gated(store=Store(tmp_path / "runs.db"))
     events: list[Event] = []
     paused = run(mas, {"query": "cats"}, "r1", events)
-    assert paused.status == "paused" and paused.error is None and paused.outputs == {}
+    assert paused.status == "paused"
+    assert paused.error is None
+    assert paused.outputs == {}
     assert [record.agent for record in paused.records] == ["writer"]
     (question,) = cast("Any", paused.pause).questions
     assert (question.id, question.run_id, question.node, question.form) == ("r1/approve/1", "r1", "approve", "approve")
@@ -152,20 +154,25 @@ def test_approve_pauses_and_resumes(tmp_path: Path) -> None:
 
     time.sleep(0.02)
     done = resume(mas, "r1", {"r1/approve/1": {"approved": True, **TOM}}, events)
-    assert done.status == "ok" and done.pause is None
+    assert done.status == "ok"
+    assert done.pause is None
     approval = done.outputs["approval"]
     assert {k: approval[k] for k in ("approved", "option", "who", "timed_out", "comment")} == {
         "approved": True, "option": "Ship a draft", "who": "tom", "timed_out": False, "comment": None,
     }  # fmt: skip
     assert approval["asked_at"] == question.asked_at
-    assert done.outputs["shipped"] == "ship" and done.outputs["held"] is None
+    assert done.outputs["shipped"] == "ship"
+    assert done.outputs["held"] is None
     assert [record.agent for record in done.records] == ["writer", "approve", "ship"]
     (human,) = done["approve"]
     assert (human.kind, human.cost_usd, human.route, human.visit) == ("human", 0.0, ("ship",), 1)
-    assert human.inputs == {"draft": "a draft"} and human.rendered_prompt == "Ship this? a draft"
-    assert cast("float", human.wait_s) >= 0.02 and cast("float", human.latency_s) < 0.02
+    assert human.inputs == {"draft": "a draft"}
+    assert human.rendered_prompt == "Ship this? a draft"
+    assert cast("float", human.wait_s) >= 0.02
+    assert cast("float", human.latency_s) < 0.02
     assert json.loads(human.raw_response) == approval
-    assert cast("Any", store.run("r1")).status == "ok" and store.question("r1/approve/1").answer == approval  # type: ignore[union-attr]
+    assert cast("Any", store.run("r1")).status == "ok"
+    assert store.question("r1/approve/1").answer == approval  # type: ignore[union-attr]
     with pytest.raises(ValueError, match="is ok, not paused"):
         resume(mas, "r1", {})
     with pytest.raises(ValueError, match="has no run"):
@@ -181,9 +188,12 @@ def test_an_optimizer_keeps_people_where_they_are() -> None:
     mas = gated(asker=Asker(), store=Store())
     updater = GraphUpdater(MechanicalSynthesizer(), TopologyBudget(min_agents=2, max_agents=5, max_edges=8), seed=0)
     fixed = updater.fixed_of(mas)
-    assert fixed is not None and "approve" in fixed.nodes and "approve" in fixed.code
+    assert fixed is not None
+    assert "approve" in fixed.nodes
+    assert "approve" in fixed.code
     rebuilt = updater.rebuild(mas, updater.names_of(mas), updater.edges_of(mas))
-    assert rebuilt.humans == mas.humans and (rebuilt.asker, rebuilt.store) == (mas.asker, mas.store)
+    assert rebuilt.humans == mas.humans
+    assert (rebuilt.asker, rebuilt.store) == (mas.asker, mas.store)
     assert set(rebuilt.agents) == {"writer", "ship", "hold"}
     assert rebuilt.run_state({"query": "cats"}, run_id="o1").status == "paused"
 
@@ -210,9 +220,11 @@ def test_a_pause_lets_other_branches_end() -> None:
     paused = run(both, {"query": "q"}, "u2")
     assert sorted(open_ids(paused)) == ["u2/approve/1", "u2/check/1"]
     still = resume(both, "u2", {"u2/check/1": {"approved": True, **TOM}})
-    assert still.status == "paused" and open_ids(still) == ["u2/approve/1"]
+    assert still.status == "paused"
+    assert open_ids(still) == ["u2/approve/1"]
     done = resume(both, "u2", {"u2/approve/1": {"approved": True, **TOM}})
-    assert done.status == "ok" and [r.agent for r in done.records].count("join") == 1
+    assert done.status == "ok"
+    assert [r.agent for r in done.records].count("join") == 1
     assert done["join"][0].inputs["n3_out"] == "n3"
 
 
@@ -273,11 +285,14 @@ def test_pauses_inside_boxes() -> None:
     assert open_ids(paused) == ["n1/review/1/approve/1"]
     assert paused.agents == ("side",)
     done = resume(mas, "n1", {"n1/review/1/approve/1": {"approved": True, **TOM}})
-    assert done.status == "ok" and done.outputs["approval"]["approved"] is True
+    assert done.status == "ok"
+    assert done.outputs["approval"]["approved"] is True
     (record,) = done["review"]
-    assert record.kind == "box" and [(r.agent, r.kind) for r in cast("Any", record.inner).records] == [
-        ("writer", "agent"), ("approve", "human"),
-    ]  # fmt: skip
+    assert record.kind == "box"
+    assert [(r.agent, r.kind) for r in cast("Any", record.inner).records] == [
+        ("writer", "agent"),
+        ("approve", "human"),
+    ]
 
     # A second human inside the box pauses it again.
     twice = Box("review", boxed_inner(confirm=True), reads={"topic": "query"}, writes={"confirmed": "confirmed"})
@@ -286,7 +301,8 @@ def test_pauses_inside_boxes() -> None:
     second = resume(mas, "b4", {"b4/review/1/approve/1": {"approved": True, **TOM}})
     assert open_ids(second) == ["b4/review/1/confirm/1"]
     done = resume(mas, "b4", {"b4/review/1/confirm/1": {"approved": True, **TOM}})
-    assert done.outputs["confirmed"]["approved"] is True and len(done["review"]) == 1
+    assert done.outputs["confirmed"]["approved"] is True
+    assert len(done["review"]) == 1
 
     # A box in a chain item.
     each = {"review": "page in pages"}
@@ -340,7 +356,8 @@ def test_resume_after_a_restart(tmp_path: Path) -> None:
     time.sleep(0.3)  # the wait counts against no wall limit
     fresh = restartable(path, budget=Budget(max_calls=2, max_wall_s=0.25))
     done = resume(fresh, "r9", {"r9/approve/1": {"approved": True, **TOM}})
-    assert done.status == "ok" and done.outputs["shipped"] == "done"
+    assert done.status == "ok"
+    assert done.outputs["shipped"] == "done"
     assert [r.agent for r in done.records] == ["writer", "approve", "ship"]
     assert done.cost_usd == pytest.approx(0.02)
     assert cast("Any", fresh.runs().run("r9")).totals["calls"] == 2
@@ -349,7 +366,8 @@ def test_resume_after_a_restart(tmp_path: Path) -> None:
     subprocess.run([sys.executable, "-c", RESTART, str(tmp_path / "b.db")], cwd=ROOT, check=True, timeout=120)
     tight = restartable(str(tmp_path / "b.db"), budget=Budget(max_calls=1))
     over = resume(tight, "r9", {"r9/approve/1": {"approved": True, **TOM}})
-    assert over.status == "over_budget" and [r.agent for r in over.records] == ["writer", "approve"]
+    assert over.status == "over_budget"
+    assert [r.agent for r in over.records] == ["writer", "approve"]
 
     # a row whose checkpoints are gone is refused, and the run's id is free again
     later = gated()
@@ -374,7 +392,8 @@ def test_timeouts_take_the_default() -> None:
     never = gated(human=gate(timeout_s=0, default={"approved": False}))
     events: list[Event] = []
     done = run(never, {"query": "q"}, "t1", events)
-    assert done.status == "ok" and "pause" not in [e.kind for e in events]
+    assert done.status == "ok"
+    assert "pause" not in [e.kind for e in events]
     approval = done.outputs["approval"]
     assert (approval["approved"], approval["option"], approval["who"], approval["timed_out"]) == (
         False, "Redraw", None, True,
@@ -390,9 +409,10 @@ def test_timeouts_take_the_default() -> None:
         resume(waits, "t2")
     time.sleep(0.25)
     assert [row.run_id for row in store.due()] == ["t2"]
-    assert [row.run_id for row in store.due(datetime.now())] == ["t2"]  # a time without a zone is local
+    assert [row.run_id for row in store.due(datetime.now())] == ["t2"]  # noqa: DTZ005  a time without a zone is local: the point of this line
     done = resume(waits, "t2")
-    assert done.outputs["approval"]["timed_out"] is True and done.outputs["held"] == "hold"
+    assert done.outputs["approval"]["timed_out"] is True
+    assert done.outputs["held"] == "hold"
     assert store.due() == ()
 
 
@@ -405,11 +425,12 @@ def test_forms_and_answer_checks() -> None:
     paused = run(asked, {"query": "q"}, "f1")
     question = cast("Any", paused.pause).questions[0]
     assert (question.text, question.options) == ("Which for T?", ("short", "long"))
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(ValueError, match="medium") as refused:
         resume(asked, "f1", {"f1/pick/1": {"option": "medium", "extra": 1}})
     assert all(word in str(refused.value) for word in ("medium", "extra", "who"))  # every problem in one error
     store = asked.runs()
-    assert cast("Any", store.run("f1")).status == "paused" and store.question("f1/pick/1").answer is None  # type: ignore[union-attr]
+    assert cast("Any", store.run("f1")).status == "paused"
+    assert store.question("f1/pick/1").answer is None  # type: ignore[union-attr]
     assert resume(asked, "f1", {"f1/pick/1": {"option": "long", **TOM}}).outputs == {}
     assert store.question("f1/pick/1").answer["option"] == "long"  # type: ignore[union-attr,index]
 
@@ -430,7 +451,8 @@ def test_forms_and_answer_checks() -> None:
     run(edited, {"query": "q"}, "f3")
     done = resume(edited, "f3", {"f3/fix/1": {"value": "new", **TOM}})
     (record,) = done["fix"]
-    assert record.outputs["final"] == "new" and json.loads(record.outputs["fixed"])["changed"] is True
+    assert record.outputs["final"] == "new"
+    assert json.loads(record.outputs["fixed"])["changed"] is True
 
 
 def test_askers_and_unattended_runs(tmp_path: Path) -> None:
@@ -451,16 +473,19 @@ def test_askers_and_unattended_runs(tmp_path: Path) -> None:
     events: list[Event] = []
     now = gated(asker=Asker(lambda q: {"approved": True, **TOM}))
     done = run(now, {"query": "q"}, "a2", events)
-    assert done.status == "ok" and done.outputs["shipped"] == "ship"
+    assert done.status == "ok"
+    assert done.outputs["shipped"] == "ship"
     assert [e.kind for e in events if e.node == "approve"] == ["start", "end"]
 
     # Unattended runs replay recorded answers, take the default, or fail by name.
     replayed = gated(asker=ReplayAsker(done)).run("q")
-    assert replayed.status == "ok" and replayed.outputs["approval"]["approved"] is True
+    assert replayed.status == "ok"
+    assert replayed.outputs["approval"]["approved"] is True
     assert replayed.outputs["shipped"] == done.outputs["shipped"]
     assert cast("float", replayed["approve"][0].wait_s) >= 0  # answered when asked again
     defaulted = gated(human=gate(default={"approved": False})).run("q")
-    assert defaulted.outputs["approval"]["timed_out"] is True and defaulted.outputs["held"] == "hold"
+    assert defaulted.outputs["approval"]["timed_out"] is True
+    assert defaulted.outputs["held"] == "hold"
     failed = gated().run("q")
     assert failed.error == "Unanswered: human node 'approve' got no answer in an unattended run"
     assert [r.agent for r in failed.records] == ["writer"]
@@ -492,7 +517,7 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
     def late(prompt: str) -> str:
         if prompt.startswith("n2"):
             holder["mas"].answer("e1", {"e1/approve/1": {"approved": True, **TOM}})
-        return prompt.split()[0]
+        return prompt.split(maxsplit=1)[0]
 
     agents = [Agent("n1", "n1 {query}", "n1_out"), Agent("n2", "n2 {n1_out}", "n2_out", ["n1_out"])]
     ask = Human("approve", "approve", ["query"], "approval", question="Go on with {query}?")
@@ -500,7 +525,8 @@ def test_early_answers(monkeypatch: pytest.MonkeyPatch) -> None:
     holder["mas"] = mas = people(agents, [("n1", "n2")], [ask], llm=MockLLM(late), outputs=outputs)
     events: list[Event] = []
     done = run(mas, {"query": "q"}, "e1", events)
-    assert done.status == "ok" and {"pause", "resume"}.isdisjoint(e.kind for e in events)
+    assert done.status == "ok"
+    assert {"pause", "resume"}.isdisjoint(e.kind for e in events)
     with pytest.raises(ValueError, match="answered already"):
         mas.answer("e1", {"e1/approve/1": {"approved": False, **TOM}})
     with pytest.raises(ValueError, match="no question of run"):
@@ -551,15 +577,20 @@ def test_store_keeps_deadlines_totals_and_threads(tmp_path: Path) -> None:
     run(mas, plan("a", "b"), "s1")
     store = mas.runs()
     (row,) = store.runs("paused")
-    assert row.paused == ("s1/fix/a/1", "s1/fix/b/1") and row.totals is not None and row.totals["calls"] == 2
+    assert row.paused == ("s1/fix/a/1", "s1/fix/b/1")
+    assert row.totals is not None
+    assert row.totals["calls"] == 2
     question = cast("Any", store.question("s1/fix/b/1"))
-    assert question.payload["item_key"] == "b" and question.deadline is None
+    assert question.payload["item_key"] == "b"
+    assert question.deadline is None
     threads = {t for (t,) in store.execute("SELECT DISTINCT thread_id FROM checkpoints")}
     assert threads == {"s1", "s1/drafter/1/0", "s1/drafter/1/1"}
     assert store.prune_runs(0) == ()  # a paused run is kept
     resume(mas, "s1", {"s1/fix/a/1": {"approved": True, **TOM}, "s1/fix/b/1": {"approved": True, **TOM}})
-    assert store.prune_runs(1) == () and store.prune_runs(0) == ("s1",)
-    assert store.run("s1") is None and store.execute("SELECT COUNT(*) FROM checkpoints") == [(0,)]
+    assert store.prune_runs(1) == ()
+    assert store.prune_runs(0) == ("s1",)
+    assert store.run("s1") is None
+    assert store.execute("SELECT COUNT(*) FROM checkpoints") == [(0,)]
 
 
 def test_checkpoints_hold_xmas_types(
@@ -589,8 +620,10 @@ def test_checkpoints_hold_xmas_types(
         done = resume(again, "x1", {"x1/review/1/approve/1": {"approved": True, **TOM}})
     inner_trace = cast("Any", done["review"][0].inner)
     (found,) = inner_trace["finder"]
-    assert found.tool_calls[0].result == "CAT" and isinstance(found.tool_calls, tuple)
-    assert serde_events == [] and not [r for r in caplog.records if "unregistered" in r.getMessage()]
+    assert found.tool_calls[0].result == "CAT"
+    assert isinstance(found.tool_calls, tuple)
+    assert serde_events == []
+    assert not [r for r in caplog.records if "unregistered" in r.getMessage()]
 
 
 def test_events_and_compiled_graphs() -> None:
@@ -601,7 +634,8 @@ def test_events_and_compiled_graphs() -> None:
     human = [(e.kind, e.question, e.visit) for e in events if e.node == "approve"]
     assert human == [("start", None, 1), ("pause", "v1/approve/1", 1), ("resume", "v1/approve/1", 1), ("end", None, 1)]
     (resumed,) = [e for e in events if e.kind == "resume"]
-    assert resumed.wait_s is not None and resumed.wait_s >= 0
+    assert resumed.wait_s is not None
+    assert resumed.wait_s >= 0
     assert {e.run_id for e in events} == {"v1"}
 
     # A human is two nodes, its edges leave from the wait; a system without one compiles as it did.
@@ -609,7 +643,8 @@ def test_events_and_compiled_graphs() -> None:
     assert {"approve", "approve.wait"} <= nodes
     plain = MAS([Agent("writer", "Write {query}", "draft")], llm=MockLLM())
     assert set(plain.compiled.get_graph().nodes) == {"__start__", "writer", "__end__"}
-    assert "asks" not in plain.compiled.channels and "asks" in mas.compiled.channels
+    assert "asks" not in plain.compiled.channels
+    assert "asks" in mas.compiled.channels
 
 
 def test_a_model_without_parts_fails_clearly(png: Path) -> None:
@@ -617,7 +652,8 @@ def test_a_model_without_parts_fails_clearly(png: Path) -> None:
     mas = MAS([Agent("reviewer", "Review {page}", "review", ["page"])], inputs={"page": "image"}, llm=llm)
     llm.full_response = False  # after the check: the parts path is off when the run calls it
     trace = mas.run_state({"page": png})
-    assert trace.status == "failed" and "SeeingLLM cannot send pictures or sound" in str(trace.error)
+    assert trace.status == "failed"
+    assert "SeeingLLM cannot send pictures or sound" in str(trace.error)
 
 
 def test_a_stopped_visit_keeps_its_record() -> None:
@@ -641,7 +677,8 @@ def test_a_stopped_visit_keeps_its_record() -> None:
     agents = [Agent("writer", "Write {query}", "draft"), Agent("judge", "Judge {draft}", "verdict", ["draft"])]
     holder["mas"] = pressed = MAS(agents, [("writer", "judge")], llm=MockLLM(press))
     stopped = pressed.run_state({"query": "q"}, run_id="s2")
-    assert stopped.status == "stopped" and "judge" not in {record.agent for record in stopped.records}
+    assert stopped.status == "stopped"
+    assert "judge" not in {record.agent for record in stopped.records}
 
 
 def test_a_paused_and_resumed_run_is_in_the_run_log() -> None:
@@ -650,8 +687,12 @@ def test_a_paused_and_resumed_run_is_in_the_run_log() -> None:
     store = mas.runs()
     assert store.path is not None
     kept = store.trace("logged")
-    assert kept == paused and kept.status == "paused" and open_ids(kept) == open_ids(paused)
+    assert kept == paused
+    assert kept.status == "paused"
+    assert open_ids(kept) == open_ids(paused)
     done = resume(mas, "logged", {open_ids(paused)[0]: {"approved": True, **TOM}})
-    assert store.trace("logged") == done and done.status == "ok" and len(done.records) == 3
+    assert store.trace("logged") == done
+    assert done.status == "ok"
+    assert len(done.records) == 3
     assert [row.answer is not None for row in store.questions("logged")] == [True]
     assert {"pause", "resume"} <= {event.kind for event in store.events("logged")}

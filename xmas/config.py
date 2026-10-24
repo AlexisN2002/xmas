@@ -54,7 +54,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -63,7 +63,9 @@ from promptolution.llms.base_llm import BaseLLM
 from xmas.llms import APILLM
 from xmas.llms.meta import TokenPrice
 from xmas.media import TEXT_ONLY, Capabilities
-from xmas.tools import ToolSource
+
+if TYPE_CHECKING:
+    from xmas.tools import ToolSource
 
 __all__ = [
     "CATALOGUE_TTL_S",
@@ -219,35 +221,12 @@ class Config:
 
 def read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
     """Parse the file into :class:`Config` fields, naming the key of any problem."""
-    try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        raise ValueError(f"{path}: not a TOML file ({exc})") from None
-
-    def checked(table: Any, kind: str | None, where: str) -> dict[str, Any]:
-        if not isinstance(table, dict):
-            raise ValueError(f"{path}: {where} is a table, not {type(table).__name__}")
-        if kind is None:  # a table of tables, such as [models."<id>"]
-            return table
-        allowed = SCALARS[kind]
-        for key, value in table.items():
-            if key not in allowed:
-                raise ValueError(f"{path}: unknown key '{where}.{key}'; {where} takes {', '.join(allowed)}")
-            want = allowed[key]
-            fits = isinstance(value, (int, float)) if want is float else isinstance(value, want)
-            words = key != "catalogue" or all(isinstance(item, str) for item in value)
-            if isinstance(value, bool) is not (want is bool) or not fits or not words:
-                raise ValueError(f"{path}: {where}.{key} is {SHAPES[want]}, not {type(value).__name__}")
-        for key, alias in (("api_key", "api_key_env"), ("key", "key_env")):
-            if key in table and alias in table:
-                raise ValueError(f"{path}: {where} takes {key} or {alias}, not both")
-        return table
-
+    data = parse_toml(path)
     for key in data:
         if key not in TABLES:
             raise ValueError(f"{path}: unknown table '{key}'; the file takes {', '.join(TABLES)}")
-    endpoint = checked(data.get("endpoint", {}), "endpoint", "endpoint")
-    store = checked(data.get("store", {}), "store", "store")
+    endpoint = checked_table(path, data.get("endpoint", {}), "endpoint", "endpoint")
+    store = checked_table(path, data.get("store", {}), "store", "store")
     values: dict[str, Any] = {
         "base_url": endpoint.get("base_url"),
         "api_key": secret(endpoint, "api_key", environ),
@@ -256,29 +235,85 @@ def read_file(path: Path, environ: Mapping[str, str]) -> dict[str, Any]:
         "media_store": store.get("media"),
         "run_store": store.get("runs"),
     }
+    prices, streams = read_models(path, data)
+    tools = read_tools(path, data, environ)
+    warn_if_others_read_a_key(path, data, endpoint)
+    return {**{k: v for k, v in values.items() if v is not None}, "prices": prices, "streams": streams, "tools": tools}
+
+
+def parse_toml(path: Path) -> dict[str, Any]:
+    """Return the TOML content of ``path``; a file that is not TOML is a ``ValueError`` naming it."""
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{path}: not a TOML file ({exc})") from None
+
+
+def checked_table(path: Path, table: Any, kind: str | None, where: str) -> dict[str, Any]:
+    """Return ``table`` once it is a table whose keys and values fit ``kind``; ``None`` for a table of tables."""
+    if not isinstance(table, dict):
+        raise ValueError(f"{path}: {where} is a table, not {type(table).__name__}")
+    if kind is None:  # a table of tables, such as [models."<id>"]
+        return table
+    allowed = SCALARS[kind]
+    for key, value in table.items():
+        check_scalar(path, allowed, where, key, value)
+    for key, alias in (("api_key", "api_key_env"), ("key", "key_env")):
+        if key in table and alias in table:
+            raise ValueError(f"{path}: {where} takes {key} or {alias}, not both")
+    return table
+
+
+def check_scalar(path: Path, allowed: Mapping[str, type], where: str, key: str, value: Any) -> None:
+    """Refuse a ``key`` the table does not take, or a ``value`` not of the shape it takes."""
+    if key not in allowed:
+        raise ValueError(f"{path}: unknown key '{where}.{key}'; {where} takes {', '.join(allowed)}")
+    want = allowed[key]
+    fits = isinstance(value, (int, float)) if want is float else isinstance(value, want)
+    words = key != "catalogue" or all(isinstance(item, str) for item in value)
+    if isinstance(value, bool) is not (want is bool) or not fits or not words:
+        raise ValueError(f"{path}: {where}.{key} is {SHAPES[want]}, not {type(value).__name__}")
+
+
+def read_models(path: Path, data: Mapping[str, Any]) -> tuple[dict[str, TokenPrice], dict[str, bool]]:
+    """Return the ``[models."<id>"]`` tables as the prices and the stream settings they state."""
     prices, streams = {}, {}
-    for model, entry in checked(data.get("models", {}), None, "models").items():
+    for model, entry in checked_table(path, data.get("models", {}), None, "models").items():
         where = f"models.{json.dumps(model)}"
-        checked(entry, "model", where)
+        checked_table(path, entry, "model", where)
         if "stream" in entry:
             streams[model] = entry["stream"]
         if "price" in entry:
-            price = checked(entry["price"], "price", f"{where}.price")
-            missing = [key for key in ("input_per_m", "output_per_m") if key not in price]
-            if missing:
-                raise ValueError(f"{path}: {where}.price needs {' and '.join(missing)}")
-            prices[model] = TokenPrice(**{key: float(value) for key, value in price.items()})
+            prices[model] = read_price(path, entry["price"], f"{where}.price")
+    return prices, streams
+
+
+def read_price(path: Path, table: Any, where: str) -> TokenPrice:
+    """Return a model's ``price`` table as a :class:`TokenPrice`; both rates are needed."""
+    price = checked_table(path, table, "price", where)
+    missing = [key for key in ("input_per_m", "output_per_m") if key not in price]
+    if missing:
+        raise ValueError(f"{path}: {where} needs {' and '.join(missing)}")
+    return TokenPrice(**{key: float(value) for key, value in price.items()})
+
+
+def read_tools(path: Path, data: Mapping[str, Any], environ: Mapping[str, str]) -> dict[str, ToolServer]:
+    """Return the ``[tools.<name>]`` tables as tool servers, each with its url and key."""
     tools = {}
-    for name, entry in checked(data.get("tools", {}), None, "tools").items():
+    for name, entry in checked_table(path, data.get("tools", {}), None, "tools").items():
         where = f"tools.{name}"
-        checked(entry, "tool", where)
+        checked_table(path, entry, "tool", where)
         if "url" not in entry:
             raise ValueError(f"{path}: {where} needs url")
         tools[name] = ToolServer(entry["url"], secret(entry, "key", environ))
+    return tools
+
+
+def warn_if_others_read_a_key(path: Path, data: Mapping[str, Any], endpoint: Mapping[str, Any]) -> None:
+    """Warn when the file states a key and its mode lets the group or others read it."""
     keyed = "api_key" in endpoint or any("key" in entry for entry in data.get("tools", {}).values())
     if keyed and path.stat().st_mode & (stat.S_IRGRP | stat.S_IROTH):
-        warnings.warn(f"{path} holds a key and others can read it; chmod 600 {path}", UserWarning, stacklevel=3)
-    return {**{k: v for k, v in values.items() if v is not None}, "prices": prices, "streams": streams, "tools": tools}
+        warnings.warn(f"{path} holds a key and others can read it; chmod 600 {path}", UserWarning, stacklevel=4)
 
 
 def secret(table: Mapping[str, Any], key: str, environ: Mapping[str, str]) -> str | None:
@@ -588,7 +623,7 @@ def tool_sources(servers: Mapping[str, Mapping[str, Mapping[str, str]]], config:
     Raises:
         ValueError: For a server the configuration does not list; the message names both remedies.
     """
-    from xmas.tools.mcp import MCPTools  # here, not at the top: MCP is an extra
+    from xmas.tools.mcp import MCPTools  # noqa: PLC0415  here, not at the top: MCP is an extra
 
     sources: list[ToolSource] = []
     for server, writes in servers.items():
