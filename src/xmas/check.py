@@ -5,8 +5,9 @@ expensively: does each value a node reads exist before the node runs, is each
 value written once (or by alternatives), does each prompt placeholder name a
 read, do the names and types of steps and boxes fit, do the edges decide on
 values that exist, and is every node with several incoming edges a merge or a
-join. It collects every problem and raises them together, so one edit cycle
-fixes them all. A version 1 system never comes here; it keeps
+join, and can each agent's model read and write the kinds the agent does. It
+collects every problem and raises them together, so one edit cycle fixes them
+all. A version 1 system never comes here; it keeps
 ``validate_graph`` and ``terminal_agent``.
 
 A ``for each`` chain is checked twice: inside, as a system of its own that one
@@ -17,7 +18,7 @@ reads from outside and writes each value the chain writes as a list.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -37,12 +38,13 @@ from xmas.graph import (
     loop_problems,
     validate_graph,
 )
+from xmas.llms import meta as llm_meta
 from xmas.nodes import Box
 from xmas.predicates import BUILTINS, KEYWORDS, Predicate, PredicateError, parse_predicate
 from xmas.prompts import extract_placeholders
 from xmas.routes import Join, RouteGraph
 from xmas.schemas import compile_form
-from xmas.values import JSON, KINDS, LIST_PREFIX, TEXT, ValueType, fits, parse_type
+from xmas.values import JSON, KINDS, LIST_PREFIX, MEDIA, TEXT, ValueType, fits, media_kind, parse_type
 
 if TYPE_CHECKING:  # pragma: no cover
     import networkx as nx
@@ -57,8 +59,25 @@ MERGE_LAST = "last"
 ROUTED_ERRORS = frozenset(kind.value for kind in ErrorKind if kind not in RUN_ENDS)
 """The error kinds an ``on error`` edge may route; a run always stops on the others."""
 
-AVAILABLE = frozenset({TEXT, JSON})
-"""The value kinds a system may use; a ``list of`` them, at any depth, as well."""
+AVAILABLE = frozenset({TEXT, JSON, *MEDIA})
+"""The value kinds a system may use: every kind; a ``list of`` them, at any depth, as well."""
+
+SENT = ("image", "audio")
+"""The kinds a model reads as content parts, when it accepts them; a ``file`` it reads as its ref's JSON line."""
+
+_CONVERSIONS = {"document": "document_text", "table": "table_rows"}
+"""The built-in :mod:`xmas.convert` step that turns each kind a model never reads into text or rows."""
+
+_supports_parts: Callable[[object], bool] = getattr(
+    llm_meta,
+    "supports_parts",
+    lambda llm: callable(getattr(llm, "generate_parts_with_meta", None)) and getattr(llm, "full_response", 0) is True,
+)
+_supports_images: Callable[[object], bool] = getattr(
+    llm_meta,
+    "supports_images",
+    lambda llm: callable(getattr(llm, "generate_image_with_meta", None)) and getattr(llm, "full_response", 0) is True,
+)
 
 RESERVED_READS = {"error": JSON, "run": JSON}
 """Values xmas fills and no node writes. ``error``, ``{kind, message, node}`` of
@@ -128,24 +147,20 @@ def step_maps(step: Step, item: Tool) -> tuple[dict[str, str], dict[str, str]]:
 
 
 def _schema_type(item: Tool, parameter: str) -> str:
-    """Name a parameter's JSON-schema type for a message."""
+    """Name a parameter's type for a message: its media type, else its JSON-schema type."""
+    vtype = item.reads[parameter]
+    if media_kind(vtype) is not None:
+        return str(vtype)
     schema = item.parameters.get("properties", {}).get(parameter, {})
     return str(schema.get("type", "json")) if isinstance(schema, dict) else "json"
 
 
-def _available(vtype: ValueType) -> bool:
-    """Return whether a system may use a type: an available kind, or a list of an available type."""
-    return vtype in AVAILABLE or (vtype.item is not None and _available(vtype.item))
-
-
-def _value_problems(name: str, vtype: ValueType) -> Iterator[str]:
-    """Say why a value's name or type is not allowed."""
+def _value_problems(name: str) -> Iterator[str]:
+    """Say why a value's name is not allowed."""
     if name in RESERVED:
         yield "is a reserved name; pick another"
     elif name.startswith("__"):
         yield "starts with '__'; such names belong to xmas"
-    if not _available(vtype):
-        yield f"has type {str(vtype)!r}; {vtype} values are not available yet"
 
 
 def _holds_chain(system: MAS) -> bool:
@@ -288,7 +303,7 @@ def _writer_types(
     for name, produced in writes.items():
         for value, vtype in produced.items():
             if name not in heads:
-                problems += [f"{name!r} writes {value!r}, which {problem}" for problem in _value_problems(value, vtype)]
+                problems += [f"{name!r} writes {value!r}, which {problem}" for problem in _value_problems(value)]
             if value in types and types[value] != vtype:
                 problems.append(f"value {value!r} is {types[value]} elsewhere but {name!r} writes it as {vtype}")
             types.setdefault(value, vtype)
@@ -366,13 +381,128 @@ def _read_problems(
                 yield f"{name!r} runs only when {writers[value][0]!r} fails, so it cannot read {value!r}"
             if parameter is None or fits(types[value], parameter[1]):
                 continue
-            inside, _, word = parameter
+            inside, wanted, word = parameter
             if name in mas.boxes:
                 yield f"box {name!r} passes {types[value]} {value!r} to its {word} input {inside!r}"
-            else:
+                continue
+            kind = media_kind(types[value]) or media_kind(wanted)
+            media = "" if kind is None else f", {kind} into {_a(kind)} parameter (xmas.media.{kind.title()}) or a file"
+            yield (
+                f"step {name!r} passes {types[value]} {value!r} to parameter {inside!r} ({word}); "
+                f"text goes into a string parameter only{media}, json into any other"
+            )
+
+
+def _a(kind: str) -> str:
+    """Return ``an image`` or ``a table``: the kind with its article."""
+    return f"{'an' if kind[0] in 'aeiou' else 'a'} {kind}"
+
+
+def _model_words(mas: MAS, agent: Agent) -> tuple[str | None, str]:
+    """Return the name of an agent's model, ``None`` for an unnamed default, and how a message names it."""
+    name = agent.model if agent.model is not None else mas.default_model
+    return name, "the default model" if name is None else f"model {name!r}"
+
+
+def _only(stated: tuple[str, ...]) -> str:
+    """Return what a model takes or gives, such as ``text`` or ``text and audio``."""
+    return " and ".join(dict.fromkeys(("text", *(word for word in stated if word not in ("text", "json")))))
+
+
+def _tuple(stated: tuple[str, ...], kind: str) -> str:
+    """Return the ``accepts`` or ``produces`` attribute a model would need, such as ``("text", "image")``."""
+    return "(" + ", ".join(f'"{word}"' for word in dict.fromkeys(("text", *stated, kind))) + ")"
+
+
+def _capability_problems(mas: MAS, types: Mapping[str, ValueType], members: set[str]) -> Iterator[str]:
+    """Say which agents read or write a kind their model does not take or give, and which steps hand media on badly.
+
+    A model reads an image or audio as a content part, so it must accept the
+    kind and be able to send parts; it never reads a document or a table,
+    which a conversion step turns into text first. An agent writing an image
+    needs a model that produces one, and no tools. A chain's members are its
+    own check's question.
+    """
+    bindable = {*mas.llms, mas.default_model}
+    yield from (f"models names {name!r}, which no agent binds" for name in mas.models if name not in bindable)
+    sends: dict[str, set[str]] = {}
+    paints: set[str] = set()
+    for name, agent in mas.agents.items():
+        if name in members:
+            continue
+        capabilities = mas.capabilities(agent)
+        model, called = _model_words(mas, agent)
+        for value in agent.inputs:
+            kind = media_kind(types[value]) if value in types else None
+            if kind in _CONVERSIONS:
                 yield (
-                    f"step {name!r} passes {types[value]} {value!r} to parameter {inside!r} ({word}); "
-                    "text goes into a string parameter only, json into any other"
+                    f"agent {name!r} reads {kind} {value!r}; a model reads {_a(kind)} through a conversion step, "
+                    f"such as one using xmas.convert.{_CONVERSIONS[kind]}"
+                )
+            elif kind in SENT and capabilities.takes(kind):
+                sends.setdefault(called, set()).add(kind)
+            elif kind in SENT:
+                fix = (
+                    f"give it accepts = {_tuple(capabilities.accepts, kind)}"
+                    if model is None
+                    else f"bind a model that accepts {kind} (models: {{{model}: {{accepts: [{kind}]}}}})"
+                )
+                yield (
+                    f"agent {name!r} reads {kind} {value!r}, but {called} accepts only "
+                    f"{_only(capabilities.accepts)}; {fix} or convert it first with a step"
+                )
+        written = media_kind(parse_type(agent.output_type))
+        if written is None:
+            continue
+        if written != "image":
+            yield f"agent {name!r} writes {written} {agent.output!r}; a model answers with text, json or image"
+        elif agent.tools:
+            yield f"agent {name!r} writes image and has tools; an image answer takes none"
+        elif not capabilities.gives("image"):
+            fix = (
+                f"give it produces = {_tuple(capabilities.produces, 'image')}"
+                if model is None
+                else f"bind a model that produces image (models: {{{model}: {{produces: [image]}}}})"
+            )
+            yield (
+                f"agent {name!r} writes image {agent.output!r}, but {called} produces only "
+                f"{_only(capabilities.produces)}; {fix}"
+            )
+        else:
+            paints.add(called)
+    llms = {
+        _model_words(mas, agent)[1]: mas.llms.get(agent.model) if agent.model is not None else mas.llm
+        for agent in mas.agents.values()
+    }
+    for called, kinds in sends.items():
+        if llms[called] is not None and not _supports_parts(llms[called]):
+            yield (
+                f"{called} accepts {' and '.join(sorted(kinds))} but cannot send content parts; "
+                "use APILLM, or give it generate_parts_with_meta and full_response = True"
+            )
+    for called in sorted(paints):
+        if llms[called] is not None and not _supports_images(llms[called]):
+            yield (
+                f"{called} produces image but cannot answer with images; "
+                "use APILLM, or give it generate_image_with_meta and full_response = True"
+            )
+    yield from _remote_media_problems(mas, types, members)
+
+
+def _remote_media_problems(mas: MAS, types: Mapping[str, ValueType], members: set[str]) -> Iterator[str]:
+    """Say which steps pass a media value to a remote tool, which reads text and json only."""
+    for name, step in mas.steps.items():
+        try:
+            item, _source = mas.resolve_callable(step)
+        except ValueError:  # named by the node's own problems
+            continue
+        if name in members or item.fn is not None:
+            continue
+        for value in step_maps(step, item)[0].values():
+            if value in types and media_kind(types[value]) is not None:
+                yield (
+                    f"step {name!r} passes {media_kind(types[value])} {value!r} to remote tool {step.uses!r}; "
+                    "remote tools read no media"
                 )
 
 
@@ -514,7 +644,7 @@ def _chains(
             found.append(f"for each {each} runs over {root} {each.root!r}; a chain runs over json or a list")
         if each.key is not None and item != JSON:
             found.append(f"key {each.key!r} needs json items, not {item}")
-        found += [f"the item {each.item!r} {problem}" for problem in _value_problems(each.item, item)]
+        found += [f"the item {each.item!r} {problem}" for problem in _value_problems(each.item)]
         if each.item in types:
             found.append(f"the item {each.item!r} is an input or a written value too; give it a name of its own")
         found += [
@@ -555,8 +685,8 @@ def check_system(mas: MAS) -> SystemInfo:
     nodes: dict[str, Agent | Step | Box] = {**mas.agents, **mas.steps, **mas.boxes}
     problems = [f"node {name!r}: names starting with '__' belong to xmas" for name in nodes if name.startswith("__")]
     problems += [f"frozen names {name!r}, which is no node" for name in sorted(mas.frozen - set(nodes))]
-    for name, vtype in mas.inputs.items():
-        problems += [f"input {name!r} {problem}" for problem in _value_problems(name, vtype)]
+    for name in mas.inputs:
+        problems += [f"input {name!r} {problem}" for problem in _value_problems(name)]
     reads, writes, io_problems = _node_io(mas, nodes)
     shapes, shape_problems = find_chains(list(nodes), mas.edges, {n: f for n, f in mas.each.items() if n in nodes})
     members = {name for shape in shapes for name in shape.nodes}
@@ -597,6 +727,7 @@ def check_system(mas: MAS) -> SystemInfo:
             problems += _read_problems(mas, flow_reads, typed, writers, routes, before, erred)
             problems += _predicate_problems(mas, predicates, typed, writers, before, erred)
     problems += _writer_count_problems(mas, writers, routes)
+    problems += _capability_problems(mas, {**RESERVED_READS, **types}, members)
     for name, vtype in mas.outputs.items():
         if name not in types:
             problems.append(f"output {name!r} is neither an input nor written by any node")

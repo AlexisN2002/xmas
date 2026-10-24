@@ -252,8 +252,17 @@ COUNT, PUBLISH, APOLOGY = STEPS
             id="text into an int parameter",
         ),
         pytest.param(
-            {"inputs": {"query": "text", "photo": "image"}},
-            [r"input 'photo' has type 'image'; image values are not available yet"],
+            {
+                "inputs": {"query": "text", "photo": "image"},
+                "agents": [{**WRITER, "reads": [*WRITER["reads"], "photo"]}, JUDGE],
+                "prompts": {**PROMPTS, "writer": PROMPTS["writer"] + " {photo}"},
+            },
+            [
+                re.escape(
+                    "agent 'writer' reads image 'photo', but model 'text-model' accepts only text; bind a model that "
+                    "accepts image (models: {text-model: {accepts: [image]}}) or convert it first with a step"
+                )
+            ],
             id="image",
         ),
         pytest.param(
