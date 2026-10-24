@@ -1,7 +1,8 @@
 """Spec version 2: the worked examples round-trip, the check names every problem, describe is plain data.
 
 The media example's models section round-trips too, and the check refuses every agent whose model cannot read or
-write the kinds it does.
+write the kinds it does. The humans example's human nodes and ``first of`` race round-trip, the check names every
+problem of a human node and of a race, and a human node's questions and answers work without a run.
 
 These run on construction, serialization and ``describe()`` alone; running a
 version 2 system is tested in ``test_steps.py``, ``test_operators.py`` and
@@ -13,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,14 +26,19 @@ from xmas.chains import ForEach
 from xmas.check import check_system
 from xmas.convert import document_text
 from xmas.edges import Edge, EdgeKind, dump_edges, parse_edges
-from xmas.health import HealthSettings
+from xmas.errors import RunStatus
+from xmas.health import HealthSettings, summarize
+from xmas.human import ANSWER_FIELDS, FORMS, Human, Pause, Question, ReplayAsker, answer_value, fill, question_id
 from xmas.media import TEXT_ONLY, Capabilities, File
 from xmas.nodes import Box, Step
 from xmas.optimization.graph_updater import GraphUpdater
 from xmas.optimization.synthesis import MechanicalSynthesizer
 from xmas.optimization.topology import TopologyBudget
 from xmas.routes import Join
+from xmas.store import Store
 from xmas.tools import Tool, ToolSource, tool
+from xmas.trace import AgentRecord, Event, Trace
+from xmas.values import ValueType
 
 from .conftest import (
     DECK,
@@ -1184,3 +1191,623 @@ def test_capabilities_resolve_in_order(png: Path) -> None:
     assert weighed.describe()["nodes"][0]["reads"] == {"png": "image"}
     trace = weighed.run_state({"png": png})
     assert trace.error is None and trace.output == "6"
+
+
+@tool(writes={"deck": "json"})
+def assemble_final(final_draft: list[str]) -> dict[str, Any]:
+    """Put the final pages together."""
+    return {"pages": final_draft}
+
+
+HUMANS = """\
+version: 2
+inputs: {plan: json}
+outputs: {deck: json, approval: json, notes: text}
+agents:
+- {name: drafter, model: writer-model, for each: {item: page, in: plan.slides, key: id}, reads: {slide: page},
+   writes: {draft: text}}
+- {name: outline, model: small-model, reads: [plan], writes: {outline: text}}
+- {name: quick_notes, model: small-model, prompt: notes, reads: [outline], writes: {notes: text}}
+- {name: careful_notes, model: writer-model, prompt: notes, reads: [outline], writes: {notes: text}}
+steps:
+- {name: assemble, uses: assemble_final}
+humans:
+- {name: fix_title, form: edit, for each: page in plan.slides, reads: [page, draft],
+   writes: {answer: title_fix, value: final_draft}, question: "Slide {page.id}: fix the title if it does not say the claim.",
+   edits: draft}
+- {name: approve, form: approve, reads: [deck, plan], writes: approval, question: "Ship '{plan.title}'?",
+   labels: {'yes': "Ship all slides of {plan.title}", 'no': "Hold the deck"}, timeout_s: 86400, default: {approved: false}}
+edges:
+- drafter -> fix_title -> assemble -> approve
+- 'outline -> quick_notes': first of
+- 'outline -> careful_notes': first of
+callables:
+  assemble_final: {kind: python, import: 'tests.test_spec:assemble_final', reads: {final_draft: json}, writes: {deck: json}}
+prompts:
+  drafter: "Draft slide {slide}."
+  outline: "Outline speaker notes for {plan}."
+  notes: "Write speaker notes from this outline: {outline}"
+"""  # noqa: E501
+"""An edit per slide in a chain, a race of two note writers, and an approve gate that times out after a day."""
+
+HUMANS_DATA: dict[str, Any] = yaml.safe_load(HUMANS)
+
+
+def load_humans(data: dict[str, Any] | None = None) -> MAS:
+    return MAS.from_dict(
+        copy.deepcopy(HUMANS_DATA if data is None else data),
+        llms={"writer-model": MockLLM(), "small-model": MockLLM()},
+        tools=[assemble_final],
+    )
+
+
+def test_humans_and_races_round_trip() -> None:
+    mas = load_humans()
+    assert (mas.version, list(mas.humans), list(mas.nodes)[-1]) == (2, ["fix_title", "approve"], "approve")
+    approve, fix_title = mas.humans["approve"], mas.humans["fix_title"]
+    assert approve.labels == {"yes": "Ship all slides of {plan.title}", "no": "Hold the deck"}
+    assert (approve.answer, approve.written, fix_title.written) == (
+        "approval",
+        ("approval",),
+        ("title_fix", "final_draft"),
+    )
+    assert mas.each["fix_title"] == ForEach("page", "plan.slides")
+    info = mas._checked()
+    assert (info.humans, info.races) == (("drafter", "approve"), {"outline": ("quick_notes", "careful_notes")})
+    assert info.chains["drafter"].system._checked().humans == ("fix_title",)  # the human inside the item's system
+    assert {name: str(info.types[name]) for name in ("title_fix", "final_draft", "approval", "notes")} == {
+        "title_fix": "list of json",
+        "final_draft": "list of text",
+        "approval": "json",
+        "notes": "text",
+    }
+    assert info.joins[END] == Join("join", (("quick_notes", "careful_notes"), ("approve",)), ("__in__.__end__.0", None))
+    assert mas.edges[-1] == Edge("outline", "careful_notes", EdgeKind.FIRST)
+
+    spec = mas.to_dict()
+    assert spec == HUMANS_DATA
+    assert list(spec) == [
+        "version", "inputs", "outputs", "agents", "steps", "humans", "edges", "callables", "prompts"
+    ]  # fmt: skip
+    assert list(spec["humans"][0]) == ["name", "form", "for each", "reads", "writes", "question", "edits"]
+    assert list(spec["humans"][1]) == [
+        "name", "form", "reads", "writes", "question", "labels", "timeout_s", "default"
+    ]  # fmt: skip
+    again = load_humans(json.loads(json.dumps(spec)))
+    assert again.to_dict() == spec and again.structure == mas.structure  # idempotent
+    unquoted = yaml.safe_load(HUMANS.replace("'yes'", "yes").replace("'no'", "no"))  # YAML reads them as booleans
+    assert load_humans(unquoted).humans["approve"] == approve
+    assert dump_edges(parse_edges(spec["edges"])) == spec["edges"]
+
+    # describe names the human nodes and the race; the structure follows every setting but the question text
+    described = mas.describe()
+    humans = [node for node in described["nodes"] if node["kind"] == "human"]
+    assert humans == [
+        {
+            "name": "fix_title",
+            "kind": "human",
+            "form": "edit",
+            "reads": {"page": "json", "draft": "text"},
+            "writes": {"title_fix": "json", "final_draft": "text"},
+            "for each": "page in plan.slides",
+        },
+        {
+            "name": "approve",
+            "kind": "human",
+            "form": "approve",
+            "reads": {"deck": "json", "plan": "json"},
+            "writes": {"approval": "json"},
+            "timeout_s": 86400,
+        },
+    ]
+    assert [edge["kind"] for edge in described["edges"] if edge["from"] == "outline"] == ["first of", "first of"]
+    asked = copy.deepcopy(HUMANS_DATA)
+    asked["humans"][1]["question"] = "Ship it?"
+    assert load_humans(asked).structure == mas.structure and load_humans(asked).describe()["id"] == described["id"]
+    relabelled = copy.deepcopy(HUMANS_DATA)
+    relabelled["humans"][1]["labels"]["no"] = "Redraw"
+    assert load_humans(relabelled).structure != mas.structure
+    shorter = copy.deepcopy(HUMANS_DATA)
+    shorter["humans"][1]["timeout_s"] = 60
+    assert load_humans(shorter).describe()["id"] != described["id"]
+
+    # the asker and the store are runtime: copied by reference, never in the spec
+    asker, store = ReplayAsker([]), Store()
+    held = load_humans()
+    held.asker, held.store = asker, store
+    copied = held.copy()
+    assert (copied.asker, copied.store, copied.humans) == (asker, store, held.humans)
+    assert copied.to_dict() == spec and held._v2_kwargs()["humans"] == tuple(held.humans.values())
+    assert held._runs() is store and isinstance(mas._runs(), Store) and mas._runs() is mas._runs()
+    assert held._checked().chains["drafter"].system._runs() is store  # a chain's items keep the outer runs
+
+
+def test_a_human_makes_a_system_version_2() -> None:
+    gate = Human("approve", "approve", ["draft"], "approval", question="Ship this? {draft}")
+    writer = Agent("writer", "Write {query}", "draft")
+    mas = MAS([writer], humans=[gate], edges=[("writer", "approve")], llm=MockLLM())
+    assert (mas.version, mas._checked().humans, mas.describe()["nodes"][1]["kind"]) == (2, ("approve",), "human")
+    alone = MAS([], humans=[Human("pick", "ask", ["query"], options=["a", "b"])], outputs={"answer": "json"})
+    assert alone.to_dict()["humans"] == [{"name": "pick", "form": "ask", "reads": ["query"], "writes": "answer",
+                                          "options": ["a", "b"]}]  # fmt: skip
+    with pytest.raises(ValueError, match="humans, inputs, outputs"):
+        MAS([writer], humans=[gate], edges=[("writer", "approve")], llm=MockLLM(), version=1)
+    with pytest.raises(ValueError, match=r"Node names must be unique: \['writer'\]"):
+        MAS([writer], humans=[Human("writer", "approve", ["query"])], llm=MockLLM())
+    assert mas.copy().structure == mas.structure and "human approve" in mas.structure
+    assert Human("r", "judge", {"left": "a", "right": "b"}, pair=["left", "right"]).to_dict()["reads"] == {
+        "left": "a",
+        "right": "b",
+    }
+    # an edit's value has the type of what it edits: an input, or its chain's item
+    fix = Human("fix", "edit", ["title"], {"answer": "fix", "value": "final"}, edits="title")
+    retitled = MAS([], humans=[fix], inputs={"title": "text"}, outputs={"final": "text"})
+    per_item = MAS([], humans=[fix], inputs={"titles": "list of text"}, each={"fix": "title in titles"},
+                   outputs={"final": "list of text"})  # fmt: skip
+    assert str(retitled._checked().types["final"]) == "text" and per_item._checked().humans == ("fix",)
+    assert per_item._checked().chains["fix"].writes == {"fix": ValueType("json"), "final": ValueType("text")}
+    refused: list[tuple[dict[str, Any], str]] = [
+        ({"name": ""}, "needs a name"),
+        ({"reads": "draft"}, "reads is a list of texts"),
+        ({"reads": {"d": ""}}, "reads must name values"),
+        ({"writes": {"answer": 3}}, "writes is a value name"),
+        ({"options": [1, 2]}, "options is a list of texts"),
+        ({"pair": "ab"}, "pair is a list of texts"),
+        ({"labels": ["yes"]}, "labels is a mapping"),
+        ({"edits": 3}, "edits names a read"),
+        ({"timeout_s": True}, "timeout_s is a number"),
+    ]
+    for settings, phrase in refused:
+        with pytest.raises(ValueError, match=phrase):
+            Human(**{"name": "h", "form": "ask", **settings})
+
+
+HUMAN_BASE = """\
+version: 2
+inputs: {plan: json}
+outputs: {approval: json}
+agents:
+- {name: writer, reads: [plan], writes: {draft: text}}
+humans:
+- {name: approve, form: approve, reads: [draft, plan], writes: approval, question: "Ship {plan.title}?"}
+edges:
+- writer -> approve
+prompts: {writer: "Write {plan}."}
+"""
+"""A writer and an approve gate; each case of the human check changes the gate."""
+
+
+def gate(**fields: Any) -> MAS:
+    """The base system with the gate's fields replaced, ``None`` dropping one; ``spec`` replaces top-level keys."""
+    data: dict[str, Any] = yaml.safe_load(HUMAN_BASE)
+    data.update(fields.pop("spec", {}))
+    entry = {key: value for key, value in {**data["humans"][0], **fields}.items() if value is not None}
+    return MAS.from_dict({**data, "humans": [entry]}, llm=MockLLM())
+
+
+def routed(when: str) -> dict[str, Any]:
+    """The base system's spec with a ``ship`` node the gate routes to when ``when`` holds, else to the end."""
+    data: dict[str, Any] = yaml.safe_load(HUMAN_BASE)
+    return {
+        "agents": [*data["agents"], {"name": "ship", "reads": ["draft"], "writes": {"shipped": "text"}}],
+        "outputs": {"approval": "json", "shipped": "text"},
+        "edges": ["writer -> approve", {"approve -> ship": {"when": when}}, {f"approve -> {END}": "else"}],
+        "prompts": {**data["prompts"], "ship": "Ship {draft}."},
+    }
+
+
+def test_the_gate_checks() -> None:
+    assert gate()._checked().humans == ("approve",)
+    assert gate(form="ask", options="plan.choices")._checked().humans == ("approve",)
+    timed = gate(timeout_s=0, default=None, spec=routed("approval.approved"))  # the else edge takes a timeout
+    assert timed._checked().joins[END].kind == "merge"
+
+
+@pytest.mark.parametrize(
+    ("build", "phrase"),
+    [
+        pytest.param(lambda: gate(form="vote"), r"human 'approve': form 'vote' is not one of", id="unknown form"),
+        pytest.param(
+            lambda: gate(options=["a", "b"]),
+            r"human 'approve': options belongs to the ask form, not to approve",
+            id="field foreign to the form",
+        ),
+        pytest.param(lambda: gate(form="ask"), r"an ask node needs options", id="ask without options"),
+        pytest.param(
+            lambda: gate(form="ask", options="draft"),
+            r"human 'approve': options 'draft' reads text 'draft'; options read from state are a list of text",
+            id="path option not a list of text",
+        ),
+        pytest.param(
+            lambda: gate(form="ask", options="notes"),
+            r"options 'notes' is not the path of a read",
+            id="path option not a read",
+        ),
+        pytest.param(
+            lambda: gate(form="judge", pair=["draft", "draft"]),
+            r"pair names two different reads of \['draft', 'plan'\], got \['draft', 'draft'\]",
+            id="judge pair not two reads",
+        ),
+        pytest.param(lambda: gate(form="judge"), r"a judge node needs a pair", id="judge without a pair"),
+        pytest.param(
+            lambda: gate(form="edit", edits="title", writes={"answer": "approval", "value": "final"}),
+            r"edits names one of its reads \['draft', 'plan'\], got 'title'",
+            id="edit edits not a read",
+        ),
+        pytest.param(
+            lambda: gate(form="edit", edits="draft"),
+            r"human 'approve': the edit form writes \['answer', 'value'\], got \['answer'\]",
+            id="edit without writes value",
+        ),
+        pytest.param(
+            lambda: gate(question="Ship {deck}?"),
+            r"placeholder 'deck' is not among its reads \['draft', 'plan'\]",
+            id="template placeholder not read",
+        ),
+        pytest.param(
+            lambda: gate(question="Ship {draft.title}?"),
+            r"placeholder 'draft.title' reads a field of text 'draft'",
+            id="field of a text",
+        ),
+        pytest.param(
+            lambda: gate(labels={"maybe": "Later"}),
+            r"labels sets 'maybe'; an approve node labels 'yes' and 'no'",
+            id="label key not yes or no",
+        ),
+        pytest.param(
+            lambda: gate(timeout_s=60),
+            r"human 'approve' times out after 60 s with no default; give a default or else edge",
+            id="timeout without default",
+        ),
+        pytest.param(
+            lambda: gate(default={"pick": "draft"}),
+            r"default sets \['pick'\]; the approve form's answer takes \['approved', 'option', 'comment'\]",
+            id="default field foreign to the form",
+        ),
+        pytest.param(
+            lambda: gate(default={"approved": "no"}),
+            r"default approved is true or false, got 'no'",
+            id="default of the wrong type",
+        ),
+        pytest.param(
+            lambda: gate(timeout_s=-1, default={"approved": False}),
+            r"timeout_s is -1; give 0 or more seconds",
+            id="negative timeout",
+        ),
+        pytest.param(
+            lambda: MAS(
+                [Agent("writer", "Write {query}", "draft")],
+                [("writer", "approve")],
+                humans=[Human("approve", "approve", ["draft"])],
+                llm=MockLLM(),
+                version=1,
+            ),
+            r"Steps, boxes, humans, inputs, outputs",
+            id="human in a version 1 system",
+        ),
+        pytest.param(lambda: gate(writes="len"), r"'approve' writes 'len', which is a reserved name", id="reserved"),
+        pytest.param(
+            lambda: gate(spec={"outputs": {"approval": "text"}}),
+            r"output 'approval' is declared text but is json",
+            id="writes typed other than json",
+        ),
+        pytest.param(
+            lambda: gate(reads=["draft", "plan", "run"]),
+            r"human 'approve' reads 'run'; a human reads values nodes write, not 'error' or 'run'",
+            id="run read",
+        ),
+        pytest.param(
+            lambda: gate(reads=["draft", "plan", "notes"]),
+            r"'approve' reads 'notes', which is neither an input nor written by any node",
+            id="read not written",
+        ),
+        pytest.param(
+            lambda: gate(spec=routed("approval.yes")),
+            r"edge approve -> ship reads approval.yes, but 'approve''s answer has the fields \['approved', 'option'",
+            id="routing on a field the answer lacks",
+        ),
+        pytest.param(
+            lambda: MAS.from_dict(
+                {**yaml.safe_load(HUMAN_BASE), "humans": [{"name": "approve", "form": "approve", "writes": 3}]},
+                llm=MockLLM(),
+            ),
+            r"Human 'approve' needs 'writes' to be a string or a mapping, got 3",
+            id="spec shape",
+        ),
+        pytest.param(
+            lambda: MAS(
+                [Agent("writer", "Write {plan}", "draft", inputs=["plan"])],
+                [("writer", "approve")],
+                humans=[Human("approve", "approve", ["draft"], "approval")],
+                inputs={"plan": "json"},
+                outputs={"approval": "json"},
+                retry={"approve": {"outage": 1}},
+                llm=MockLLM(),
+            ),
+            r"human 'approve' takes no retry",
+            id="retry on a human",
+        ),
+        pytest.param(
+            lambda: load_humans(
+                {
+                    **HUMANS_DATA,
+                    "humans": [
+                        {**HUMANS_DATA["humans"][0], "question": "Slide {page.id}: {title}"},
+                        HUMANS_DATA["humans"][1],
+                    ],
+                }
+            ),
+            r"chain 'drafter': human 'fix_title': placeholder 'title' is not among its reads",
+            id="a human inside a chain",
+        ),
+    ],
+)
+def test_check_names_every_human_problem(build: Any, phrase: str) -> None:
+    with pytest.raises(ValueError) as info:
+        build()
+    assert re.search(phrase, str(info.value)), str(info.value)
+
+
+RACE = """\
+version: 2
+outputs: {notes: text}
+agents:
+- {name: outline, writes: {outline: text}}
+- {name: quick, prompt: notes, reads: [outline], writes: {notes: text}}
+- {name: careful, prompt: notes, reads: [outline], writes: {notes: text}}
+edges:
+- 'outline -> quick': first of
+- 'outline -> careful': first of
+prompts: {outline: "Outline {query}.", notes: "Notes from {outline}."}
+"""
+"""A race of two note writers; each case of the race check changes it."""
+
+
+def race(*agents: dict[str, Any], edges: list[Any] | None = None, **spec: Any) -> MAS:
+    """The race with agents added, its edges replaced and top-level keys set."""
+    data: dict[str, Any] = yaml.safe_load(RACE)
+    data["agents"] += agents
+    data["edges"] = data["edges"] if edges is None else edges
+    data["prompts"].update({agent["name"]: f"Do {{{agent['reads'][0]}}}." for agent in agents if "prompt" not in agent})
+    return MAS.from_dict({**data, **spec}, llm=MockLLM())
+
+
+FIRST = [{"outline -> quick": "first of"}, {"outline -> careful": "first of"}]
+
+
+def test_a_race_checks() -> None:
+    info = race()._checked()
+    assert info.races == {"outline": ("quick", "careful")} and info.writers["notes"] == ("quick", "careful")
+    assert info.joins[END].kind == "merge"  # the winner's writes arrive
+    polish = {"name": "polish", "reads": ["notes"], "writes": {"final": "text"}}
+    joined = race(polish, edges=[*FIRST, "quick -> polish", "careful -> polish"], outputs={"final": "text"})
+    assert joined._checked().joins["polish"].kind == "merge"
+
+
+@pytest.mark.parametrize(
+    ("build", "phrase"),
+    [
+        pytest.param(
+            lambda: race(edges=[FIRST[0], "outline -> careful"], state={"notes": {"merge": "last"}}),
+            r"the first of race from 'outline' has one contestant, 'quick'; a race needs two or more",
+            id="one contestant",
+        ),
+        pytest.param(
+            lambda: MAS.from_dict(
+                {
+                    **yaml.safe_load(RACE),
+                    "agents": [
+                        {"name": "outline", "writes": {"outline": "text"}},
+                        {"name": "quick", "prompt": "notes", "reads": ["outline"], "writes": {"notes": "text"}},
+                        {"name": "careful", "prompt": "notes", "reads": ["outline"], "writes": {"long_notes": "text"}},
+                    ],
+                },
+                llm=MockLLM(),
+            ),
+            r"its contestants write differently \{'quick': \{'notes': 'text'\}, 'careful': \{'long_notes': 'text'\}\}",
+            id="unequal writes",
+        ),
+        pytest.param(
+            lambda: MAS(
+                [
+                    Agent("outline", "Outline {plan}", "outline", inputs=["plan"]),
+                    Agent("quick", "Notes {outline}", "notes", inputs=["outline"]),
+                    Agent("careful", "Notes {outline} {page}", "notes", inputs=["outline", "page"]),
+                ],
+                [Edge("outline", "quick", EdgeKind.FIRST), Edge("outline", "careful", EdgeKind.FIRST)],
+                inputs={"plan": "json"},
+                outputs={"notes": "text"},
+                each={"careful": "page in plan"},
+                llm=MockLLM(),
+            ),
+            r"'careful' is a chain head; agents, steps and boxes race",
+            id="chain head contestant",
+        ),
+        pytest.param(
+            lambda: MAS(
+                [
+                    Agent("outline", "Outline {query}", "outline"),
+                    Agent("quick", "Notes {outline}", "notes", ["outline"]),
+                ],
+                [Edge("outline", "quick", EdgeKind.FIRST), Edge("outline", "careful", EdgeKind.FIRST)],
+                humans=[Human("careful", "approve", ["outline"], "verdict")],
+                outputs={"notes": "text"},
+                llm=MockLLM(),
+            ),
+            r"'careful' is a human node; agents, steps and boxes race",
+            id="human contestant",
+        ),
+        pytest.param(
+            lambda: race(
+                {"name": "fallback", "reads": ["outline"], "writes": {"apology": "text"}},
+                edges=[*FIRST, {"careful -> fallback": {"on error": "any"}}],
+                outputs={"notes": "text", "apology": "text"},
+            ),
+            r"'careful' has an on error edge; a contestant's failure is the race's",
+            id="error edge on a contestant",
+        ),
+        pytest.param(
+            lambda: race(
+                {"name": "a", "reads": ["notes"], "writes": {"x": "text"}},
+                {"name": "b", "reads": ["notes"], "writes": {"y": "text"}},
+                edges=[*FIRST, "careful -> a", "careful -> b", "quick -> a"],
+                outputs={"x": "text", "y": "text"},
+            ),
+            r"'careful' has 2 out-edges; a contestant has one plain edge or none",
+            id="two out-edges",
+        ),
+        pytest.param(
+            lambda: race(
+                {"name": "polish", "reads": ["notes"], "writes": {"final": "text"}},
+                edges=[*FIRST, "quick -> polish"],
+                outputs={"final": "text", "notes": "text"},
+            ),
+            r"its contestants go on to different nodes \{'quick': 'polish', 'careful': '__end__'\}",
+            id="differing next nodes",
+        ),
+        pytest.param(
+            lambda: race(
+                {"name": "second", "reads": ["query"], "writes": {"other": "text"}},
+                {"name": "third", "prompt": "notes", "reads": ["outline"], "writes": {"notes": "text"}},
+                edges=[*FIRST, "outline -> second", {"second -> careful": "first of"}, {"second -> third": "first of"}],
+                outputs={"notes": "text"},
+                state={"notes": {"merge": "last"}},
+            ),
+            r"'careful' runs in 2 first of races; a node races in one",
+            id="a contestant in two races",
+        ),
+        pytest.param(
+            lambda: race(
+                {"name": "skip", "reads": ["outline"], "writes": {"notes": "text"}},
+                edges=[*FIRST, {"outline -> skip": {"when": "true"}}, {"outline -> END": "else"}],
+            ),
+            r"'outline' also decides with when, switch or else edges; race from a node of its own",
+            id="a deciding race source",
+        ),
+    ],
+)
+def test_check_names_every_race_problem(build: Any, phrase: str) -> None:
+    with pytest.raises(ValueError) as info:
+        build()
+    assert re.search(phrase, str(info.value)), str(info.value)
+
+
+NOW = datetime(2026, 10, 24, 9, 0, tzinfo=UTC)
+GATE_PLAN = {"title": "Deck", "choices": ["short", {"label": "long"}]}
+
+
+def test_questions_and_answers_without_a_run() -> None:
+    approve = Human(
+        "approve", "approve", ["deck", "plan"], "approval", question="Ship '{plan.title}'?",
+        labels={"yes": "Ship {plan.title}"}, timeout_s=60, default={"approved": False},
+    )  # fmt: skip
+    types = {"deck": ValueType("json"), "plan": ValueType("json")}
+    question = approve.ask({"deck": {"pages": 2}, "plan": GATE_PLAN}, types, run_id="r1", visit=1, now=NOW)
+    assert (question.id, question.text, question.options) == ("r1/approve/1", "Ship 'Deck'?", ("Ship Deck", "Reject"))
+    assert question.shown == {"deck": '{"pages": 2}', "plan": json.dumps(GATE_PLAN)}
+    assert question.deadline == (NOW + timedelta(seconds=60)).isoformat() and not question.due(NOW)
+    assert question.due(NOW + timedelta(seconds=60))
+    assert Question.from_dict(json.loads(json.dumps(question.to_dict()))) == question
+    assert Pause("r1", (question,)).to_dict() == {"run_id": "r1", "questions": [question.to_dict()]}
+    assert (
+        question_id("r1", "fix", 2, item=3) == "r1/fix/3/2"
+        and question_id("r1", "fix", 1, 0, "intro") == "r1/fix/intro/1"
+    )
+    assert fill("{plan.title} {plan.missing} {other} {{plan}}", {"plan": GATE_PLAN}, types) == "Deck  {other} {{plan}}"
+
+    later = NOW + timedelta(seconds=30)
+    answer = answer_value(question, {"approved": True, "who": "tom"}, now=later)
+    assert answer == {
+        "approved": True,
+        "option": "Ship Deck",
+        "who": "tom",
+        "asked_at": NOW.isoformat(),
+        "answered_at": later.isoformat(),
+        "comment": None,
+        "timed_out": False,
+    }
+    assert answer_value(question, {"option": "Reject", "who": "tom"}, now=later)["approved"] is False
+    timed_out = answer_value(question, question.default or {}, now=later, timed_out=True)
+    assert (timed_out["approved"], timed_out["option"], timed_out["who"], timed_out["timed_out"]) == (
+        False, "Reject", None, True
+    )  # fmt: skip
+    assert approve.state_writes(answer) == {"approval": answer}
+    with pytest.raises(ValueError) as info:
+        answer_value(question, {"approved": "yes", "option": "Ship", "extra": 1}, now=later)
+    for phrase in ("'extra' is not a field", "approved is true or false", "who answered is missing"):
+        assert phrase in str(info.value)
+
+    with pytest.raises(
+        ValueError, match="comment is a text, got 3; option 'Reject' is not the label of the choice, 'Ship Deck'"
+    ):
+        answer_value(question, {"approved": True, "option": "Reject", "who": "tom", "comment": 3}, now=later)
+    literal = Human("pick", "ask", ["plan"], options=["{plan.title} as it is", "redo"], question="{plan}")
+    shown = literal.ask({"plan": GATE_PLAN}, types, run_id="r1", visit=1, now=NOW)
+    assert (shown.text, shown.options) == (json.dumps(GATE_PLAN), ("Deck as it is", "redo"))
+    pick = Human("pick", "ask", ["plan"], options="plan.choices", question="Which?")
+    asked = pick.ask({"plan": GATE_PLAN}, types, run_id="r1", visit=1, now=NOW, item=0, item_key="intro")
+    assert (asked.id, asked.options, asked.deadline) == ("r1/pick/intro/1", ("short", "long"), None)
+    assert answer_value(asked, {"option": "long", "who": "ann"}, now=NOW)["option"] == "long"
+    with pytest.raises(ValueError, match=r"option 'medium' is not one of \['short', 'long'\]"):
+        answer_value(asked, {"option": "medium", "who": "ann"}, now=NOW)
+    with pytest.raises(ValueError, match="option is missing"):
+        answer_value(asked, {"who": "ann"}, now=NOW)
+    with pytest.raises(ValueError, match="must be a list of text"):
+        pick.ask({"plan": {"choices": "short"}}, types, run_id="r1", visit=1, now=NOW)
+
+    judge = Human("judge", "judge", {"left": "a", "right": "b"}, pair=["left", "right"])
+    duel = judge.ask({"a": "one", "b": "two"}, {}, run_id="r1", visit=2, now=NOW)
+    assert duel.options == ("left", "right", "tie") and duel.shown == {"left": "one", "right": "two"}
+    assert answer_value(duel, {"pick": "tie", "who": "tom", "comment": "both fine"}, now=NOW)["comment"] == "both fine"
+
+    edit = Human("fix", "edit", ["draft"], {"answer": "fix", "value": "final"}, edits="draft")
+    page = edit.ask({"draft": "Old title"}, {}, run_id="r1", visit=1, now=NOW)
+    changed = answer_value(page, {"value": "New title", "who": "tom"}, now=NOW)
+    same = answer_value(page, {"value": "Old title", "who": "tom"}, now=NOW)
+    kept = answer_value(page, {"who": "tom"}, now=NOW)
+    assert (changed["changed"], same["changed"], kept["changed"], "value" in kept) == (True, False, False, False)
+    assert edit.state_writes(changed) == {
+        "fix": {k: v for k, v in changed.items() if k != "value"},
+        "final": "New title",
+    }
+    assert edit.state_writes(kept, "Old title")["final"] == "Old title"
+    with pytest.raises(ValueError, match="changed is true, but the edited value is missing"):
+        answer_value(page, {"changed": True, "who": "tom"}, now=NOW)
+    assert set(ANSWER_FIELDS) == set(FORMS)
+
+    # an optimizer replays recorded answers and asks nobody
+    record = AgentRecord(
+        "approve", 0, "", "", {}, {}, kind="human", raw_response=json.dumps(answer), visit=1, wait_s=30.0
+    )
+    unanswered = AgentRecord("approve", 1, "", "", {}, {}, kind="human", raw_response=json.dumps(timed_out), visit=2)
+    replay = ReplayAsker(Trace("q", "", (record, unanswered)))
+    given = {"approved": True, "option": "Ship Deck", "who": "tom", "answered_at": later.isoformat(), "comment": None}
+    assert replay.ask(question) == given
+    assert replay.ask(Question(**{**question.to_dict(), "visit": 2, "options": ("a", "b")})) is None  # a default
+    assert replay.ask(asked) is None
+    assert answer_value(question, replay.ask(question) or {}, now=NOW) == answer
+
+    # records, events and health carry the waits
+    assert record == AgentRecord("approve", 0, "", "", {}, {}, kind="human", raw_response=json.dumps(answer), visit=1)
+    assert record.to_dict()["wait_s"] == 30.0 and "lost" not in record.to_dict()
+    lost = AgentRecord("quick", 2, "p", "p", {}, {}, lost=True)
+    assert lost.to_dict()["lost"] is True
+    assert summarize([record, lost]).budget == {"waited_s": {"spent": 30.0}}
+    assert summarize([lost]).budget == {}
+    events = [
+        Event("pause", "approve", "r1", 0.1, question="r1/approve/1"),
+        Event("resume", "approve", "r1", 30.1, question="r1/approve/1", wait_s=30.0),
+        Event("stop", "", "r1", 31.0, reason="stopped"),
+        Event("end", "quick", "r1", 1.0, status="lost"),
+    ]
+    assert [event.to_dict() for event in events][2] == {"kind": "stop", "node": "", "run_id": "r1", "at_s": 31.0,
+                                                        "reason": "stopped"}  # fmt: skip
+    assert Trace("q", "").pause is None and "pause" not in Trace("q", "").to_dict()
+
+
+@pytest.mark.skipif(not hasattr(RunStatus, "PAUSED"), reason="needs RunStatus.PAUSED")
+def test_a_paused_trace_says_so() -> None:
+    question = Human("a", "approve", ["query"]).ask({"query": "q"}, {}, run_id="r", visit=1, now=NOW)
+    paused = Trace("q", "", pause=Pause("r", (question,)))
+    assert paused.status == "paused" and paused == Trace("q", "")
+    assert paused.to_dict()["status"] == "paused" and paused.to_dict()["pause"]["questions"][0]["id"] == "r/a/1"
